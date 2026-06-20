@@ -12,10 +12,10 @@ FROM gcr.io/distroless/cc-debian12
 WORKDIR /app
 
 # Copy the compiled release binary
-COPY --from=builder /app/target/release/llm_gateway .
+COPY --from=builder /app/target/release/cascade-llm .
 
 # Expose the gateway port
 EXPOSE 3000
 
 # Run the binary
-CMD ["./llm_gateway"]
+CMD ["./cascade-llm"]
