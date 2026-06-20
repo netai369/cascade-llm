@@ -1,9 +1,12 @@
+use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use axum::{
     body::Body,
-    extract::{State, Json, DefaultBodyLimit},
+    extract::{DefaultBodyLimit, Json, State},
     http::{HeaderMap, HeaderValue, StatusCode},
     routing::post,
     Router,
@@ -12,7 +15,8 @@ use futures_util::stream::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::net::TcpListener;
-use tracing::info;
+use tokio::sync::RwLock;
+use tracing::{info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -65,6 +69,91 @@ pub struct ChatCompletionRequest {
 }
 
 #[derive(Debug, Clone)]
+struct CircuitBreaker {
+    failures: Arc<RwLock<HashMap<String, Vec<Instant>>>>,
+    threshold: u32,
+    reset_duration: Duration,
+}
+
+impl CircuitBreaker {
+    fn new(threshold: u32, reset_duration_secs: u64) -> Self {
+        Self {
+            failures: Arc::new(RwLock::new(HashMap::new())),
+            threshold,
+            reset_duration: Duration::from_secs(reset_duration_secs),
+        }
+    }
+
+    async fn record_failure(&self, url: &str) {
+        let mut failures = self.failures.write().await;
+        let now = Instant::now();
+        let entry = failures.entry(url.to_string()).or_default();
+        entry.push(now);
+        entry.retain(|t| now.duration_since(*t) < self.reset_duration);
+        warn!(
+            "Circuit breaker: {} failures for {} in last {}s",
+            entry.len(),
+            url,
+            self.reset_duration.as_secs()
+        );
+    }
+
+    async fn is_open(&self, url: &str) -> bool {
+        let failures = self.failures.read().await;
+        if let Some(times) = failures.get(url) {
+            let now = Instant::now();
+            let recent: Vec<_> = times
+                .iter()
+                .filter(|t| now.duration_since(**t) < self.reset_duration)
+                .collect();
+            recent.len() as u32 >= self.threshold
+        } else {
+            false
+        }
+    }
+
+    async fn record_success(&self, url: &str) {
+        let mut failures = self.failures.write().await;
+        if failures.remove(url).is_some() {
+            info!("Circuit breaker reset for {}", url);
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct LoadTracker {
+    request_count: Arc<AtomicU64>,
+    total_complexity: Arc<AtomicU64>,
+}
+
+impl Default for LoadTracker {
+    fn default() -> Self {
+        Self {
+            request_count: Arc::new(AtomicU64::new(0)),
+            total_complexity: Arc::new(AtomicU64::new(0)),
+        }
+    }
+}
+
+impl LoadTracker {
+    fn record(&self, complexity: f64) {
+        self.request_count.fetch_add(1, Ordering::Relaxed);
+        self.total_complexity
+            .fetch_add((complexity * 100.0) as u64, Ordering::Relaxed);
+    }
+
+    fn avg_complexity(&self) -> f64 {
+        let count = self.request_count.load(Ordering::Relaxed);
+        if count == 0 {
+            0.0
+        } else {
+            let total = self.total_complexity.load(Ordering::Relaxed);
+            total as f64 / count as f64 / 100.0
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 struct GatewayState {
     http_client: Arc<reqwest::Client>,
     small_mllm_url: String,
@@ -74,6 +163,8 @@ struct GatewayState {
     confidence_threshold: f64,
     large_model_multimodal: bool,
     route_tools_to_large: bool,
+    circuit_breaker: CircuitBreaker,
+    load_tracker: LoadTracker,
 }
 
 impl GatewayState {
@@ -104,6 +195,15 @@ impl GatewayState {
                 .expect("Failed to build reqwest client"),
         );
 
+        let cb_threshold = std::env::var("CIRCUIT_BREAKER_THRESHOLD")
+            .unwrap_or_else(|_| "5".to_string())
+            .parse::<u32>()
+            .unwrap_or(5);
+        let cb_reset = std::env::var("CIRCUIT_BREAKER_RESET_SECS")
+            .unwrap_or_else(|_| "60".to_string())
+            .parse::<u64>()
+            .unwrap_or(60);
+
         Self {
             http_client,
             small_mllm_url,
@@ -113,6 +213,8 @@ impl GatewayState {
             confidence_threshold,
             large_model_multimodal,
             route_tools_to_large,
+            circuit_breaker: CircuitBreaker::new(cb_threshold, cb_reset),
+            load_tracker: LoadTracker::default(),
         }
     }
 
@@ -176,7 +278,13 @@ impl GatewayState {
         Some(mean.exp())
     }
 
-    fn pick_model(&self, has_image: bool, complexity: f64) -> (bool, &str) {
+    fn pick_model(&self, has_image: bool, complexity: f64, tier: &str) -> (bool, &str) {
+        // Premium tier always routes to large model
+        if tier == "premium" {
+            info!("PREMIUM TIER: routing to large model");
+            return (false, &self.large_text_url);
+        }
+
         if has_image {
             if self.large_model_multimodal && complexity > self.router_threshold {
                 info!("MODEL SELECTION: image present, complexity {:.2} > threshold {}, routing to large multimodal model",
@@ -338,10 +446,26 @@ impl GatewayState {
         urls
     }
 
-    async fn route_request(&self, payload: ChatCompletionRequest, is_streaming: bool) -> Result<(HeaderMap, Body), StatusCode> {
+    /// Check if a backend URL is available (circuit breaker closed).
+    async fn is_backend_available(&self, url: &str, fallback: &str) -> String {
+        if self.circuit_breaker.is_open(url).await {
+            warn!("Circuit breaker OPEN for {}, using fallback {}", url, fallback);
+            return fallback.to_string();
+        }
+        url.to_string()
+    }
+
+    async fn route_request(&self, payload: ChatCompletionRequest, is_streaming: bool, tier: &str) -> Result<(HeaderMap, Body), StatusCode> {
         let has_image = self.detect_image(&payload.messages);
         let has_tools = payload.tools.is_some() || payload.functions.is_some();
         let complexity_score = self.evaluate_complexity(&payload.messages);
+
+        // Record load metrics
+        self.load_tracker.record(complexity_score);
+
+        // Check circuit breaker for backends
+        let small_url = self.is_backend_available(&self.small_mllm_url, &self.large_text_url).await;
+        let large_url = self.is_backend_available(&self.large_text_url, &self.large_mllm_url).await;
 
         // If both image AND tools: describe image with small vision model,
         // then route text description + tools to large text model
@@ -365,16 +489,26 @@ impl GatewayState {
             let mut modified_payload = payload.clone();
             self.replace_images_with_text(&mut modified_payload, &descriptions);
 
-            let target = &self.large_text_url;
             info!("IMAGE + TOOLS: routing text+tools to large text model");
-            return self.proxy_to_backend(&modified_payload, target, is_streaming).await;
+            let result = self.proxy_to_backend(&modified_payload, &large_url, is_streaming).await;
+            // Track success/failure
+            match &result {
+                Ok(_) => { self.circuit_breaker.record_success(&large_url).await; }
+                Err(_) => { self.circuit_breaker.record_failure(&large_url).await; }
+            }
+            return result;
         }
 
         // If tools are present and route_tools_to_large is enabled, route to large model
         if has_tools && self.route_tools_to_large {
-            let target = if has_image { &self.large_mllm_url } else { &self.large_text_url };
+            let target = if has_image { &large_url } else { &large_url };
             info!("TOOLS DETECTED + route_tools_to_large=true: routing to {}", if has_image { "large multimodal model" } else { "large text model" });
-            return self.proxy_to_backend(&payload, target, is_streaming).await;
+            let result = self.proxy_to_backend(&payload, target, is_streaming).await;
+            match &result {
+                Ok(_) => { self.circuit_breaker.record_success(target).await; }
+                Err(_) => { self.circuit_breaker.record_failure(target).await; }
+            }
+            return result;
         }
 
         info!(
@@ -382,24 +516,34 @@ impl GatewayState {
             has_image, complexity_score, self.router_threshold, self.large_model_multimodal
         );
 
-        let (use_small, target_url) = self.pick_model(has_image, complexity_score);
+        let (use_small, target_url) = self.pick_model(has_image, complexity_score, tier);
         let target_url = target_url.to_owned();
         info!("SELECTED_URL: {}", target_url);
 
         if !use_small {
-            return self.proxy_to_backend(&payload, &target_url, is_streaming).await;
+            let result = self.proxy_to_backend(&payload, &target_url, is_streaming).await;
+            match &result {
+                Ok(_) => { self.circuit_breaker.record_success(&target_url).await; }
+                Err(_) => { self.circuit_breaker.record_failure(&target_url).await; }
+            }
+            return result;
         }
 
         // === Small model path ===
-        let mut small_payload = payload.clone();
-        self.inject_german_lean(&mut small_payload);
+        let small_payload = self.inject_german_lean(payload.clone());
 
         // Streaming: proxy directly (no confidence check possible on a stream)
         if is_streaming {
-            return self.proxy_to_backend(&small_payload, &target_url, true).await;
+            let result = self.proxy_to_backend(&small_payload, &target_url, true).await;
+            match &result {
+                Ok(_) => { self.circuit_breaker.record_success(&target_url).await; }
+                Err(_) => { self.circuit_breaker.record_failure(&target_url).await; }
+            }
+            return result;
         }
 
         // Non-streaming: try small model with logprobs for confidence-based rerouting
+        let mut small_payload = small_payload;
         small_payload.logprobs = Some(true);
         small_payload.top_logprobs = Some(0);
 
@@ -420,8 +564,15 @@ impl GatewayState {
         // Small model error: fall through to large model
         if !status.is_success() {
             info!("Small model returned HTTP {}, rerouting original request to large model", status);
-            return self.proxy_to_backend(&payload, &self.large_text_url, false).await;
+            self.circuit_breaker.record_failure(&target_url).await;
+            let result = self.proxy_to_backend(&payload, &large_url, false).await;
+            if result.is_ok() {
+                self.circuit_breaker.record_success(&large_url).await;
+            }
+            return result;
         }
+
+        self.circuit_breaker.record_success(&target_url).await;
 
         // Extract confidence from logprobs
         let confidence = self.extract_confidence(&body_bytes);
@@ -454,7 +605,11 @@ impl GatewayState {
 
         // Reroute to large model with original payload (no German injection)
         info!("Rerouting original request to large text model");
-        self.proxy_to_backend(&payload, &self.large_text_url, false).await
+        let result = self.proxy_to_backend(&payload, &large_url, false).await;
+        if result.is_ok() {
+            self.circuit_breaker.record_success(&large_url).await;
+        }
+        result
     }
 
     fn detect_image(&self, messages: &[ChatMessage]) -> bool {
@@ -473,7 +628,8 @@ impl GatewayState {
         false
     }
 
-    fn inject_german_lean(&self, payload: &mut ChatCompletionRequest) {
+    fn inject_german_lean(&self, payload: ChatCompletionRequest) -> ChatCompletionRequest {
+        let mut payload = payload;
         let has_system = payload.messages.iter().any(|m| m.role == "system");
         
         if !has_system {
@@ -497,6 +653,7 @@ impl GatewayState {
                 info!("Modified existing system prompt to lean German");
             }
         }
+        payload
     }
 }
 
@@ -528,10 +685,15 @@ fn base64_encode(input: &[u8]) -> String {
 
 async fn handler(
     State(state): State<GatewayState>,
+    headers: HeaderMap,
     Json(payload): Json<ChatCompletionRequest>,
 ) -> Result<(HeaderMap, Body), StatusCode> {
     let is_streaming = payload.stream.unwrap_or(false);
-    state.route_request(payload, is_streaming).await
+    let tier = headers
+        .get("x-tier")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("standard");
+    state.route_request(payload, is_streaming, tier).await
 }
 
 #[tokio::main]
