@@ -337,6 +337,9 @@ impl GatewayState {
 
     /// Download image from URL and convert to base64 data URL.
     async fn download_image_as_base64(&self, url: &str) -> Option<String> {
+        if url.starts_with("data:") {
+            return Some(url.to_string());
+        }
         let resp = self.http_client.get(url).send().await.ok()?;
         let content_type = resp
             .headers()
