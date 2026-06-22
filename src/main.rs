@@ -19,6 +19,39 @@ use tokio::sync::RwLock;
 use tracing::{info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
+async fn fetch_large_model_multimodal_async() -> bool {
+    match reqwest::Client::new()
+        .get("http://netai-inference:8080/models")
+        .send()
+        .await
+    {
+        Ok(resp) => match resp.json::<Value>().await {
+            Ok(json) => {
+                let empty_vec = Vec::new();
+                let models = json.get("models").and_then(|m| m.as_array()).unwrap_or(&empty_vec);
+                for model in models {
+                    let empty_caps = Vec::new();
+                    let caps = model.get("capabilities").and_then(|c| c.as_array()).unwrap_or(&empty_caps);
+                    if caps.iter().any(|c| c.as_str() == Some("multimodal")) {
+                        info!("Auto-detected: large model supports multimodal");
+                        return true;
+                    }
+                }
+                info!("Auto-detected: large model is text-only");
+                false
+            }
+            Err(e) => {
+                warn!("Failed to parse /models response JSON: {}, defaulting to false", e);
+                false
+            }
+        },
+        Err(e) => {
+            warn!("Failed to fetch /models endpoint (inference server not ready?): {}", e);
+            false
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum MessageContentPart {
@@ -168,7 +201,7 @@ struct GatewayState {
 }
 
 impl GatewayState {
-    fn new() -> Self {
+    fn new(large_model_multimodal: bool) -> Self {
         let small_mllm_url = std::env::var("SMALL_MLLM_URL").unwrap_or_else(|_| "http://localhost:8082/v1/chat/completions".to_string());
         let large_mllm_url = std::env::var("LARGE_MLLM_URL").unwrap_or_else(|_| "http://localhost:8080/v1/chat/completions".to_string());
         let large_text_url = std::env::var("LARGE_TEXT_URL").unwrap_or_else(|_| "http://localhost:8080/v1/chat/completions".to_string());
@@ -180,9 +213,6 @@ impl GatewayState {
             .unwrap_or_else(|_| "0.7".to_string())
             .parse::<f64>()
             .unwrap_or(0.7);
-        let large_model_multimodal = std::env::var("LARGE_MODEL_MULTIMODAL")
-            .unwrap_or_else(|_| "true".to_string())
-            .eq_ignore_ascii_case("true");
         let route_tools_to_large = std::env::var("ROUTE_TOOLS_TO_LARGE")
             .unwrap_or_else(|_| "true".to_string())
             .eq_ignore_ascii_case("true");
@@ -711,7 +741,26 @@ async fn main() {
 
     info!("cascade-llm v{}", env!("CARGO_PKG_VERSION"));
 
-    let state = GatewayState::new();
+    // Auto-detect LARGE_MODEL_MULTIMODAL from inference server if not set in env
+    let large_model_multimodal = match std::env::var("LARGE_MODEL_MULTIMODAL") {
+        Ok(v) => v.eq_ignore_ascii_case("true"),
+        Err(_) => {
+            info!("LARGE_MODEL_MULTIMODAL not set, auto-detecting from inference server...");
+            // Try to fetch from inference server, but don't block startup if unavailable
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                fetch_large_model_multimodal_async()
+            ).await {
+                Ok(result) => result,
+                Err(_) => {
+                    warn!("Timeout fetching multimodal capability, defaulting to true");
+                    true
+                }
+            }
+        }
+    };
+
+    let state = GatewayState::new(large_model_multimodal);
     let app = Router::new()
         .route("/v1/chat/completions", post(handler))
         .layer(DefaultBodyLimit::disable())
