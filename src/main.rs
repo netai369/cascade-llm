@@ -19,9 +19,12 @@ use tokio::sync::RwLock;
 use tracing::{info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-async fn fetch_large_model_multimodal_async() -> bool {
+mod language;
+
+async fn fetch_large_model_multimodal_async(inference_url: &str) -> bool {
+    let models_url = format!("{}/models", inference_url.trim_end_matches('/'));
     match reqwest::Client::new()
-        .get("http://netai-inference:8080/models")
+        .get(&models_url)
         .send()
         .await
     {
@@ -248,6 +251,10 @@ impl GatewayState {
         }
     }
 
+    fn detect_language(&self, messages: &[ChatMessage]) -> &'static str {
+        language::detect_language(messages)
+    }
+
     fn evaluate_complexity(&self, messages: &[ChatMessage]) -> f64 {
         let mut total_chars = 0;
         let mut keyword_score = 0.0;
@@ -385,10 +392,12 @@ impl GatewayState {
     /// Describe an image using the small vision model.
     /// Downloads the image in the gateway and sends as base64 data URL
     /// to avoid llama.cpp's external URL download issues.
-    async fn describe_image(&self, image_url: &str) -> Option<String> {
+    async fn describe_image(&self, image_url: &str, language: &str) -> Option<String> {
         info!("Downloading image for description: {}", image_url);
         let data_url = self.download_image_as_base64(image_url).await?;
         info!("Image downloaded, size: {} bytes", data_url.len());
+
+        let prompt_text = language::get_image_prompt(language);
 
         let desc_payload = ChatCompletionRequest {
             model: "vision".to_string(),
@@ -396,7 +405,7 @@ impl GatewayState {
                 ChatMessage {
                     role: "user".to_string(),
                     content: MessageContent::Parts(vec![
-                        MessageContentPart::Text { text: "Describe this image in detail. Focus on objects, text, people, and anything notable. Keep it concise but thorough.".to_string() },
+                        MessageContentPart::Text { text: prompt_text.to_string() },
                         MessageContentPart::ImageUrl { image_url: ImageUrlTarget { url: data_url } },
                     ]),
                 },
@@ -492,6 +501,7 @@ impl GatewayState {
         let has_image = self.detect_image(&payload.messages);
         let has_tools = payload.tools.is_some() || payload.functions.is_some();
         let complexity_score = self.evaluate_complexity(&payload.messages);
+        let language = self.detect_language(&payload.messages);
 
         // Record load metrics
         self.load_tracker.record(complexity_score);
@@ -510,7 +520,7 @@ impl GatewayState {
             // Describe each image
             let mut descriptions = Vec::new();
             for url in &image_urls {
-                if let Some(desc) = self.describe_image(url).await {
+                if let Some(desc) = self.describe_image(url, language).await {
                     info!("Image description: {}", desc.chars().take(100).collect::<String>());
                     descriptions.push(desc);
                 } else {
@@ -563,7 +573,7 @@ impl GatewayState {
         }
 
         // === Small model path ===
-        let small_payload = self.inject_german_lean(payload.clone());
+        let small_payload = language::inject_language_prompt(language, payload.clone());
 
         // Streaming: proxy directly (no confidence check possible on a stream)
         if is_streaming {
@@ -660,34 +670,6 @@ impl GatewayState {
         }
         false
     }
-
-    fn inject_german_lean(&self, payload: ChatCompletionRequest) -> ChatCompletionRequest {
-        let mut payload = payload;
-        let has_system = payload.messages.iter().any(|m| m.role == "system");
-        
-        if !has_system {
-            payload.messages.insert(0, ChatMessage {
-                role: "system".to_string(),
-                content: MessageContent::Text("Antworte immer auf Deutsch. Sei hilfreich und präzise.".to_string()),
-            });
-            info!("Injected German system prompt into small model request");
-        } else {
-            if let Some(sys_msg) = payload.messages.iter_mut().find(|m| m.role == "system") {
-                match &mut sys_msg.content {
-                    MessageContent::Text(text) => {
-                        *text = format!("Antworte immer auf Deutsch. {}", text);
-                    }
-                    MessageContent::Parts(parts) => {
-                        parts.insert(0, MessageContentPart::Text { 
-                            text: "Antworte immer auf Deutsch. ".to_string() 
-                        });
-                    }
-                }
-                info!("Modified existing system prompt to lean German");
-            }
-        }
-        payload
-    }
 }
 
 /// Simple base64 encoder (no external dependency needed).
@@ -742,14 +724,15 @@ async fn main() {
     info!("cascade-llm v{}", env!("CARGO_PKG_VERSION"));
 
     // Auto-detect LARGE_MODEL_MULTIMODAL from inference server if not set in env
+    let inference_url = std::env::var("INFERENCE_URL")
+        .unwrap_or_else(|_| "http://netai-inference:8080".to_string());
     let large_model_multimodal = match std::env::var("LARGE_MODEL_MULTIMODAL") {
         Ok(v) => v.eq_ignore_ascii_case("true"),
         Err(_) => {
             info!("LARGE_MODEL_MULTIMODAL not set, auto-detecting from inference server...");
-            // Try to fetch from inference server, but don't block startup if unavailable
             match tokio::time::timeout(
                 std::time::Duration::from_secs(5),
-                fetch_large_model_multimodal_async()
+                fetch_large_model_multimodal_async(&inference_url)
             ).await {
                 Ok(result) => result,
                 Err(_) => {
