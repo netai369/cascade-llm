@@ -11,6 +11,7 @@ pub fn detect_language(messages: &[ChatMessage]) -> &'static str {
         .build();
 
     let result = detector.detect_language_of(&text);
+    info!("LANGUAGE_DETECTION: text={}, detected={:?}", text, result);
     match result {
         Some(Language::German) => "de",
         Some(Language::French) => "fr",
@@ -22,9 +23,10 @@ pub fn detect_language(messages: &[ChatMessage]) -> &'static str {
     }
 }
 
-fn extract_text(messages: &[ChatMessage]) -> String {
+pub fn extract_text(messages: &[ChatMessage]) -> String {
     let mut text = String::new();
     for msg in messages {
+        info!("EXTRACT_TEXT: role={}, skipping={}", msg.role, msg.role == "system");
         if msg.role == "system" { continue; }
         match &msg.content {
             MessageContent::Text(t) => {
@@ -41,6 +43,7 @@ fn extract_text(messages: &[ChatMessage]) -> String {
             }
         }
     }
+    info!("EXTRACT_TEXT: final_aggregated_length={}, text_preview={:?}", text.len(), text.chars().take(200).collect::<String>());
     text
 }
 
@@ -102,5 +105,6 @@ pub fn inject_language_prompt(language: &str, mut payload: ChatCompletionRequest
             info!("Modified existing system prompt to lean {}", lang_name);
         }
     }
+    info!("INJECT_LANGUAGE: final system prompt length={}", payload.messages.get(0).map(|m| match &m.content { MessageContent::Text(t) => t.len(), MessageContent::Parts(p) => p.iter().map(|x| match x { MessageContentPart::Text { text } => text.len(), _ => 0 }).sum(), }).unwrap_or(0));
     payload
 }

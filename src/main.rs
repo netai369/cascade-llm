@@ -393,11 +393,17 @@ impl GatewayState {
     /// Downloads the image in the gateway and sends as base64 data URL
     /// to avoid llama.cpp's external URL download issues.
     async fn describe_image(&self, image_url: &str, language: &str) -> Option<String> {
-        info!("Downloading image for description: {}", image_url);
+        let url_preview = if image_url.starts_with("data:") {
+            format!("data:...<{} bytes>", image_url.len())
+        } else {
+            image_url.to_string()
+        };
+        info!("Downloading image for description: {}", url_preview);
         let data_url = self.download_image_as_base64(image_url).await?;
         info!("Image downloaded, size: {} bytes", data_url.len());
 
         let prompt_text = language::get_image_prompt(language);
+        info!("IMAGE_DESCRIPTION_LANGUAGE: {}, PROMPT_LENGTH: {}", language, prompt_text.len());
 
         let desc_payload = ChatCompletionRequest {
             model: "vision".to_string(),
@@ -503,6 +509,31 @@ impl GatewayState {
         let complexity_score = self.evaluate_complexity(&payload.messages);
         let language = self.detect_language(&payload.messages);
 
+        info!("[REQ_START] has_image={}, has_tools={}, tier={}", has_image, has_tools, tier);
+        info!("[REQ] user_text={:?}", language::extract_text(&payload.messages));
+
+        info!("DETECTED_LANGUAGE: {}", language);
+
+        let aggregated_text = language::extract_text(&payload.messages);
+        info!("REQUEST_MESSAGES: count={}, aggregated_text_length={}, aggregated_text_preview={}", 
+            payload.messages.len(), aggregated_text.len(), aggregated_text.chars().take(200).collect::<String>());
+        for (i, msg) in payload.messages.iter().enumerate() {
+            match &msg.content {
+                MessageContent::Text(t) => info!("MSG_{}: role={}, type=Text, length={}, text={:?}", i, msg.role, t.len(), t),
+                MessageContent::Parts(parts) => {
+                    info!("MSG_{}: role={}, type=Parts, part_count={}", i, msg.role, parts.len());
+                    for (j, part) in parts.iter().enumerate() {
+                        match part {
+                            MessageContentPart::Text { text } => info!("  PART_{}_TEXT: length={}, text={:?}", j, text.len(), text),
+                            MessageContentPart::ImageUrl { .. } => info!("  PART_{}: ImageUrl", j),
+                        }
+                    }
+                }
+            }
+        }
+
+        let injected_payload = language::inject_language_prompt(language, payload);
+
         // Record load metrics
         self.load_tracker.record(complexity_score);
 
@@ -515,7 +546,7 @@ impl GatewayState {
         if has_image && has_tools {
             info!("IMAGE + TOOLS: describing image with small vision model first");
 
-            let image_urls = self.extract_image_urls(&payload.messages);
+            let image_urls = self.extract_image_urls(&injected_payload.messages);
 
             // Describe each image
             let mut descriptions = Vec::new();
@@ -529,7 +560,7 @@ impl GatewayState {
             }
 
             // Replace images with descriptions and route to large model
-            let mut modified_payload = payload.clone();
+            let mut modified_payload = injected_payload.clone();
             self.replace_images_with_text(&mut modified_payload, &descriptions);
 
             info!("IMAGE + TOOLS: routing text+tools to large text model");
@@ -546,7 +577,7 @@ impl GatewayState {
         if has_tools && self.route_tools_to_large {
             let target = if has_image { &large_url } else { &large_url };
             info!("TOOLS DETECTED + route_tools_to_large=true: routing to {}", if has_image { "large multimodal model" } else { "large text model" });
-            let result = self.proxy_to_backend(&payload, target, is_streaming).await;
+            let result = self.proxy_to_backend(&injected_payload, target, is_streaming).await;
             match &result {
                 Ok(_) => { self.circuit_breaker.record_success(target).await; }
                 Err(_) => { self.circuit_breaker.record_failure(target).await; }
@@ -564,7 +595,7 @@ impl GatewayState {
         info!("SELECTED_URL: {}", target_url);
 
         if !use_small {
-            let result = self.proxy_to_backend(&payload, &target_url, is_streaming).await;
+            let result = self.proxy_to_backend(&injected_payload, &target_url, is_streaming).await;
             match &result {
                 Ok(_) => { self.circuit_breaker.record_success(&target_url).await; }
                 Err(_) => { self.circuit_breaker.record_failure(&target_url).await; }
@@ -573,7 +604,9 @@ impl GatewayState {
         }
 
         // === Small model path ===
-        let small_payload = language::inject_language_prompt(language, payload.clone());
+        info!("SMALL_MODEL_PATH: target_url={}, use_small=true", target_url);
+        let small_payload = injected_payload.clone();
+        info!("SMALL_MODEL_PAYLOAD_SENT: messages={}", small_payload.messages.len());
 
         // Streaming: proxy directly (no confidence check possible on a stream)
         if is_streaming {
@@ -608,7 +641,7 @@ impl GatewayState {
         if !status.is_success() {
             info!("Small model returned HTTP {}, rerouting original request to large model", status);
             self.circuit_breaker.record_failure(&target_url).await;
-            let result = self.proxy_to_backend(&payload, &large_url, false).await;
+            let result = self.proxy_to_backend(&injected_payload, &large_url, false).await;
             if result.is_ok() {
                 self.circuit_breaker.record_success(&large_url).await;
             }
@@ -646,9 +679,9 @@ impl GatewayState {
             return Ok((headers, Body::from(body_bytes)));
         }
 
-        // Reroute to large model with original payload (no German injection)
+        // Reroute to large model with language-injected payload
         info!("Rerouting original request to large text model");
-        let result = self.proxy_to_backend(&payload, &large_url, false).await;
+        let result = self.proxy_to_backend(&injected_payload, &large_url, false).await;
         if result.is_ok() {
             self.circuit_breaker.record_success(&large_url).await;
         }
