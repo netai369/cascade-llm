@@ -28,16 +28,18 @@ pub fn extract_text(messages: &[ChatMessage]) -> String {
     for msg in messages {
         info!("EXTRACT_TEXT: role={}, skipping={}", msg.role, msg.role == "system");
         if msg.role == "system" { continue; }
-        match &msg.content {
-            MessageContent::Text(t) => {
-                text.push_str(t);
-                text.push(' ');
-            }
-            MessageContent::Parts(parts) => {
-                for part in parts {
-                    if let MessageContentPart::Text { text: t } = part {
-                        text.push_str(t);
-                        text.push(' ');
+        if let Some(content) = &msg.content {
+            match content {
+                MessageContent::Text(t) => {
+                    text.push_str(t);
+                    text.push(' ');
+                }
+                MessageContent::Parts(parts) => {
+                    for part in parts {
+                        if let MessageContentPart::Text { text: t } = part {
+                            text.push_str(t);
+                            text.push(' ');
+                        }
                     }
                 }
             }
@@ -87,24 +89,31 @@ pub fn inject_language_prompt(language: &str, mut payload: ChatCompletionRequest
     if !has_system {
         payload.messages.insert(0, ChatMessage {
             role: "system".to_string(),
-            content: MessageContent::Text(prefix.to_string()),
+            content: Some(MessageContent::Text(prefix.to_string())),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
         });
         info!("Injected {} system prompt into small model request", lang_name);
     } else {
         if let Some(sys_msg) = payload.messages.iter_mut().find(|m| m.role == "system") {
-            match &mut sys_msg.content {
-                MessageContent::Text(text) => {
-                    *text = format!("{}. {}", prefix, text);
+            if let Some(ref mut content) = sys_msg.content {
+                match content {
+                    MessageContent::Text(text) => {
+                        *text = format!("{}. {}", prefix, text);
+                    }
+                    MessageContent::Parts(parts) => {
+                        parts.insert(0, MessageContentPart::Text { 
+                            text: format!("{}. ", prefix) 
+                        });
+                    }
                 }
-                MessageContent::Parts(parts) => {
-                    parts.insert(0, MessageContentPart::Text { 
-                        text: format!("{}. ", prefix) 
-                    });
-                }
+            } else {
+                sys_msg.content = Some(MessageContent::Text(prefix.to_string()));
             }
             info!("Modified existing system prompt to lean {}", lang_name);
         }
     }
-    info!("INJECT_LANGUAGE: final system prompt length={}", payload.messages.get(0).map(|m| match &m.content { MessageContent::Text(t) => t.len(), MessageContent::Parts(p) => p.iter().map(|x| match x { MessageContentPart::Text { text } => text.len(), _ => 0 }).sum(), }).unwrap_or(0));
+    info!("INJECT_LANGUAGE: final system prompt length={}", payload.messages.get(0).map(|m| match &m.content { Some(MessageContent::Text(t)) => t.len(), Some(MessageContent::Parts(p)) => p.iter().map(|x| match x { MessageContentPart::Text { text } => text.len(), _ => 0 }).sum(), _ => 0 }).unwrap_or(0));
     payload
 }

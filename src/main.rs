@@ -77,7 +77,14 @@ pub enum MessageContent {
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct ChatMessage {
     pub role: String,
-    pub content: MessageContent,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<MessageContent>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -102,6 +109,12 @@ pub struct ChatCompletionRequest {
     pub functions: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub function_call: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_format: Option<Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -201,6 +214,7 @@ struct GatewayState {
     route_tools_to_large: bool,
     circuit_breaker: CircuitBreaker,
     load_tracker: LoadTracker,
+    session_cache: Arc<RwLock<HashMap<String, (String, Instant)>>>,
 }
 
 impl GatewayState {
@@ -248,6 +262,7 @@ impl GatewayState {
             route_tools_to_large,
             circuit_breaker: CircuitBreaker::new(cb_threshold, cb_reset),
             load_tracker: LoadTracker::default(),
+            session_cache: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -261,28 +276,30 @@ impl GatewayState {
         let keywords = ["analyze deeply", "write code", "expert", "reasoning", "logic", "complex"];
 
         for msg in messages {
-            match &msg.content {
-                MessageContent::Text(text) => {
-                    total_chars += text.len();
-                    for keyword in &keywords {
-                        if text.to_lowercase().contains(keyword) {
-                            keyword_score += 0.2;
+            if let Some(ref content) = msg.content {
+                match content {
+                    MessageContent::Text(text) => {
+                        total_chars += text.len();
+                        for keyword in &keywords {
+                            if text.to_lowercase().contains(keyword) {
+                                keyword_score += 0.2;
+                            }
                         }
                     }
-                }
-                MessageContent::Parts(parts) => {
-                    for part in parts {
-                        match part {
-                            MessageContentPart::Text { text } => {
-                                total_chars += text.len();
-                                for keyword in &keywords {
-                                    if text.to_lowercase().contains(keyword) {
-                                        keyword_score += 0.2;
+                    MessageContent::Parts(parts) => {
+                        for part in parts {
+                            match part {
+                                MessageContentPart::Text { text } => {
+                                    total_chars += text.len();
+                                    for keyword in &keywords {
+                                        if text.to_lowercase().contains(keyword) {
+                                            keyword_score += 0.2;
+                                        }
                                     }
                                 }
-                            }
-                            MessageContentPart::ImageUrl { .. } => {
-                                total_chars += 100;
+                                MessageContentPart::ImageUrl { .. } => {
+                                    total_chars += 100;
+                                }
                             }
                         }
                     }
@@ -410,10 +427,13 @@ impl GatewayState {
             messages: vec![
                 ChatMessage {
                     role: "user".to_string(),
-                    content: MessageContent::Parts(vec![
+                    content: Some(MessageContent::Parts(vec![
                         MessageContentPart::Text { text: prompt_text.to_string() },
                         MessageContentPart::ImageUrl { image_url: ImageUrlTarget { url: data_url } },
-                    ]),
+                    ])),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    name: None,
                 },
             ],
             stream: Some(false),
@@ -425,6 +445,9 @@ impl GatewayState {
             tool_choice: None,
             functions: None,
             function_call: None,
+            user: None,
+            stop: None,
+            response_format: None,
         };
 
         let resp = self.http_client
@@ -453,27 +476,29 @@ impl GatewayState {
     fn replace_images_with_text(&self, payload: &mut ChatCompletionRequest, descriptions: &[String]) {
         let mut desc_idx = 0;
         for msg in payload.messages.iter_mut() {
-            if let MessageContent::Parts(parts) = &mut msg.content {
-                let mut new_parts = Vec::new();
-                for part in parts.drain(..) {
-                    match part {
-                        MessageContentPart::ImageUrl { .. } => {
-                            if desc_idx < descriptions.len() {
-                                new_parts.push(MessageContentPart::Text {
-                                    text: format!("[Image: {}]", descriptions[desc_idx]),
-                                });
-                                desc_idx += 1;
+            if let Some(ref mut content) = msg.content {
+                if let MessageContent::Parts(parts) = content {
+                    let mut new_parts = Vec::new();
+                    for part in parts.drain(..) {
+                        match part {
+                            MessageContentPart::ImageUrl { .. } => {
+                                if desc_idx < descriptions.len() {
+                                    new_parts.push(MessageContentPart::Text {
+                                        text: format!("[Image: {}]", descriptions[desc_idx]),
+                                    });
+                                    desc_idx += 1;
+                                }
                             }
+                            _ => new_parts.push(part),
                         }
-                        _ => new_parts.push(part),
                     }
-                }
-                if new_parts.len() == 1 {
-                    if let MessageContentPart::Text { text } = new_parts.remove(0) {
-                        msg.content = MessageContent::Text(text);
+                    if new_parts.len() == 1 {
+                        if let MessageContentPart::Text { text } = new_parts.remove(0) {
+                            msg.content = Some(MessageContent::Text(text));
+                        }
+                    } else {
+                        msg.content = Some(MessageContent::Parts(new_parts));
                     }
-                } else {
-                    msg.content = MessageContent::Parts(new_parts);
                 }
             }
         }
@@ -483,10 +508,12 @@ impl GatewayState {
     fn extract_image_urls(&self, messages: &[ChatMessage]) -> Vec<String> {
         let mut urls = Vec::new();
         for msg in messages {
-            if let MessageContent::Parts(parts) = &msg.content {
-                for part in parts {
-                    if let MessageContentPart::ImageUrl { image_url } = part {
-                        urls.push(image_url.url.clone());
+            if let Some(ref content) = msg.content {
+                if let MessageContent::Parts(parts) = content {
+                    for part in parts {
+                        if let MessageContentPart::ImageUrl { image_url } = part {
+                            urls.push(image_url.url.clone());
+                        }
                     }
                 }
             }
@@ -503,13 +530,42 @@ impl GatewayState {
         url.to_string()
     }
 
-    async fn route_request(&self, payload: ChatCompletionRequest, is_streaming: bool, tier: &str) -> Result<(HeaderMap, Body), StatusCode> {
+    async fn route_request(&self, payload: ChatCompletionRequest, is_streaming: bool, tier: &str, headers: &HeaderMap) -> Result<(HeaderMap, Body), StatusCode> {
         let has_image = self.detect_image(&payload.messages);
         let has_tools = payload.tools.is_some() || payload.functions.is_some();
         let complexity_score = self.evaluate_complexity(&payload.messages);
         let language = self.detect_language(&payload.messages);
 
-        info!("[REQ_START] has_image={}, has_tools={}, tier={}", has_image, has_tools, tier);
+        // Check if history contains any tool role or tool_calls
+        let history_has_tools = payload.messages.iter().any(|m| {
+            m.role == "tool" || m.tool_calls.is_some()
+        });
+
+        // Determine session key
+        let session_key = headers
+            .get("x-conversation-id")
+            .or_else(|| headers.get("x-librechat-conversation-id"))
+            .and_then(|v| v.to_str().ok().map(|s| s.to_string()))
+            .or_else(|| payload.user.clone());
+
+        let cached_route = if let Some(ref key) = session_key {
+            let cache = self.session_cache.read().await;
+            if let Some((url, timestamp)) = cache.get(key) {
+                // Cache entry valid for 1 hour
+                if timestamp.elapsed() < Duration::from_secs(3600) {
+                    Some(url.clone())
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        info!("[REQ_START] has_image={}, has_tools={}, history_has_tools={}, session_key={:?}, cached_route={:?}, tier={}", 
+            has_image, has_tools, history_has_tools, session_key, cached_route, tier);
         info!("[REQ] user_text={:?}", language::extract_text(&payload.messages));
 
         info!("DETECTED_LANGUAGE: {}", language);
@@ -518,17 +574,21 @@ impl GatewayState {
         info!("REQUEST_MESSAGES: count={}, aggregated_text_length={}, aggregated_text_preview={}", 
             payload.messages.len(), aggregated_text.len(), aggregated_text.chars().take(200).collect::<String>());
         for (i, msg) in payload.messages.iter().enumerate() {
-            match &msg.content {
-                MessageContent::Text(t) => info!("MSG_{}: role={}, type=Text, length={}, text={:?}", i, msg.role, t.len(), t),
-                MessageContent::Parts(parts) => {
-                    info!("MSG_{}: role={}, type=Parts, part_count={}", i, msg.role, parts.len());
-                    for (j, part) in parts.iter().enumerate() {
-                        match part {
-                            MessageContentPart::Text { text } => info!("  PART_{}_TEXT: length={}, text={:?}", j, text.len(), text),
-                            MessageContentPart::ImageUrl { .. } => info!("  PART_{}: ImageUrl", j),
+            if let Some(ref content) = msg.content {
+                match content {
+                    MessageContent::Text(t) => info!("MSG_{}: role={}, type=Text, length={}, text={:?}", i, msg.role, t.len(), t),
+                    MessageContent::Parts(parts) => {
+                        info!("MSG_{}: role={}, type=Parts, part_count={}", i, msg.role, parts.len());
+                        for (j, part) in parts.iter().enumerate() {
+                            match part {
+                                MessageContentPart::Text { text } => info!("  PART_{}_TEXT: length={}, text={:?}", j, text.len(), text),
+                                MessageContentPart::ImageUrl { .. } => info!("  PART_{}: ImageUrl", j),
+                            }
                         }
                     }
                 }
+            } else {
+                info!("MSG_{}: role={}, type=None", i, msg.role);
             }
         }
 
@@ -538,8 +598,35 @@ impl GatewayState {
         self.load_tracker.record(complexity_score);
 
         // Check circuit breaker for backends
-        let small_url = self.is_backend_available(&self.small_mllm_url, &self.large_text_url).await;
+        let _small_url = self.is_backend_available(&self.small_mllm_url, &self.large_text_url).await;
         let large_url = self.is_backend_available(&self.large_text_url, &self.large_mllm_url).await;
+
+        // Sticky Session Affinity Logic
+        // Determine routing target based on cache or tool history
+        let target_override = if let Some(url) = cached_route {
+            info!("SESSION AFFINITY: Using cached route target_url={}", url);
+            Some(url)
+        } else if history_has_tools {
+            info!("SESSION AFFINITY: History has tools but no cached route. Forcing large model target_url={}", large_url);
+            if let Some(ref key) = session_key {
+                let mut cache = self.session_cache.write().await;
+                cache.insert(key.clone(), (large_url.clone(), Instant::now()));
+            }
+            Some(large_url.clone())
+        } else {
+            None
+        };
+
+        if let Some(target) = target_override {
+            // Check if we need image description first (if image present and target is not multimodal or is large text, but wait, if it has_image and has_tools, we already handle it below, let's keep it simple: if there is a session target override, bypass complexity evaluation/model picker and proxy directly to the target)
+            info!("SESSION AFFINITY ROUTE: Proxying directly to target={}", target);
+            let result = self.proxy_to_backend(&injected_payload, &target, is_streaming).await;
+            match &result {
+                Ok(_) => { self.circuit_breaker.record_success(&target).await; }
+                Err(_) => { self.circuit_breaker.record_failure(&target).await; }
+            }
+            return result;
+        }
 
         // If both image AND tools: describe image with small vision model,
         // then route text description + tools to large text model
@@ -567,7 +654,13 @@ impl GatewayState {
             let result = self.proxy_to_backend(&modified_payload, &large_url, is_streaming).await;
             // Track success/failure
             match &result {
-                Ok(_) => { self.circuit_breaker.record_success(&large_url).await; }
+                Ok(_) => { 
+                    self.circuit_breaker.record_success(&large_url).await;
+                    if let Some(ref key) = session_key {
+                        let mut cache = self.session_cache.write().await;
+                        cache.insert(key.clone(), (large_url.clone(), Instant::now()));
+                    }
+                }
                 Err(_) => { self.circuit_breaker.record_failure(&large_url).await; }
             }
             return result;
@@ -575,11 +668,17 @@ impl GatewayState {
 
         // If tools are present and route_tools_to_large is enabled, route to large model
         if has_tools && self.route_tools_to_large {
-            let target = if has_image { &large_url } else { &large_url };
-            info!("TOOLS DETECTED + route_tools_to_large=true: routing to {}", if has_image { "large multimodal model" } else { "large text model" });
+            let target = &large_url;
+            info!("TOOLS DETECTED + route_tools_to_large=true: routing to large text model");
             let result = self.proxy_to_backend(&injected_payload, target, is_streaming).await;
             match &result {
-                Ok(_) => { self.circuit_breaker.record_success(target).await; }
+                Ok(_) => { 
+                    self.circuit_breaker.record_success(target).await;
+                    if let Some(ref key) = session_key {
+                        let mut cache = self.session_cache.write().await;
+                        cache.insert(key.clone(), (target.clone(), Instant::now()));
+                    }
+                }
                 Err(_) => { self.circuit_breaker.record_failure(target).await; }
             }
             return result;
@@ -597,7 +696,13 @@ impl GatewayState {
         if !use_small {
             let result = self.proxy_to_backend(&injected_payload, &target_url, is_streaming).await;
             match &result {
-                Ok(_) => { self.circuit_breaker.record_success(&target_url).await; }
+                Ok(_) => { 
+                    self.circuit_breaker.record_success(&target_url).await;
+                    if let Some(ref key) = session_key {
+                        let mut cache = self.session_cache.write().await;
+                        cache.insert(key.clone(), (target_url.clone(), Instant::now()));
+                    }
+                }
                 Err(_) => { self.circuit_breaker.record_failure(&target_url).await; }
             }
             return result;
@@ -612,7 +717,13 @@ impl GatewayState {
         if is_streaming {
             let result = self.proxy_to_backend(&small_payload, &target_url, true).await;
             match &result {
-                Ok(_) => { self.circuit_breaker.record_success(&target_url).await; }
+                Ok(_) => { 
+                    self.circuit_breaker.record_success(&target_url).await;
+                    if let Some(ref key) = session_key {
+                        let mut cache = self.session_cache.write().await;
+                        cache.insert(key.clone(), (target_url.clone(), Instant::now()));
+                    }
+                }
                 Err(_) => { self.circuit_breaker.record_failure(&target_url).await; }
             }
             return result;
@@ -668,6 +779,11 @@ impl GatewayState {
         };
 
         if keep_small {
+            // Since we routed to and decided to keep the small model, let's cache it for session affinity
+            if let Some(ref key) = session_key {
+                let mut cache = self.session_cache.write().await;
+                cache.insert(key.clone(), (target_url.clone(), Instant::now()));
+            }
             let mut headers = HeaderMap::new();
             headers.insert("content-type", HeaderValue::from_static("application/json"));
             if let Some(c) = confidence {
@@ -684,18 +800,24 @@ impl GatewayState {
         let result = self.proxy_to_backend(&injected_payload, &large_url, false).await;
         if result.is_ok() {
             self.circuit_breaker.record_success(&large_url).await;
+            if let Some(ref key) = session_key {
+                let mut cache = self.session_cache.write().await;
+                cache.insert(key.clone(), (large_url.clone(), Instant::now()));
+            }
         }
         result
     }
 
     fn detect_image(&self, messages: &[ChatMessage]) -> bool {
         for msg in messages {
-            match &msg.content {
-                MessageContent::Text(_) => {}
-                MessageContent::Parts(parts) => {
-                    for part in parts {
-                        if matches!(part, MessageContentPart::ImageUrl { .. }) {
-                            return true;
+            if let Some(ref content) = msg.content {
+                match content {
+                    MessageContent::Text(_) => {}
+                    MessageContent::Parts(parts) => {
+                        for part in parts {
+                            if matches!(part, MessageContentPart::ImageUrl { .. }) {
+                                return true;
+                            }
                         }
                     }
                 }
@@ -741,7 +863,7 @@ async fn handler(
         .get("x-tier")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("standard");
-    state.route_request(payload, is_streaming, tier).await
+    state.route_request(payload, is_streaming, tier, &headers).await
 }
 
 #[tokio::main]
