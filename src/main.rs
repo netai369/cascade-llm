@@ -3,6 +3,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::time::timeout;
 
 use axum::{
     body::Body,
@@ -209,6 +210,8 @@ struct GatewayState {
     small_mllm_url: String,
     large_mllm_url: String,
     large_text_url: String,
+    main_model_name: String,
+    small_model_name: String,
     router_threshold: f64,
     confidence_threshold: f64,
     large_model_multimodal: bool,
@@ -252,11 +255,18 @@ impl GatewayState {
             .parse::<u64>()
             .unwrap_or(60);
 
+        let main_model_name = std::env::var("MAIN_MODEL_NAME")
+            .unwrap_or_else(|_| "gpt-3.5-turbo".to_string());
+        let small_model_name = std::env::var("SMALL_MODEL_NAME")
+            .unwrap_or_else(|_| "gpt-4o-mini".to_string());
+
         Self {
             http_client,
             small_mllm_url,
             large_mllm_url,
             large_text_url,
+            main_model_name,
+            small_model_name,
             router_threshold,
             confidence_threshold,
             large_model_multimodal,
@@ -393,12 +403,94 @@ impl GatewayState {
             headers.insert("content-type", HeaderValue::from_static("application/json"));
         }
 
-        let stream = backend_response
-            .bytes_stream()
-            .map(|item| item.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)));
+        if is_streaming {
+            let on_chunk = move |bytes: &mut Vec<u8>| {
+                let s = match std::str::from_utf8(bytes) {
+                    Ok(s) => s,
+                    Err(_) => return,
+                };
+                if !s.starts_with("data: ") && !s.starts_with("data:{") {
+                    return;
+                }
 
-        let body = Body::from_stream(stream);
-        Ok((headers, body))
+                let trimmed = s.trim_start_matches("data: ").trim();
+                if trimmed == "[DONE]" { return; }
+
+                if let Ok(mut event) = serde_json::from_str::<serde_json::Value>(trimmed) {
+                    let mut modified = false;
+                    if let Some(delta) = event.get_mut("delta") {
+                        // Lib. The order must be think chunks first, then text chunks.
+                        if let Some(reasoning) = delta.get("reasoning_content").and_then(|v| v.as_str()) {
+                            delta["content"] = serde_json::json!([{"type":"think","think":reasoning}]);
+                            delta.as_object_mut().unwrap().remove("reasoning_content");
+                            modified = true;
+                        } else if let Some(reasoning) = delta.get("reasoning").and_then(|v| v.as_str()) {
+                            delta["content"] = serde_json::json!([{"type":"think","think":reasoning}]);
+                            delta.as_object_mut().unwrap().remove("reasoning");
+                            modified = true;
+                        } else if let Some(text) = delta.get("content").and_then(|v| v.as_str()) {
+                            if !text.is_empty() {
+                                delta["content"] = serde_json::json!([{"type":"text","text":text}]);
+                                modified = true;
+                            }
+                        }
+                    }
+                    if modified {
+                        if let Ok(new_s) = serde_json::to_string(&event) {
+                            *bytes = if s.starts_with("data: ") {
+                                format!("data: {}\n\n", new_s).into_bytes()
+                            } else {
+                                format!("{}\n\n", new_s).into_bytes()
+                            };
+                        }
+                    }
+                }
+            };
+
+            let stream = backend_response
+                .bytes_stream()
+                .map(move |item| {
+                    let mut chunk = match item {
+                        Ok(c) => Ok::<_, std::io::Error>(c),
+                        Err(e) => Err(std::io::Error::new(std::io::ErrorKind::Other, e)),
+                    };
+                    if let Ok(ref mut c) = chunk {
+                        let mut buf = c.to_vec();
+                        on_chunk(&mut buf);
+                        *c = axum::body::Bytes::from(buf);
+                    }
+                    chunk
+                });
+            let body = Body::from_stream(stream);
+            return Ok((headers, body));
+        }
+
+        let body_bytes = backend_response
+            .bytes()
+            .await
+            .map_err(|_| StatusCode::BAD_GATEWAY)?;
+
+        // Transform chunk to LibreChat-compatible delta format
+        if let Ok(mut event) = serde_json::from_slice::<serde_json::Value>(&body_bytes) {
+            if let Some(choices) = event.get_mut("choices").and_then(|c| c.as_array_mut()) {
+                if let Some(choice) = choices.get_mut(0) {
+                    if let Some(delta) = choice.get_mut("delta") {
+                        if let Some(reasoning) = delta.get("reasoning_content").and_then(|v| v.as_str()) {
+                            delta["content"] = serde_json::json!([{"type":"think","think":reasoning}]);
+                            delta.as_object_mut().unwrap().remove("reasoning_content");
+                        } else if let Some(text) = delta.get("content").and_then(|v| v.as_str()) {
+                            if !text.is_empty() {
+                                delta["content"] = serde_json::json!([{"type":"text","text":text}]);
+                            }
+                        }
+                    }
+                }
+            }
+            let new_body = serde_json::to_vec(&event).unwrap_or(body_bytes.to_vec());
+            return Ok((headers, Body::from(new_body)));
+        }
+
+        Ok((headers, Body::from(body_bytes)))
     }
 
     /// Download image from URL and convert to base64 data URL.
@@ -622,6 +714,74 @@ impl GatewayState {
 
         let injected_payload = language::inject_language_prompt(language, payload);
 
+        let on_chunk = |chunk_bytes: &mut Vec<u8>, _streaming: bool| {
+            if let Ok(s) = std::str::from_utf8(chunk_bytes) {
+                let finish_reason_pos = s.find("\"finish_reason\":");
+                let has_reasoning = s.find("\"reasoning_content\":\"") != None;
+                let has_delta_content = !has_reasoning && s.find("\"delta\":{") != None;
+
+                if !has_reasoning && !has_delta_content {
+                    return;
+                }
+
+                if let Some(p) = finish_reason_pos {
+                    let after_key = &s[p + "\"finish_reason\":".len()..];
+                    let val_start = after_key.strip_prefix(' ')
+                        .or_else(|| after_key.strip_prefix('\"'))
+                        .map(|s| s.as_ptr());
+                    if let Some(start) = val_start {
+                        let mut end = start;
+                        unsafe { while *end != b',' && *end != b'}' && *end != b'\n' { end = end.add(1); } }
+                        let val = unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(start, end.offset_from(start) as usize)) };
+                        let trimmed = val.strip_prefix('\"').unwrap_or(val).strip_suffix('\"').unwrap_or(val);
+                        let fr_val = format!("\"finish_reason\":\"{trimmed}\"");
+                        let old_fr = &s[p..p + "\"finish_reason\":".len() + val.len() + 2];
+                        *chunk_bytes = s.replace(old_fr, &fr_val).into_bytes();
+                        return;
+                    }
+                }
+
+                if let Some(pos) = s.find("\"reasoning_content\":\"") {
+                    let rest = &s[pos + "\"reasoning_content\":\"".len()..];
+                    let mut end = 0;
+                    let mut bs_count = 0;
+                    while end < rest.len() {
+                        let c = rest.as_bytes()[end];
+                        if c == b'\\' { bs_count += 1; }
+                        else if c == b'"' && bs_count % 2 == 0 { break; }
+                        else { bs_count = 0; }
+                        end += 1;
+                    }
+                    let raw = &rest[..end];
+                    let val = rest[..end].replace('"', "\\\"");
+                    let replacement = format!("[{{\"type\":\"think\",\"think\":\"{val}\"}}]");
+                    let old_slice = &s[pos..pos + "\"reasoning_content\":\"".len() + end];
+                    *chunk_bytes = s.replacen(old_slice, &replacement, 1).into_bytes();
+                    return;
+                }
+
+                if has_delta_content {
+                    if let Some(pos) = s.find("\"content\":\"") {
+                        let rest = &s[pos + "\"content\":\"".len()..];
+                        let mut end = 0;
+                        let mut bs_count = 0;
+                        while end < rest.len() {
+                            let c = rest.as_bytes()[end];
+                            if c == b'\\' { bs_count += 1; }
+                            else if c == b'"' && bs_count % 2 == 0 { break; }
+                            else { bs_count = 0; }
+                            end += 1;
+                        }
+                        let raw = &rest[..end];
+                        let val = rest[..end].replace('"', "\\\"");
+                        let replacement = format!("[{{\"type\":\"text\",\"text\":\"{val}\"}}]");
+                        let old_slice = &s[pos..pos + "\"content\":\"".len() + end];
+                        *chunk_bytes = s.replacen(old_slice, &replacement, 1).into_bytes();
+                    }
+                }
+            }
+        };
+
         // Record load metrics
         self.load_tracker.record(complexity_score);
 
@@ -748,10 +908,13 @@ impl GatewayState {
 
         // === Small model path ===
         info!("SMALL_MODEL_PATH: target_url={}, use_small=true", target_url);
-        let small_payload = injected_payload.clone();
+        let mut small_payload = injected_payload.clone();
         info!("SMALL_MODEL_PAYLOAD_SENT: messages={}", small_payload.messages.len());
 
-        // Streaming: proxy directly (no confidence check possible on a stream)
+        if small_payload.max_tokens.is_none() {
+            small_payload.max_tokens = Some(4096);
+        }
+
         if is_streaming {
             let result = self.proxy_to_backend(&small_payload, &target_url, true).await;
             match &result {
@@ -771,6 +934,10 @@ impl GatewayState {
         let mut small_payload = small_payload;
         small_payload.logprobs = Some(true);
         small_payload.top_logprobs = Some(0);
+
+        if let Some(max_tokens) = injected_payload.max_tokens {
+            small_payload.max_tokens = Some(max_tokens);
+        }
 
         let backend_response = self
             .http_client
@@ -865,7 +1032,67 @@ impl GatewayState {
     }
 }
 
-/// Simple base64 encoder (no external dependency needed).
+// ── OpenAI-compatible model response types ──
+
+#[derive(Debug, Serialize)]
+struct ModelPermission {
+    id: String,
+    object: String,
+    created: u64,
+    allow_create_engine: bool,
+    allow_sampling: bool,
+    allow_logprobs: bool,
+    allow_search_indices: bool,
+    allow_view: bool,
+    allow_fine_tuning: bool,
+    organization: String,
+    group: Option<String>,
+    is_blocking: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct ModelInfo {
+    id: String,
+    object: String,
+    created: u64,
+    owned_by: String,
+    permission: Vec<ModelPermission>,
+    root: String,
+    parent: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ModelList {
+    object: String,
+    data: Vec<ModelInfo>,
+}
+
+fn build_model_info(id: &str) -> ModelInfo {
+    ModelInfo {
+        id: id.to_string(),
+        object: "model".to_string(),
+        created: 1740000000,
+        owned_by: "netai-stack".to_string(),
+        permission: vec![ModelPermission {
+            id: format!("modelperm-{}", id),
+            object: "model_permission".to_string(),
+            created: 1740000000,
+            allow_create_engine: false,
+            allow_sampling: true,
+            allow_logprobs: true,
+            allow_search_indices: false,
+            allow_view: true,
+            allow_fine_tuning: false,
+            organization: "*".to_string(),
+            group: None,
+            is_blocking: false,
+        }],
+        root: id.to_string(),
+        parent: None,
+    }
+}
+
+// ── Base64 encoder ──
 fn base64_encode(input: &[u8]) -> String {
     const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut output = String::with_capacity((input.len() + 2) / 3 * 4);
@@ -892,42 +1119,34 @@ fn base64_encode(input: &[u8]) -> String {
 }
 
 async fn fetch_models_handler(State(state): State<GatewayState>) -> Response {
-    let inference_url = std::env::var("INFERENCE_URL")
-        .unwrap_or_else(|_| "http://netai-inference:8080".to_string());
-    let models_url = format!("{}/v1/models", inference_url.trim_end_matches('/'));
+    let models = ModelList {
+        object: "list".to_string(),
+        data: vec![
+            build_model_info(&state.main_model_name),
+            build_model_info(&state.small_model_name),
+        ],
+    };
+    let body = Body::from(serde_json::to_string(&models).unwrap_or_default());
+    let mut response = Response::new(body);
+    response.headers_mut().insert("content-type", HeaderValue::from_static("application/json"));
+    response
+}
 
-    match state.http_client.get(&models_url).send().await {
-        Ok(resp) => {
-            let status = resp.status();
-            if !status.is_success() {
-                let err_body = resp.text().await.unwrap_or_default();
-                warn!("Inference server /v1/models returned HTTP {}: {}", status, err_body);
-                let error_json = Body::from(
-                    serde_json::json!({"error": {"message": "upstream model listing failed", "type": "upstream_error"}})
-                        .to_string(),
-                );
-                let mut response = Response::new(error_json);
-                response.headers_mut().insert("content-type", HeaderValue::from_static("application/json"));
-                *response.status_mut() = StatusCode::BAD_GATEWAY;
-                return response;
-            }
-            let body_bytes = resp.bytes().await.unwrap_or_default();
-            let mut response = Response::new(Body::from(body_bytes));
-            response.headers_mut().insert("content-type", HeaderValue::from_static("application/json"));
-            response
-        }
-        Err(e) => {
-            warn!("Failed to reach inference server /v1/models: {}", e);
-            let error_json = Body::from(
-                serde_json::json!({"error": {"message": "inference server unreachable", "type": "upstream_error"}})
-                    .to_string(),
-            );
-            let mut response = Response::new(error_json);
-            response.headers_mut().insert("content-type", HeaderValue::from_static("application/json"));
-            *response.status_mut() = StatusCode::BAD_GATEWAY;
-            response
-        }
-    }
+async fn model_handler(State(state): State<GatewayState>) -> Response {
+    let model = build_model_info(&state.main_model_name);
+    let body = Body::from(serde_json::to_string(&model).unwrap_or_default());
+    let mut response = Response::new(body);
+    response.headers_mut().insert("content-type", HeaderValue::from_static("application/json"));
+    response
+}
+
+async fn health_handler() -> Response {
+    let body = Body::from(
+        serde_json::json!({"status": "ok"}).to_string()
+    );
+    let mut response = Response::new(body);
+    response.headers_mut().insert("content-type", HeaderValue::from_static("application/json"));
+    response
 }
 
 async fn handler(
@@ -1003,6 +1222,8 @@ async fn main() {
     let app = Router::new()
         .route("/v1/chat/completions", post(handler))
         .route("/v1/models", get(fetch_models_handler))
+        .route("/model", get(model_handler))
+        .route("/health", get(health_handler))
         .layer(DefaultBodyLimit::disable())
         .with_state(state);
 

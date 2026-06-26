@@ -4,10 +4,17 @@ use tracing::info;
 
 pub fn detect_language(messages: &[ChatMessage]) -> &'static str {
     let text = extract_text(messages);
-    if text.is_empty() { return "en"; }
+    if text.len() < 5 { return "en"; }
+
+    let german_indicators = [" ist ", " die ", " der ", " das ", " nicht ", " bist ", " wer ", " was ", " wie ", " ä", " ö", " ü", "ß"];
+    let lower = text.to_lowercase();
+    if german_indicators.iter().any(|i| lower.contains(i)) {
+        info!("LANGUAGE_DETECTION: text={}, detected=German (heuristic)", text);
+        return "de";
+    }
 
     let detector = LanguageDetectorBuilder::from_all_languages()
-        .with_minimum_relative_distance(0.1)
+        .with_minimum_relative_distance(0.3)
         .build();
 
     let result = detector.detect_language_of(&text);
