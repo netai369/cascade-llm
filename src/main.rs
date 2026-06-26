@@ -8,7 +8,8 @@ use axum::{
     body::Body,
     extract::{DefaultBodyLimit, Json, State},
     http::{HeaderMap, HeaderValue, StatusCode},
-    routing::post,
+    response::Response,
+    routing::{get, post},
     Router,
 };
 use futures_util::stream::StreamExt;
@@ -372,6 +373,17 @@ impl GatewayState {
             .await
             .map_err(|_| StatusCode::BAD_GATEWAY)?;
 
+        let status = backend_response.status();
+        if !status.is_success() {
+            let err_body = backend_response
+                .text()
+                .await
+                .unwrap_or_default();
+            warn!("Backend error HTTP {} from {}: {}", status, url, err_body);
+            let error_code = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+            return Err(error_code);
+        }
+
         let mut headers = HeaderMap::new();
         if is_streaming {
             headers.insert("content-type", HeaderValue::from_static("text/event-stream"));
@@ -463,13 +475,20 @@ impl GatewayState {
         }
 
         let body: Value = resp.json().await.ok()?;
-        body.get("choices")?
+        let msg = body.get("choices")?
             .as_array()?
             .first()?
-            .get("message")?
-            .get("content")?
-            .as_str()
-            .map(|s| s.to_string())
+            .get("message")?;
+        let content = msg.get("content")?.as_str().map(|s| s.to_string());
+        let reasoning = msg.get("reasoning_content")?.as_str().map(|s| s.to_string());
+
+        let description = match (content, reasoning) {
+            (Some(ref c), _) if !c.is_empty() => Some(c.clone()),
+            (_, Some(ref r)) if !r.is_empty() => Some(r.clone()),
+            _ => None,
+        };
+
+        description
     }
 
     /// Replace image_url parts with text descriptions in the payload.
@@ -545,8 +564,17 @@ impl GatewayState {
         let session_key = headers
             .get("x-conversation-id")
             .or_else(|| headers.get("x-librechat-conversation-id"))
-            .and_then(|v| v.to_str().ok().map(|s| s.to_string()))
-            .or_else(|| payload.user.clone());
+            .and_then(|v| v.to_str().ok().map(|s| s.to_string()));
+
+        let has_reliable_session_key = session_key.is_some();
+
+        let session_key = session_key.or_else(|| {
+            payload.user.as_ref().map(|u| {
+                let msg_count = payload.messages.len();
+                let first_role = payload.messages.first().map(|m| m.role.as_str()).unwrap_or("none");
+                format!("user:{}:{}:{}", u, msg_count, first_role)
+            })
+        });
 
         let cached_route = if let Some(ref key) = session_key {
             let cache = self.session_cache.read().await;
@@ -564,8 +592,8 @@ impl GatewayState {
             None
         };
 
-        info!("[REQ_START] has_image={}, has_tools={}, history_has_tools={}, session_key={:?}, cached_route={:?}, tier={}", 
-            has_image, has_tools, history_has_tools, session_key, cached_route, tier);
+        info!("[REQ_START] has_image={}, has_tools={}, history_has_tools={}, session_key={:?}, cached_route={:?}, tier={}, has_reliable_session_key={}",
+            has_image, has_tools, history_has_tools, session_key, cached_route, tier, has_reliable_session_key);
         info!("[REQ] user_text={:?}", language::extract_text(&payload.messages));
 
         info!("DETECTED_LANGUAGE: {}", language);
@@ -603,8 +631,8 @@ impl GatewayState {
 
         // Sticky Session Affinity Logic
         // Determine routing target based on cache or tool history
-        let target_override = if let Some(url) = cached_route {
-            info!("SESSION AFFINITY: Using cached route target_url={}", url);
+        let mut target_override = if let Some(url) = cached_route {
+            info!("SESSION AFFINITY: candidate from cache target_url={}", url);
             Some(url)
         } else if history_has_tools {
             info!("SESSION AFFINITY: History has tools but no cached route. Forcing large model target_url={}", large_url);
@@ -617,8 +645,18 @@ impl GatewayState {
             None
         };
 
+        if let Some(ref url) = target_override {
+            if has_image && !self.large_model_multimodal {
+                warn!("SESSION AFFINITY INVALIDATED: request has images but large model is text-only; falling back to image routing via small vision model");
+                target_override = None;
+                if let Some(ref key) = session_key {
+                    let mut cache = self.session_cache.write().await;
+                    cache.remove(key);
+                }
+            }
+        }
+
         if let Some(target) = target_override {
-            // Check if we need image description first (if image present and target is not multimodal or is large text, but wait, if it has_image and has_tools, we already handle it below, let's keep it simple: if there is a session target override, bypass complexity evaluation/model picker and proxy directly to the target)
             info!("SESSION AFFINITY ROUTE: Proxying directly to target={}", target);
             let result = self.proxy_to_backend(&injected_payload, &target, is_streaming).await;
             match &result {
@@ -646,15 +684,15 @@ impl GatewayState {
                 }
             }
 
-            // Replace images with descriptions and route to large model
+            // Replace images with descriptions and route to large text model as requested
             let mut modified_payload = injected_payload.clone();
             self.replace_images_with_text(&mut modified_payload, &descriptions);
 
-            info!("IMAGE + TOOLS: routing text+tools to large text model");
+            info!("IMAGE + TOOLS: routing text+descriptions+tools to large text model ({})", large_url);
             let result = self.proxy_to_backend(&modified_payload, &large_url, is_streaming).await;
             // Track success/failure
             match &result {
-                Ok(_) => { 
+                Ok(_) => {
                     self.circuit_breaker.record_success(&large_url).await;
                     if let Some(ref key) = session_key {
                         let mut cache = self.session_cache.write().await;
@@ -853,17 +891,80 @@ fn base64_encode(input: &[u8]) -> String {
     output
 }
 
+async fn fetch_models_handler(State(state): State<GatewayState>) -> Response {
+    let inference_url = std::env::var("INFERENCE_URL")
+        .unwrap_or_else(|_| "http://netai-inference:8080".to_string());
+    let models_url = format!("{}/v1/models", inference_url.trim_end_matches('/'));
+
+    match state.http_client.get(&models_url).send().await {
+        Ok(resp) => {
+            let status = resp.status();
+            if !status.is_success() {
+                let err_body = resp.text().await.unwrap_or_default();
+                warn!("Inference server /v1/models returned HTTP {}: {}", status, err_body);
+                let error_json = Body::from(
+                    serde_json::json!({"error": {"message": "upstream model listing failed", "type": "upstream_error"}})
+                        .to_string(),
+                );
+                let mut response = Response::new(error_json);
+                response.headers_mut().insert("content-type", HeaderValue::from_static("application/json"));
+                *response.status_mut() = StatusCode::BAD_GATEWAY;
+                return response;
+            }
+            let body_bytes = resp.bytes().await.unwrap_or_default();
+            let mut response = Response::new(Body::from(body_bytes));
+            response.headers_mut().insert("content-type", HeaderValue::from_static("application/json"));
+            response
+        }
+        Err(e) => {
+            warn!("Failed to reach inference server /v1/models: {}", e);
+            let error_json = Body::from(
+                serde_json::json!({"error": {"message": "inference server unreachable", "type": "upstream_error"}})
+                    .to_string(),
+            );
+            let mut response = Response::new(error_json);
+            response.headers_mut().insert("content-type", HeaderValue::from_static("application/json"));
+            *response.status_mut() = StatusCode::BAD_GATEWAY;
+            response
+        }
+    }
+}
+
 async fn handler(
     State(state): State<GatewayState>,
     headers: HeaderMap,
     Json(payload): Json<ChatCompletionRequest>,
-) -> Result<(HeaderMap, Body), StatusCode> {
+) -> Response {
     let is_streaming = payload.stream.unwrap_or(false);
     let tier = headers
         .get("x-tier")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("standard");
-    state.route_request(payload, is_streaming, tier, &headers).await
+
+    match state.route_request(payload, is_streaming, tier, &headers).await {
+        Ok((hdrs, body)) => {
+            let mut response = Response::new(body);
+            *response.headers_mut() = hdrs;
+            response
+        }
+        Err(status) => {
+            let error_json = Body::from(
+                serde_json::json!({
+                    "error": {
+                        "message": format!("HTTP {}", status.as_u16()),
+                        "type": "cascade_proxy_error",
+                        "param": Value::Null,
+                        "code": Value::Number(status.as_u16().into())
+                    }
+                })
+                .to_string(),
+            );
+            let mut response = Response::new(error_json);
+            response.headers_mut().insert("content-type", HeaderValue::from_static("application/json"));
+            *response.status_mut() = status;
+            response
+        }
+    }
 }
 
 #[tokio::main]
@@ -901,6 +1002,7 @@ async fn main() {
     let state = GatewayState::new(large_model_multimodal);
     let app = Router::new()
         .route("/v1/chat/completions", post(handler))
+        .route("/v1/models", get(fetch_models_handler))
         .layer(DefaultBodyLimit::disable())
         .with_state(state);
 

@@ -94,7 +94,7 @@ pub fn inject_language_prompt(language: &str, mut payload: ChatCompletionRequest
             tool_call_id: None,
             name: None,
         });
-        info!("Injected {} system prompt into small model request", lang_name);
+        info!("Injected {} system prompt into model request", lang_name);
     } else {
         if let Some(sys_msg) = payload.messages.iter_mut().find(|m| m.role == "system") {
             if let Some(ref mut content) = sys_msg.content {
