@@ -3,7 +3,6 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::time::timeout;
 
 use axum::{
     body::Body,
@@ -567,12 +566,15 @@ impl GatewayState {
         }
 
         let body: Value = resp.json().await.ok()?;
+        info!("Vision raw response: {}", body.to_string().chars().take(200).collect::<String>());
+
         let msg = body.get("choices")?
             .as_array()?
             .first()?
             .get("message")?;
-        let content = msg.get("content")?.as_str().map(|s| s.to_string());
-        let reasoning = msg.get("reasoning_content")?.as_str().map(|s| s.to_string());
+        
+        let content = msg.get("content").and_then(|v| v.as_str()).map(|s| s.to_string());
+        let reasoning = msg.get("reasoning_content").and_then(|v| v.as_str()).map(|s| s.to_string());
 
         let description = match (content, reasoning) {
             (Some(ref c), _) if !c.is_empty() => Some(c.clone()),
@@ -580,7 +582,31 @@ impl GatewayState {
             _ => None,
         };
 
-        description
+        // Clean out special Unicode tags (e.g. \ue202turn0description1) produced by certain vision models
+        description.map(|desc| {
+            let re = regex::Regex::new(r"\\?u[eE][0-9a-fA-F]{3}[^\s:]*[:\s]*").unwrap();
+            re.replace_all(&desc, "").to_string()
+        })
+    }
+
+    /// Converts all image URLs in the payload to base64 data URIs
+    /// to ensure llama.cpp can read them.
+    async fn inline_all_images(&self, payload: &mut ChatCompletionRequest) {
+        for msg in payload.messages.iter_mut() {
+            if let Some(ref mut content) = msg.content {
+                if let MessageContent::Parts(parts) = content {
+                    for part in parts.iter_mut() {
+                        if let MessageContentPart::ImageUrl { image_url } = part {
+                            if !image_url.url.starts_with("data:") {
+                                if let Some(base64_data) = self.download_image_as_base64(&image_url.url).await {
+                                    image_url.url = base64_data;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Replace image_url parts with text descriptions in the payload.
@@ -595,7 +621,7 @@ impl GatewayState {
                             MessageContentPart::ImageUrl { .. } => {
                                 if desc_idx < descriptions.len() {
                                     new_parts.push(MessageContentPart::Text {
-                                        text: format!("[Image: {}]", descriptions[desc_idx]),
+                                        text: format!("[System - Image Description: {}]", descriptions[desc_idx]),
                                     });
                                     desc_idx += 1;
                                 }
@@ -712,9 +738,12 @@ impl GatewayState {
             }
         }
 
-        let injected_payload = language::inject_language_prompt(language, payload);
+        let mut injected_payload = language::inject_language_prompt(language, payload);
+        if has_image {
+            self.inline_all_images(&mut injected_payload).await;
+        }
 
-        let on_chunk = |chunk_bytes: &mut Vec<u8>, _streaming: bool| {
+        let _on_chunk = |chunk_bytes: &mut Vec<u8>, _streaming: bool| {
             if let Ok(s) = std::str::from_utf8(chunk_bytes) {
                 let finish_reason_pos = s.find("\"finish_reason\":");
                 let has_reasoning = s.find("\"reasoning_content\":\"") != None;
@@ -752,7 +781,7 @@ impl GatewayState {
                         else { bs_count = 0; }
                         end += 1;
                     }
-                    let raw = &rest[..end];
+                    let _raw = &rest[..end];
                     let val = rest[..end].replace('"', "\\\"");
                     let replacement = format!("[{{\"type\":\"think\",\"think\":\"{val}\"}}]");
                     let old_slice = &s[pos..pos + "\"reasoning_content\":\"".len() + end];
@@ -772,7 +801,7 @@ impl GatewayState {
                             else { bs_count = 0; }
                             end += 1;
                         }
-                        let raw = &rest[..end];
+                        let _raw = &rest[..end];
                         let val = rest[..end].replace('"', "\\\"");
                         let replacement = format!("[{{\"type\":\"text\",\"text\":\"{val}\"}}]");
                         let old_slice = &s[pos..pos + "\"content\":\"".len() + end];
@@ -805,7 +834,7 @@ impl GatewayState {
             None
         };
 
-        if let Some(ref url) = target_override {
+        if let Some(ref _url) = target_override {
             if has_image && !self.large_model_multimodal {
                 warn!("SESSION AFFINITY INVALIDATED: request has images but large model is text-only; falling back to image routing via small vision model");
                 target_override = None;

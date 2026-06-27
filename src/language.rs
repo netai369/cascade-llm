@@ -1,5 +1,5 @@
 use crate::{ChatMessage, ChatCompletionRequest, MessageContent, MessageContentPart};
-use lingua::{Language, LanguageDetector, LanguageDetectorBuilder};
+use lingua::{Language, LanguageDetectorBuilder};
 use tracing::info;
 
 pub fn detect_language(messages: &[ChatMessage]) -> &'static str {
