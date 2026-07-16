@@ -12,11 +12,14 @@ use axum::{
     routing::{get, post},
     Router,
 };
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use futures_util::stream::StreamExt;
+use moka::future::Cache;
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::net::TcpListener;
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, Semaphore};
 use tracing::{info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -192,6 +195,7 @@ impl LoadTracker {
             .fetch_add((complexity * 100.0) as u64, Ordering::Relaxed);
     }
 
+    #[allow(dead_code)]
     fn avg_complexity(&self) -> f64 {
         let count = self.request_count.load(Ordering::Relaxed);
         if count == 0 {
@@ -217,7 +221,8 @@ struct GatewayState {
     route_tools_to_large: bool,
     circuit_breaker: CircuitBreaker,
     load_tracker: LoadTracker,
-    session_cache: Arc<RwLock<HashMap<String, (String, Instant)>>>,
+    session_cache: Cache<String, String>,
+    image_semaphore: Arc<Semaphore>,
 }
 
 impl GatewayState {
@@ -259,6 +264,11 @@ impl GatewayState {
         let small_model_name = std::env::var("SMALL_MODEL_NAME")
             .unwrap_or_else(|_| "gpt-4o-mini".to_string());
 
+        let max_concurrent_images = std::env::var("MAX_CONCURRENT_IMAGES")
+            .unwrap_or_else(|_| "4".to_string())
+            .parse::<usize>()
+            .unwrap_or(4);
+
         Self {
             http_client,
             small_mllm_url,
@@ -272,7 +282,11 @@ impl GatewayState {
             route_tools_to_large,
             circuit_breaker: CircuitBreaker::new(cb_threshold, cb_reset),
             load_tracker: LoadTracker::default(),
-            session_cache: Arc::new(RwLock::new(HashMap::new())),
+            session_cache: Cache::builder()
+                .max_capacity(10_000)
+                .time_to_live(Duration::from_secs(3600))
+                .build(),
+            image_semaphore: Arc::new(Semaphore::new(max_concurrent_images)),
         }
     }
 
@@ -281,10 +295,64 @@ impl GatewayState {
     }
 
     fn evaluate_complexity(&self, messages: &[ChatMessage]) -> f64 {
+        let detected_lang = language::detect_language(messages);
         let mut total_chars = 0;
         let mut keyword_score = 0.0;
-        let keywords = ["analyze deeply", "write code", "expert", "reasoning", "logic", "complex"];
 
+        let keywords: Vec<&str> = match detected_lang {
+            "de" => vec!["analysiere", "schreibe", "experte", "logik", "komplex"],
+            "fr" => vec!["analyser", "écrire", "expert", "logique", "complexe"],
+            "es" => vec!["analizar", "escribir", "experto", "lógica", "complejo"],
+            "it" => vec!["analizza", "scrivi", "esperto", "logica", "complesso"],
+            "pl" => vec!["analizuj", "napisz", "ekspert", "logika", "skomplikowany"],
+            "hu" => vec!["elemezd", "írj", "szakértő", "logika", "komplex"],
+            _ => vec!["analyze deeply", "write code", "expert", "reasoning", "logic", "complex"],
+        };
+
+        let complex_indicators: Vec<&str> = match detected_lang {
+            "de" => vec![
+                "analysiere tief", "schreibe code", "experte", "logik", "komplex",
+                "schritt 1", "schritt 2", "erstens", "zweitens", "dritten",
+                "architektur", "infrastruktur", "debuggen", "optimieren", "refaktorisieren",
+                "theorem", "beweis", "berechnen", "gleichung", "ableitung",
+            ],
+            "fr" => vec![
+                "analyser en détail", "écrire du code", "expert", "logique", "complexe",
+                "étape 1", "étape 2", "premièrement", "deuxièmement", "troisièmement",
+                "architecture", "infrastructure", "déboguer", "optimiser", "refactoriser",
+                "théorème", "preuve", "calculer", "équation", "dérivée",
+            ],
+            "es" => vec![
+                "analizar profundamente", "escribir código", "experto", "lógica", "complejo",
+                "paso 1", "paso 2", "primero", "segundo", "tercero",
+                "arquitectura", "infraestructura", "depurar", "optimizar", "refactorizar",
+                "teorema", "prueba", "calcular", "ecuación", "derivada",
+            ],
+            "it" => vec![
+                "analizza approfonditamente", "scrivi codice", "esperto", "logica", "complesso",
+                "passo 1", "passo 2", "prima", "seconda", "terza",
+                "architettura", "infrastruttura", "debuggare", "ottimizzare", "refattorizzare",
+                "teorema", "prova", "calcolare", "equazione", "derivata",
+            ],
+            "pl" => vec![
+                "analizuj głęboko", "napisz kod", "ekspert", "logika", "skomplikowany",
+                "krok 1", "krok 2", "pierwszy", "drugi", "trzeci",
+                "architektura", "infrastruktura", "debugować", "zoptymalizować", "refaktoryzować",
+                "twierdzenie", "dowód", "obliczyć", "równanie", "pochodna",
+            ],
+            "hu" => vec![
+                "elemezd mélyen", "írj kódot", "szakértő", "logika", "komplex",
+                "1. lépés", "2. lépés", "elsőként", "másodikként", "harmadik",
+                "architektúra", "infrastruktúra", "hibakeresés", "optimalizálás", "refaktorálás",
+                "tétel", "bizonyíték", "számít", "egyenlet", "derivál",
+            ],
+            _ => vec![
+                "analyze deeply", "write code", "expert", "reasoning", "logic", "complex",
+                "step 1", "step 2", "first,", "second,", "third,", "four", "five",
+                "architecture", "infrastructure", "debug", "optimize", "refactor",
+                "theorem", "proof", "calculate", "compute", "equation", "derivative",
+            ],
+};
         for msg in messages {
             if let Some(ref content) = msg.content {
                 match content {
@@ -295,6 +363,18 @@ impl GatewayState {
                                 keyword_score += 0.2;
                             }
                         }
+                        for indicator in &complex_indicators {
+                            if text.to_lowercase().contains(indicator) {
+                                keyword_score += 0.15;
+                            }
+                        }
+                        // Count code blocks (```)
+                        let code_block_count = text.matches("```").count() / 2;
+                        keyword_score += code_block_count as f64 * 0.25;
+                        // Count numbered lists (multilingual)
+                        let list_patterns = ["\n1.", "\n2.", "\n3.", "\n1)", "\na)", "\na."];
+                        let list_count = list_patterns.iter().map(|p| text.matches(p).count()).sum::<usize>();
+                        keyword_score += list_count as f64 * 0.1;
                     }
                     MessageContent::Parts(parts) => {
                         for part in parts {
@@ -306,6 +386,18 @@ impl GatewayState {
                                             keyword_score += 0.2;
                                         }
                                     }
+                                    for indicator in &complex_indicators {
+                                        if text.to_lowercase().contains(indicator) {
+                                            keyword_score += 0.15;
+                                        }
+                                    }
+                                    // Count code blocks (```) in parts
+                                    let code_block_count = text.matches("```").count() / 2;
+                                    keyword_score += code_block_count as f64 * 0.25;
+                                    // Count numbered lists in parts
+                                    let list_patterns = ["\n1.", "\n2.", "\n3.", "\n1)", "\na)", "\na."];
+                                    let list_count = list_patterns.iter().map(|p| text.matches(p).count()).sum::<usize>();
+                                    keyword_score += list_count as f64 * 0.1;
                                 }
                                 MessageContentPart::ImageUrl { .. } => {
                                     total_chars += 100;
@@ -318,7 +410,7 @@ impl GatewayState {
         }
 
         let char_score = (total_chars as f64 / 1000.0).min(1.0);
-        let mut score = 0.5 * char_score + 0.5 * keyword_score;
+        let mut score = 0.5 * char_score + 0.5 * keyword_score.min(1.0);
         score = score.min(1.0).max(0.0);
         score
     }
@@ -493,10 +585,14 @@ impl GatewayState {
     }
 
     /// Download image from URL and convert to base64 data URL.
+    /// Uses semaphore to limit concurrent downloads.
     async fn download_image_as_base64(&self, url: &str) -> Option<String> {
         if url.starts_with("data:") {
             return Some(url.to_string());
         }
+        // Acquire semaphore permit to limit concurrent downloads
+        let _permit = self.image_semaphore.acquire().await.ok()?;
+        
         let resp = self.http_client.get(url).send().await.ok()?;
         let content_type = resp
             .headers()
@@ -505,7 +601,7 @@ impl GatewayState {
             .unwrap_or("image/png")
             .to_string();
         let bytes = resp.bytes().await.ok()?;
-        let encoded = base64_encode(&bytes);
+        let encoded = BASE64_STANDARD.encode(&bytes);
         Some(format!("data:{};base64,{}", content_type, encoded))
     }
 
@@ -519,6 +615,7 @@ impl GatewayState {
             image_url.to_string()
         };
         info!("Downloading image for description: {}", url_preview);
+        
         let data_url = self.download_image_as_base64(image_url).await?;
         info!("Image downloaded, size: {} bytes", data_url.len());
 
@@ -584,23 +681,48 @@ impl GatewayState {
 
         // Clean out special Unicode tags (e.g. \ue202turn0description1) produced by certain vision models
         description.map(|desc| {
-            let re = regex::Regex::new(r"\\?u[eE][0-9a-fA-F]{3}[^\s:]*[:\s]*").unwrap();
+            let re = Regex::new(r"\\?u[eE][0-9a-fA-F]{3}[^\s:]*[:\s]*").unwrap();
             re.replace_all(&desc, "").to_string()
         })
     }
 
     /// Converts all image URLs in the payload to base64 data URIs
-    /// to ensure llama.cpp can read them.
+    /// to ensure llama.cpp can read them. Uses concurrent downloads with semaphore.
     async fn inline_all_images(&self, payload: &mut ChatCompletionRequest) {
         for msg in payload.messages.iter_mut() {
             if let Some(ref mut content) = msg.content {
                 if let MessageContent::Parts(parts) = content {
+                    // Collect image URLs that need to be downloaded
+                    let urls_to_download: Vec<_> = parts
+                        .iter()
+                        .filter_map(|p| {
+                            if let MessageContentPart::ImageUrl { image_url } = p {
+                                if !image_url.url.starts_with("data:") {
+                                    Some(image_url.url.clone())
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+
+                    // Download all images concurrently with semaphore-limited concurrency
+                    let download_futures = urls_to_download.into_iter().map(|url| async move {
+                        self.download_image_as_base64(&url).await
+                    });
+                    let downloaded_urls = futures_util::future::join_all(download_futures).await;
+
+                    // Replace image URLs with downloaded data URLs
+                    let mut url_idx = 0;
                     for part in parts.iter_mut() {
                         if let MessageContentPart::ImageUrl { image_url } = part {
-                            if !image_url.url.starts_with("data:") {
-                                if let Some(base64_data) = self.download_image_as_base64(&image_url.url).await {
-                                    image_url.url = base64_data;
+                            if !image_url.url.starts_with("data:") && url_idx < downloaded_urls.len() {
+                                if let Some(base64_data) = &downloaded_urls[url_idx] {
+                                    image_url.url = base64_data.clone();
                                 }
+                                url_idx += 1;
                             }
                         }
                     }
@@ -686,38 +808,31 @@ impl GatewayState {
 
         let has_reliable_session_key = session_key.is_some();
 
+        // Fallback key uses user ID + content hash to distinguish concurrent chats from same user
+        let aggregated_text = language::extract_text(&payload.messages);
         let session_key = session_key.or_else(|| {
             payload.user.as_ref().map(|u| {
-                let msg_count = payload.messages.len();
-                let first_role = payload.messages.first().map(|m| m.role.as_str()).unwrap_or("none");
-                format!("user:{}:{}:{}", u, msg_count, first_role)
+                use std::collections::hash_map::DefaultHasher;
+                use std::hash::{Hash, Hasher};
+                let mut hasher = DefaultHasher::new();
+                aggregated_text.hash(&mut hasher);
+                format!("user:{}:conv_{}", u, hasher.finish())
             })
         });
 
         let cached_route = if let Some(ref key) = session_key {
-            let cache = self.session_cache.read().await;
-            if let Some((url, timestamp)) = cache.get(key) {
-                // Cache entry valid for 1 hour
-                if timestamp.elapsed() < Duration::from_secs(3600) {
-                    Some(url.clone())
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
+            self.session_cache.get(key).await
         } else {
             None
         };
 
-        info!("[REQ_START] has_image={}, has_tools={}, history_has_tools={}, session_key={:?}, cached_route={:?}, tier={}, has_reliable_session_key={}",
-            has_image, has_tools, history_has_tools, session_key, cached_route, tier, has_reliable_session_key);
-        info!("[REQ] user_text={:?}", language::extract_text(&payload.messages));
+         info!("[REQ_START] has_image={}, has_tools={}, history_has_tools={}, session_key={:?}, cached_route={:?}, tier={}, has_reliable_session_key={}",
+             has_image, has_tools, history_has_tools, session_key, cached_route, tier, has_reliable_session_key);
+         info!("[REQ] user_text={:?}", language::extract_text(&payload.messages));
 
-        info!("DETECTED_LANGUAGE: {}", language);
+         info!("DETECTED_LANGUAGE: {}", language);
 
-        let aggregated_text = language::extract_text(&payload.messages);
-        info!("REQUEST_MESSAGES: count={}, aggregated_text_length={}, aggregated_text_preview={}", 
+         info!("REQUEST_MESSAGES: count={}, aggregated_text_length={}, aggregated_text_preview={}",
             payload.messages.len(), aggregated_text.len(), aggregated_text.chars().take(200).collect::<String>());
         for (i, msg) in payload.messages.iter().enumerate() {
             if let Some(ref content) = msg.content {
@@ -826,8 +941,7 @@ impl GatewayState {
         } else if history_has_tools {
             info!("SESSION AFFINITY: History has tools but no cached route. Forcing large model target_url={}", large_url);
             if let Some(ref key) = session_key {
-                let mut cache = self.session_cache.write().await;
-                cache.insert(key.clone(), (large_url.clone(), Instant::now()));
+                self.session_cache.insert(key.clone(), large_url.clone()).await;
             }
             Some(large_url.clone())
         } else {
@@ -839,8 +953,7 @@ impl GatewayState {
                 warn!("SESSION AFFINITY INVALIDATED: request has images but large model is text-only; falling back to image routing via small vision model");
                 target_override = None;
                 if let Some(ref key) = session_key {
-                    let mut cache = self.session_cache.write().await;
-                    cache.remove(key);
+                    self.session_cache.remove(key).await;
                 }
             }
         }
@@ -858,20 +971,21 @@ impl GatewayState {
         // If both image AND tools: describe image with small vision model,
         // then route text description + tools to large text model
         if has_image && has_tools {
-            info!("IMAGE + TOOLS: describing image with small vision model first");
+            info!("IMAGE + TOOLS: describing images with small vision model first");
 
             let image_urls = self.extract_image_urls(&injected_payload.messages);
 
-            // Describe each image
-            let mut descriptions = Vec::new();
-            for url in &image_urls {
-                if let Some(desc) = self.describe_image(url, language).await {
-                    info!("Image description: {}", desc.chars().take(100).collect::<String>());
-                    descriptions.push(desc);
-                } else {
-                    descriptions.push("[Image could not be described]".to_string());
+            // Describe images concurrently with semaphore-limited downloads
+            let description_futures = image_urls.iter().map(|url| async {
+                match self.describe_image(url, language).await {
+                    Some(desc) => {
+                        info!("Image description: {}", desc.chars().take(100).collect::<String>());
+                        desc
+                    }
+                    None => "[Image could not be described]".to_string()
                 }
-            }
+            });
+            let descriptions = futures_util::future::join_all(description_futures).await;
 
             // Replace images with descriptions and route to large text model as requested
             let mut modified_payload = injected_payload.clone();
@@ -879,13 +993,11 @@ impl GatewayState {
 
             info!("IMAGE + TOOLS: routing text+descriptions+tools to large text model ({})", large_url);
             let result = self.proxy_to_backend(&modified_payload, &large_url, is_streaming).await;
-            // Track success/failure
             match &result {
                 Ok(_) => {
                     self.circuit_breaker.record_success(&large_url).await;
                     if let Some(ref key) = session_key {
-                        let mut cache = self.session_cache.write().await;
-                        cache.insert(key.clone(), (large_url.clone(), Instant::now()));
+                        self.session_cache.insert(key.clone(), large_url.clone()).await;
                     }
                 }
                 Err(_) => { self.circuit_breaker.record_failure(&large_url).await; }
@@ -893,17 +1005,16 @@ impl GatewayState {
             return result;
         }
 
-        // If tools are present and route_tools_to_large is enabled, route to large model
+// If tools are present and route_tools_to_large is enabled, route to large model
         if has_tools && self.route_tools_to_large {
             let target = &large_url;
             info!("TOOLS DETECTED + route_tools_to_large=true: routing to large text model");
             let result = self.proxy_to_backend(&injected_payload, target, is_streaming).await;
             match &result {
-                Ok(_) => { 
+                Ok(_) => {
                     self.circuit_breaker.record_success(target).await;
                     if let Some(ref key) = session_key {
-                        let mut cache = self.session_cache.write().await;
-                        cache.insert(key.clone(), (target.clone(), Instant::now()));
+                        self.session_cache.insert(key.clone(), target.clone()).await;
                     }
                 }
                 Err(_) => { self.circuit_breaker.record_failure(target).await; }
@@ -926,8 +1037,7 @@ impl GatewayState {
                 Ok(_) => { 
                     self.circuit_breaker.record_success(&target_url).await;
                     if let Some(ref key) = session_key {
-                        let mut cache = self.session_cache.write().await;
-                        cache.insert(key.clone(), (target_url.clone(), Instant::now()));
+                        self.session_cache.insert(key.clone(), target_url.clone()).await;
                     }
                 }
                 Err(_) => { self.circuit_breaker.record_failure(&target_url).await; }
@@ -950,8 +1060,7 @@ impl GatewayState {
                 Ok(_) => { 
                     self.circuit_breaker.record_success(&target_url).await;
                     if let Some(ref key) = session_key {
-                        let mut cache = self.session_cache.write().await;
-                        cache.insert(key.clone(), (target_url.clone(), Instant::now()));
+                        self.session_cache.insert(key.clone(), target_url.clone()).await;
                     }
                 }
                 Err(_) => { self.circuit_breaker.record_failure(&target_url).await; }
@@ -1015,8 +1124,7 @@ impl GatewayState {
         if keep_small {
             // Since we routed to and decided to keep the small model, let's cache it for session affinity
             if let Some(ref key) = session_key {
-                let mut cache = self.session_cache.write().await;
-                cache.insert(key.clone(), (target_url.clone(), Instant::now()));
+                self.session_cache.insert(key.clone(), target_url.clone()).await;
             }
             let mut headers = HeaderMap::new();
             headers.insert("content-type", HeaderValue::from_static("application/json"));
@@ -1035,8 +1143,7 @@ impl GatewayState {
         if result.is_ok() {
             self.circuit_breaker.record_success(&large_url).await;
             if let Some(ref key) = session_key {
-                let mut cache = self.session_cache.write().await;
-                cache.insert(key.clone(), (large_url.clone(), Instant::now()));
+                self.session_cache.insert(key.clone(), large_url.clone()).await;
             }
         }
         result
@@ -1121,32 +1228,6 @@ fn build_model_info(id: &str) -> ModelInfo {
     }
 }
 
-// ── Base64 encoder ──
-fn base64_encode(input: &[u8]) -> String {
-    const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut output = String::with_capacity((input.len() + 2) / 3 * 4);
-    let chunks = input.chunks(3);
-    for chunk in chunks {
-        let b0 = chunk[0] as u32;
-        let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
-        let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
-        let triple = (b0 << 16) | (b1 << 8) | b2;
-        output.push(CHARS[((triple >> 18) & 0x3F) as usize] as char);
-        output.push(CHARS[((triple >> 12) & 0x3F) as usize] as char);
-        if chunk.len() > 1 {
-            output.push(CHARS[((triple >> 6) & 0x3F) as usize] as char);
-        } else {
-            output.push('=');
-        }
-        if chunk.len() > 2 {
-            output.push(CHARS[(triple & 0x3F) as usize] as char);
-        } else {
-            output.push('=');
-        }
-    }
-    output
-}
-
 async fn fetch_models_handler(State(state): State<GatewayState>) -> Response {
     let models = ModelList {
         object: "list".to_string(),
@@ -1169,9 +1250,28 @@ async fn model_handler(State(state): State<GatewayState>) -> Response {
     response
 }
 
-async fn health_handler() -> Response {
+async fn health_handler(State(state): State<GatewayState>) -> Response {
     let body = Body::from(
-        serde_json::json!({"status": "ok"}).to_string()
+        serde_json::json!({
+            "status": "ok",
+            "large_model_multimodal": state.large_model_multimodal,
+            "router_threshold": state.router_threshold,
+            "confidence_threshold": state.confidence_threshold,
+            "session_cache_entries": state.session_cache.entry_count() as u64
+        }).to_string()
+    );
+    let mut response = Response::new(body);
+    response.headers_mut().insert("content-type", HeaderValue::from_static("application/json"));
+    response
+}
+
+async fn metrics_handler(State(state): State<GatewayState>) -> Response {
+    let body = Body::from(
+        serde_json::json!({
+            "request_count": state.load_tracker.request_count.load(Ordering::Relaxed),
+            "avg_complexity": state.load_tracker.avg_complexity(),
+            "session_cache_entries": state.session_cache.entry_count() as u64
+        }).to_string()
     );
     let mut response = Response::new(body);
     response.headers_mut().insert("content-type", HeaderValue::from_static("application/json"));
@@ -1253,6 +1353,7 @@ async fn main() {
         .route("/v1/models", get(fetch_models_handler))
         .route("/model", get(model_handler))
         .route("/health", get(health_handler))
+        .route("/metrics", get(metrics_handler))
         .layer(DefaultBodyLimit::disable())
         .with_state(state);
 
