@@ -6,13 +6,14 @@ use std::time::{Duration, Instant};
 
 use axum::{
     body::Body,
-    extract::{DefaultBodyLimit, Json, State},
+    extract::{DefaultBodyLimit, Request},
     http::{HeaderMap, HeaderValue, StatusCode},
     response::Response,
     routing::{get, post},
-    Router,
 };
+use http_body_util::BodyExt;
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
+use cascade_features::{FallbackManager, QualityFilter, MetricsRegistry};
 use futures_util::stream::StreamExt;
 use moka::future::Cache;
 use regex::Regex;
@@ -24,6 +25,9 @@ use tracing::{info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 mod language;
+mod cascade_features;
+
+
 
 async fn fetch_large_model_multimodal_async(inference_url: &str) -> bool {
     let models_url = format!("{}/models", inference_url.trim_end_matches('/'));
@@ -223,10 +227,11 @@ struct GatewayState {
     load_tracker: LoadTracker,
     session_cache: Cache<String, String>,
     image_semaphore: Arc<Semaphore>,
+    metrics: Arc<MetricsRegistry>,
 }
 
 impl GatewayState {
-    fn new(large_model_multimodal: bool) -> Self {
+    fn new(large_model_multimodal: bool, metrics: Arc<MetricsRegistry>) -> Self {
         let small_mllm_url = std::env::var("SMALL_MLLM_URL").unwrap_or_else(|_| "http://localhost:8082/v1/chat/completions".to_string());
         let large_mllm_url = std::env::var("LARGE_MLLM_URL").unwrap_or_else(|_| "http://localhost:8080/v1/chat/completions".to_string());
         let large_text_url = std::env::var("LARGE_TEXT_URL").unwrap_or_else(|_| "http://localhost:8080/v1/chat/completions".to_string());
@@ -287,6 +292,7 @@ impl GatewayState {
                 .time_to_live(Duration::from_secs(3600))
                 .build(),
             image_semaphore: Arc::new(Semaphore::new(max_concurrent_images)),
+            metrics,
         }
     }
 
@@ -789,7 +795,15 @@ impl GatewayState {
         url.to_string()
     }
 
-    async fn route_request(&self, payload: ChatCompletionRequest, is_streaming: bool, tier: &str, headers: &HeaderMap) -> Result<(HeaderMap, Body), StatusCode> {
+    /// Route request with automatic fallback mechanism
+    async fn route_request_with_fallback(
+        &self,
+        payload: ChatCompletionRequest,
+        is_streaming: bool,
+        tier: &str,
+        headers: &HeaderMap,
+        _quality_filter: &Arc<QualityFilter>,
+    ) -> Result<(HeaderMap, Body), StatusCode> {
         let has_image = self.detect_image(&payload.messages);
         let has_tools = payload.tools.is_some() || payload.functions.is_some();
         let complexity_score = self.evaluate_complexity(&payload.messages);
@@ -826,14 +840,14 @@ impl GatewayState {
             None
         };
 
-         info!("[REQ_START] has_image={}, has_tools={}, history_has_tools={}, session_key={:?}, cached_route={:?}, tier={}, has_reliable_session_key={}",
-             has_image, has_tools, history_has_tools, session_key, cached_route, tier, has_reliable_session_key);
-         info!("[REQ] user_text={:?}", language::extract_text(&payload.messages));
+        info!("[REQ_START] has_image={}, has_tools={}, history_has_tools={}, session_key={:?}, cached_route={:?}, tier={}, has_reliable_session_key={}",
+            has_image, has_tools, history_has_tools, session_key, cached_route, tier, has_reliable_session_key);
+        info!("[REQ] user_text={:?}", language::extract_text(&payload.messages));
 
-         info!("DETECTED_LANGUAGE: {}", language);
+        info!("DETECTED_LANGUAGE: {}", language);
 
-         info!("REQUEST_MESSAGES: count={}, aggregated_text_length={}, aggregated_text_preview={}",
-            payload.messages.len(), aggregated_text.len(), aggregated_text.chars().take(200).collect::<String>());
+        info!("REQUEST_MESSAGES: count={}, aggregated_text_length={}, aggregated_text_preview={}",
+           payload.messages.len(), aggregated_text.len(), aggregated_text.chars().take(200).collect::<String>());
         for (i, msg) in payload.messages.iter().enumerate() {
             if let Some(ref content) = msg.content {
                 match content {
@@ -965,6 +979,7 @@ impl GatewayState {
                 Ok(_) => { self.circuit_breaker.record_success(&target).await; }
                 Err(_) => { self.circuit_breaker.record_failure(&target).await; }
             }
+            self.metrics.record_request("session_affinity");
             return result;
         }
 
@@ -1002,10 +1017,11 @@ impl GatewayState {
                 }
                 Err(_) => { self.circuit_breaker.record_failure(&large_url).await; }
             }
+            self.metrics.record_request("large");
             return result;
         }
 
-// If tools are present and route_tools_to_large is enabled, route to large model
+        // If tools are present and route_tools_to_large is enabled, route to large model
         if has_tools && self.route_tools_to_large {
             let target = &large_url;
             info!("TOOLS DETECTED + route_tools_to_large=true: routing to large text model");
@@ -1019,6 +1035,7 @@ impl GatewayState {
                 }
                 Err(_) => { self.circuit_breaker.record_failure(target).await; }
             }
+            self.metrics.record_request("large");
             return result;
         }
 
@@ -1042,6 +1059,7 @@ impl GatewayState {
                 }
                 Err(_) => { self.circuit_breaker.record_failure(&target_url).await; }
             }
+            self.metrics.record_request(if has_image && self.large_model_multimodal { "large_multimodal" } else { "large" });
             return result;
         }
 
@@ -1065,6 +1083,7 @@ impl GatewayState {
                 }
                 Err(_) => { self.circuit_breaker.record_failure(&target_url).await; }
             }
+            self.metrics.record_request("small");
             return result;
         }
 
@@ -1095,10 +1114,12 @@ impl GatewayState {
         if !status.is_success() {
             info!("Small model returned HTTP {}, rerouting original request to large model", status);
             self.circuit_breaker.record_failure(&target_url).await;
+            self.metrics.record_fallback("primary_failed");
             let result = self.proxy_to_backend(&injected_payload, &large_url, false).await;
             if result.is_ok() {
                 self.circuit_breaker.record_success(&large_url).await;
             }
+            self.metrics.record_request("large");
             return result;
         }
 
@@ -1134,11 +1155,13 @@ impl GatewayState {
                     headers.insert("x-confidence", hv);
                 }
             }
+            self.metrics.record_request("small");
             return Ok((headers, Body::from(body_bytes)));
         }
 
         // Reroute to large model with language-injected payload
         info!("Rerouting original request to large text model");
+        self.metrics.record_fallback("quality_low");
         let result = self.proxy_to_backend(&injected_payload, &large_url, false).await;
         if result.is_ok() {
             self.circuit_breaker.record_success(&large_url).await;
@@ -1146,6 +1169,7 @@ impl GatewayState {
                 self.session_cache.insert(key.clone(), large_url.clone()).await;
             }
         }
+        self.metrics.record_request("large");
         result
     }
 
@@ -1228,93 +1252,6 @@ fn build_model_info(id: &str) -> ModelInfo {
     }
 }
 
-async fn fetch_models_handler(State(state): State<GatewayState>) -> Response {
-    let models = ModelList {
-        object: "list".to_string(),
-        data: vec![
-            build_model_info(&state.main_model_name),
-            build_model_info(&state.small_model_name),
-        ],
-    };
-    let body = Body::from(serde_json::to_string(&models).unwrap_or_default());
-    let mut response = Response::new(body);
-    response.headers_mut().insert("content-type", HeaderValue::from_static("application/json"));
-    response
-}
-
-async fn model_handler(State(state): State<GatewayState>) -> Response {
-    let model = build_model_info(&state.main_model_name);
-    let body = Body::from(serde_json::to_string(&model).unwrap_or_default());
-    let mut response = Response::new(body);
-    response.headers_mut().insert("content-type", HeaderValue::from_static("application/json"));
-    response
-}
-
-async fn health_handler(State(state): State<GatewayState>) -> Response {
-    let body = Body::from(
-        serde_json::json!({
-            "status": "ok",
-            "large_model_multimodal": state.large_model_multimodal,
-            "router_threshold": state.router_threshold,
-            "confidence_threshold": state.confidence_threshold,
-            "session_cache_entries": state.session_cache.entry_count() as u64
-        }).to_string()
-    );
-    let mut response = Response::new(body);
-    response.headers_mut().insert("content-type", HeaderValue::from_static("application/json"));
-    response
-}
-
-async fn metrics_handler(State(state): State<GatewayState>) -> Response {
-    let body = Body::from(
-        serde_json::json!({
-            "request_count": state.load_tracker.request_count.load(Ordering::Relaxed),
-            "avg_complexity": state.load_tracker.avg_complexity(),
-            "session_cache_entries": state.session_cache.entry_count() as u64
-        }).to_string()
-    );
-    let mut response = Response::new(body);
-    response.headers_mut().insert("content-type", HeaderValue::from_static("application/json"));
-    response
-}
-
-async fn handler(
-    State(state): State<GatewayState>,
-    headers: HeaderMap,
-    Json(payload): Json<ChatCompletionRequest>,
-) -> Response {
-    let is_streaming = payload.stream.unwrap_or(false);
-    let tier = headers
-        .get("x-tier")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("standard");
-
-    match state.route_request(payload, is_streaming, tier, &headers).await {
-        Ok((hdrs, body)) => {
-            let mut response = Response::new(body);
-            *response.headers_mut() = hdrs;
-            response
-        }
-        Err(status) => {
-            let error_json = Body::from(
-                serde_json::json!({
-                    "error": {
-                        "message": format!("HTTP {}", status.as_u16()),
-                        "type": "cascade_proxy_error",
-                        "param": Value::Null,
-                        "code": Value::Number(status.as_u16().into())
-                    }
-                })
-                .to_string(),
-            );
-            let mut response = Response::new(error_json);
-            response.headers_mut().insert("content-type", HeaderValue::from_static("application/json"));
-            *response.status_mut() = status;
-            response
-        }
-    }
-}
-
 #[tokio::main]
 async fn main() {
     tracing_subscriber::registry()
@@ -1347,18 +1284,137 @@ async fn main() {
         }
     };
 
-    let state = GatewayState::new(large_model_multimodal);
-    let app = Router::new()
-        .route("/v1/chat/completions", post(handler))
-        .route("/v1/models", get(fetch_models_handler))
-        .route("/model", get(model_handler))
-        .route("/health", get(health_handler))
-        .route("/metrics", get(metrics_handler))
-        .layer(DefaultBodyLimit::disable())
-        .with_state(state);
+    let metrics = Arc::new(MetricsRegistry::init());
+    let state = Arc::new(GatewayState::new(large_model_multimodal, metrics));
+    
+    let quality_filter = Arc::new(QualityFilter::new());
+    
+    let fallback_manager = Arc::new(FallbackManager::new(
+        state.small_mllm_url.clone(),
+        state.large_text_url.clone(),
+        state.http_client.clone()
+    ));
+    
+    let s1 = Arc::clone(&state);
+    let s2 = Arc::clone(&state);
+    let s3 = Arc::clone(&state);
+    let s4 = Arc::clone(&state);
+    let qf = Arc::clone(&quality_filter);
+    
+    let app = cascade_features::build_router(fallback_manager.clone())
+        .route("/v1/chat/completions", post(move |req: Request<Body>| async move {
+            let state = Arc::clone(&s1);
+            let headers = req.headers().clone();
+            let body_bytes = match req.into_body().collect().await {
+                Ok(b) => b.to_bytes(),
+                Err(_) => {
+                    let error_json = Body::from(
+                        serde_json::json!({
+                            "error": {
+                                "message": "Invalid request body",
+                                "type": "cascade_proxy_error",
+                                "param": serde_json::Value::Null,
+                                "code": 400
+                            }
+                        })
+                        .to_string(),
+                    );
+                    let mut response = Response::new(error_json);
+                    response.headers_mut().insert("content-type", HeaderValue::from_static("application/json"));
+                    *response.status_mut() = StatusCode::BAD_REQUEST;
+                    return response;
+                }
+            };
+            let json: ChatCompletionRequest = match serde_json::from_slice(&body_bytes) {
+                Ok(j) => j,
+                Err(_) => {
+                    let error_json = Body::from(
+                        serde_json::json!({
+                            "error": {
+                                "message": "Invalid JSON",
+                                "type": "cascade_proxy_error",
+                                "param": serde_json::Value::Null,
+                                "code": 400
+                            }
+                        })
+                        .to_string(),
+                    );
+                    let mut response = Response::new(error_json);
+                    response.headers_mut().insert("content-type", HeaderValue::from_static("application/json"));
+                    *response.status_mut() = StatusCode::BAD_REQUEST;
+                    return response;
+                }
+            };
+            let is_streaming = json.stream.unwrap_or(false);
+            let tier = headers
+                .get("x-tier")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("standard");
+            
+            match state.route_request_with_fallback(json, is_streaming, tier, &headers, &qf).await {
+                Ok((hdrs, res_body)) => {
+                    let mut response = Response::new(res_body);
+                    *response.headers_mut() = hdrs;
+                    response
+                }
+                Err(status) => {
+                    let error_json = Body::from(
+                        serde_json::json!({
+                            "error": {
+                                "message": format!("HTTP {}", status.as_u16()),
+                                "type": "cascade_proxy_error",
+                                "param": serde_json::Value::Null,
+                                "code": serde_json::Value::Number(status.as_u16().into())
+                            }
+                        })
+                        .to_string(),
+                    );
+                    let mut response = Response::new(error_json);
+                    response.headers_mut().insert("content-type", HeaderValue::from_static("application/json"));
+                    *response.status_mut() = status;
+                    response
+                }
+            }
+        }))
+        .route("/v1/models", get(move || async move {
+            let models = ModelList {
+                object: "list".to_string(),
+                data: vec![
+                    build_model_info(&s2.main_model_name),
+                    build_model_info(&s2.small_model_name),
+                ],
+            };
+            let body = Body::from(serde_json::to_string(&models).unwrap_or_default());
+            let mut response = Response::new(body);
+            response.headers_mut().insert("content-type", HeaderValue::from_static("application/json"));
+            response
+        }))
+        .route("/model", get(move || async move {
+            let model = build_model_info(&s3.main_model_name);
+            let body = Body::from(serde_json::to_string(&model).unwrap_or_default());
+            let mut response = Response::new(body);
+            response.headers_mut().insert("content-type", HeaderValue::from_static("application/json"));
+            response
+        }))
+        .route("/health", get(move || async move {
+            let body = Body::from(
+                serde_json::json!({
+                    "status": "ok",
+                    "large_model_multimodal": s4.large_model_multimodal,
+                    "router_threshold": s4.router_threshold,
+                    "confidence_threshold": s4.confidence_threshold,
+                    "session_cache_entries": s4.session_cache.entry_count() as u64
+                }).to_string()
+            );
+            let mut response = Response::new(body);
+            response.headers_mut().insert("content-type", HeaderValue::from_static("application/json"));
+            response
+        }))
+        .layer(DefaultBodyLimit::disable());
 
     let addr = SocketAddr::from(([0, 0, 0, 0], 3000));
-    info!("Listening on {}", addr);
+    info!("Cascade LLM Gateway listening on {}", addr);
+    info!("Features enabled: In-Flight Fallback, Streaming Quality Filter, Prometheus Observability");
     let listener = TcpListener::bind(addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
 }

@@ -25,3 +25,5 @@ lru = "0.12"
 moka = { version = "0.12", features = ["future"] }
 base64 = "0.22"
 tokio-util = { version = "0.7", features = ["codec"] }
+prometheus = "0.13"
+http-body-util = "0.1"
