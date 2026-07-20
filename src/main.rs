@@ -82,6 +82,7 @@ async fn main() {
             "/v1/video/generations",
             post(handlers::video_generation),
         )
+        .route("/web/metrics", get(cascade_features::metrics_handler))
         .route("/", get(handlers::dashboard))
         .route("/web/", get(handlers::dashboard))
         .route("/web/settings", get(handlers::settings_page))
