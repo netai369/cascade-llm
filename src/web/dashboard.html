@@ -71,8 +71,8 @@
     <h1><span>Cascade</span> LLM Gateway</h1>
     <p>Unified AI Router — Multi-Provider — Real-time Monitoring</p>
     <nav>
-      <a href="/web/" class="active">Dashboard</a>
-      <a href="/web/settings">Settings</a>
+      <a href="./" class="active">Dashboard</a>
+      <a href="settings">Settings</a>
       <a href="/metrics" target="_blank">Prometheus</a>
     </nav>
   </header>
@@ -127,7 +127,7 @@
     }
     async function refresh() {
       try {
-        const r = await fetch('/web/api/dashboard');
+        const r = await fetch('api/dashboard');
         const d = await r.json();
         document.getElementById('requests-total').textContent = d.requests_total || 0;
         document.getElementById('uptime').textContent = formatUptime(d.uptime_seconds || 0);
@@ -145,12 +145,12 @@
         distChart.update('none');
       } catch(e) { console.error('Dashboard refresh error:', e); }
       try {
-        const r = await fetch('/web/api/providers');
+        const r = await fetch('api/providers');
         const providers = await r.json();
         document.getElementById('providers-count').textContent = providers.length;
         const tbody = document.getElementById('providers-table');
         if (providers.length === 0) {
-          tbody.innerHTML = '<tr><td colspan="4" style="color:#64748b">No external providers configured. Add one in <a href="/web/settings" style="color:#00ffff">Settings</a>.</td></tr>';
+          tbody.innerHTML = '<tr><td colspan="4" style="color:#64748b">No external providers configured. Add one in <a href="settings" style="color:#00ffff">Settings</a>.</td></tr>';
         } else {
           tbody.innerHTML = providers.map(p => `<tr><td>${p.name}</td><td>${p.provider_type.type || p.provider_type}</td><td>${p.models.join(', ')}</td><td><span class="badge ${p.enabled ? 'badge-active' : 'badge-inactive'}">${p.enabled ? 'Active' : 'Disabled'}</span></td></tr>`).join('');
         }

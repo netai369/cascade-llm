@@ -74,8 +74,8 @@
     <h1><span>Cascade</span> LLM — Settings</h1>
     <p>Configure providers, routing, and audio endpoints</p>
     <nav>
-      <a href="/web/">Dashboard</a>
-      <a href="/web/settings" class="active">Settings</a>
+      <a href="./">Dashboard</a>
+      <a href="./" class="active">Settings</a>
       <a href="/metrics" target="_blank">Prometheus</a>
     </nav>
   </header>
@@ -172,7 +172,7 @@
     }
     async function loadSettings() {
       try {
-        const r = await fetch('/web/api/settings');
+        const r = await fetch('api/settings');
         const s = await r.json();
         document.getElementById('router-threshold').value = s.routing?.router_threshold ?? 0.5;
         document.getElementById('confidence-threshold').value = s.routing?.confidence_threshold ?? 0.7;
@@ -183,7 +183,7 @@
     }
     async function loadProviders() {
       try {
-        const r = await fetch('/web/api/providers');
+        const r = await fetch('api/providers');
         const providers = await r.json();
         const el = document.getElementById('provider-list');
         if (providers.length === 0) {
@@ -215,7 +215,7 @@
         providers: []
       };
       try {
-        await fetch('/web/api/settings', { method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(settings) });
+        await fetch('api/settings', { method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(settings) });
         showToast('Settings saved');
       } catch(e) { showToast('Error saving settings'); }
     }
@@ -232,7 +232,7 @@
         capabilities: { chat: true, streaming: true }
       };
       try {
-        await fetch('/web/api/providers', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(provider) });
+        await fetch('api/providers', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(provider) });
         document.getElementById('provider-name').value = '';
         document.getElementById('provider-url').value = '';
         document.getElementById('provider-key').value = '';
@@ -243,7 +243,7 @@
     }
     async function deleteProvider(id) {
       try {
-        await fetch(`/web/api/providers/${id}`, { method: 'DELETE' });
+        await fetch(`api/providers/${id}`, { method: 'DELETE' });
         loadProviders();
         showToast('Provider removed');
       } catch(e) { showToast('Error removing provider'); }
