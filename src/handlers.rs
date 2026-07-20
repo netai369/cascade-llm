@@ -131,6 +131,7 @@ pub async fn chat_completions(
         info!("Audio content detected, routing to STT");
         match transcribe_audio(&state, &audio_data, &format).await {
             Ok(transcription) => {
+                state.metrics.record_request("stt_proxy");
                 let response = serde_json::json!({
                     "id": "cascade-audio-transcription",
                     "object": "chat.completion",
@@ -272,20 +273,23 @@ pub async fn dashboard_api(State(state): State<Arc<GatewayState>>) -> Response {
     let uptime = state.start_time.elapsed().as_secs();
     let cache_entries = state.session_cache.entry_count() as u64;
 
+    let known_backends = ["small", "large", "large_multimodal", "session_affinity", "stt_proxy"];
     let mut requests_by_backend = std::collections::HashMap::new();
-    for backend in &["small", "large", "large_multimodal", "session_affinity"] {
+    let mut total_requests: u64 = 0;
+    for backend in &known_backends {
         let val = state
             .metrics
             .requests_total
             .with_label_values(&[backend])
             .get() as u64;
+        total_requests += val;
         if val > 0 {
             requests_by_backend.insert(backend.to_string(), val);
         }
     }
 
     let metrics = DashboardMetrics {
-        requests_total: state.metrics.requests_total.with_label_values(&[""]).get() as u64,
+        requests_total: total_requests,
         requests_by_backend,
         fallback_count: state
             .metrics
