@@ -227,7 +227,7 @@ pub async fn metrics_handler() -> impl IntoResponse {
     )
 }
 
-pub fn build_router(_fallback_manager: Arc<FallbackManager>) -> Router {
+pub fn build_router<S: Clone + Send + Sync + 'static>() -> Router<S> {
     Router::new()
         .route("/metrics", get(metrics_handler))
 }

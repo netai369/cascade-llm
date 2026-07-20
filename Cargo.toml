@@ -1,8 +1,8 @@
 [package]
 name = "cascade-llm"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-description = "High-performance self-hosted LLM router with complexity scoring, tool-aware routing, and vision pipeline"
+description = "Unified AI gateway with multi-provider routing, web UI, TTS/STT, and media generation"
 license = "MIT"
 repository = "https://github.com/cascade-llm/cascade-llm"
 
@@ -27,3 +27,4 @@ base64 = "0.22"
 tokio-util = { version = "0.7", features = ["codec"] }
 prometheus = "0.13"
 http-body-util = "0.1"
+rusqlite = { version = "0.31", features = ["bundled"] }

@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Cascade LLM — Dashboard</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: #0a0f1a; color: #e2e8f0; min-height: 100vh;
+    }
+    header {
+      padding: 1.5rem 1rem; text-align: center;
+      border-bottom: 1px solid rgba(0,255,255,0.1);
+      background: linear-gradient(180deg, rgba(0,255,255,0.03) 0%, transparent 100%);
+    }
+    header h1 { font-size: 1.5rem; letter-spacing: -0.02em; }
+    header h1 span { color: #00ffff; }
+    header p { color: #94a3b8; margin: 0.3rem 0 0; font-size: 0.85rem; }
+    nav { display: flex; justify-content: center; gap: 1rem; margin-top: 0.8rem; }
+    nav a {
+      color: #94a3b8; text-decoration: none; font-size: 0.85rem;
+      padding: 0.3rem 0.8rem; border-radius: 6px; transition: all 0.15s;
+    }
+    nav a:hover, nav a.active { color: #00ffff; background: rgba(0,255,255,0.08); }
+    main { max-width: 1200px; margin: 0 auto; padding: 1.5rem 1rem; }
+    .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 1rem; margin-bottom: 1.5rem; }
+    .card {
+      background: rgba(20,27,45,0.8); backdrop-filter: blur(12px);
+      border: 1px solid rgba(0,255,255,0.1); border-radius: 12px;
+      padding: 1.2rem; transition: border-color 0.15s, box-shadow 0.15s;
+    }
+    .card:hover { border-color: rgba(0,255,255,0.3); box-shadow: 0 0 20px rgba(0,255,255,0.05); }
+    .card .label { font-size: 0.75rem; color: #64748b; text-transform: uppercase; letter-spacing: 0.05em; }
+    .card .value { font-size: 1.8rem; font-weight: 700; margin: 0.3rem 0 0; }
+    .card .value.cyan { color: #00ffff; }
+    .card .value.purple { color: #a78bfa; }
+    .card .value.pink { color: #ec4899; }
+    .card .value.green { color: #34d399; }
+    .charts { display: grid; grid-template-columns: 2fr 1fr; gap: 1rem; margin-bottom: 1.5rem; }
+    .chart-box {
+      background: rgba(20,27,45,0.8); backdrop-filter: blur(12px);
+      border: 1px solid rgba(0,255,255,0.1); border-radius: 12px; padding: 1.2rem;
+    }
+    .chart-box h3 { font-size: 0.9rem; color: #94a3b8; margin-bottom: 0.8rem; }
+    table { width: 100%; border-collapse: collapse; font-size: 0.88rem; }
+    thead th {
+      text-align: left; padding: 0.7rem 0.6rem; border-bottom: 1px solid rgba(0,255,255,0.1);
+      color: #64748b; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em;
+    }
+    tbody td { padding: 0.6rem; border-bottom: 1px solid rgba(255,255,255,0.03); }
+    .badge {
+      display: inline-block; padding: 0.15rem 0.55rem; border-radius: 9999px;
+      font-size: 0.75rem; font-weight: 600;
+    }
+    .badge-active { background: rgba(52,211,153,0.15); color: #34d399; }
+    .badge-inactive { background: rgba(100,116,139,0.15); color: #64748b; }
+    .provider-section {
+      background: rgba(20,27,45,0.8); backdrop-filter: blur(12px);
+      border: 1px solid rgba(0,255,255,0.1); border-radius: 12px; padding: 1.2rem;
+    }
+    .provider-section h3 { font-size: 0.9rem; color: #94a3b8; margin-bottom: 0.8rem; }
+    footer { text-align: center; padding: 1.5rem; color: #64748b; font-size: 0.8rem; }
+    @media (max-width: 768px) { .charts { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+  <header>
+    <h1><span>Cascade</span> LLM Gateway</h1>
+    <p>Unified AI Router — Multi-Provider — Real-time Monitoring</p>
+    <nav>
+      <a href="/web/" class="active">Dashboard</a>
+      <a href="/web/settings">Settings</a>
+      <a href="/metrics" target="_blank">Prometheus</a>
+    </nav>
+  </header>
+  <main>
+    <div class="cards">
+      <div class="card"><div class="label">Total Requests</div><div class="value cyan" id="requests-total">—</div></div>
+      <div class="card"><div class="label">Uptime</div><div class="value green" id="uptime">—</div></div>
+      <div class="card"><div class="label">Providers</div><div class="value purple" id="providers-count">—</div></div>
+      <div class="card"><div class="label">Fallbacks</div><div class="value pink" id="fallback-count">—</div></div>
+      <div class="card"><div class="label">Session Cache</div><div class="value cyan" id="cache-entries">—</div></div>
+      <div class="card"><div class="label">Multimodal</div><div class="value green" id="multimodal">—</div></div>
+    </div>
+    <div class="charts">
+      <div class="chart-box">
+        <h3>Requests by Backend</h3>
+        <canvas id="backendChart"></canvas>
+      </div>
+      <div class="chart-box">
+        <h3>Distribution</h3>
+        <canvas id="distChart"></canvas>
+      </div>
+    </div>
+    <div class="provider-section">
+      <h3>Configured Providers</h3>
+      <table>
+        <thead><tr><th>Name</th><th>Type</th><th>Models</th><th>Status</th></tr></thead>
+        <tbody id="providers-table"><tr><td colspan="4" style="color:#64748b">Loading...</td></tr></tbody>
+      </table>
+    </div>
+  </main>
+  <footer>Cascade LLM Gateway v0.2.0 — NetAI Stack SE</footer>
+  <script>
+    const backendData = {};
+    let backendChart, distChart;
+    function initCharts() {
+      const ctx1 = document.getElementById('backendChart').getContext('2d');
+      backendChart = new Chart(ctx1, {
+        type: 'bar',
+        data: { labels: [], datasets: [{ label: 'Requests', data: [], backgroundColor: ['#00ffff33','#a78bfa33','#ec489933','#34d39933'], borderColor: ['#00ffff','#a78bfa','#ec4899','#34d399'], borderWidth: 1 }] },
+        options: { responsive: true, plugins: { legend: { display: false } }, scales: { x: { ticks: { color: '#64748b' }, grid: { color: 'rgba(255,255,255,0.03)' } }, y: { ticks: { color: '#64748b' }, grid: { color: 'rgba(255,255,255,0.03)' } } } }
+      });
+      const ctx2 = document.getElementById('distChart').getContext('2d');
+      distChart = new Chart(ctx2, {
+        type: 'doughnut',
+        data: { labels: [], datasets: [{ data: [], backgroundColor: ['#00ffff','#a78bfa','#ec4899','#34d399','#f59e0b'] }] },
+        options: { responsive: true, plugins: { legend: { labels: { color: '#94a3b8', font: { size: 11 } } } } }
+      });
+    }
+    function formatUptime(s) {
+      const h = Math.floor(s/3600), m = Math.floor((s%3600)/60);
+      return h > 0 ? `${h}h ${m}m` : `${m}m`;
+    }
+    async function refresh() {
+      try {
+        const r = await fetch('/web/api/dashboard');
+        const d = await r.json();
+        document.getElementById('requests-total').textContent = d.requests_total || 0;
+        document.getElementById('uptime').textContent = formatUptime(d.uptime_seconds || 0);
+        document.getElementById('fallback-count').textContent = d.fallback_count || 0;
+        document.getElementById('cache-entries').textContent = d.session_cache_entries || 0;
+        document.getElementById('multimodal').textContent = d.large_model_multimodal ? 'Yes' : 'No';
+        const backends = d.requests_by_backend || {};
+        const labels = Object.keys(backends);
+        const values = Object.values(backends);
+        backendChart.data.labels = labels;
+        backendChart.data.datasets[0].data = values;
+        backendChart.update('none');
+        distChart.data.labels = labels;
+        distChart.data.datasets[0].data = values;
+        distChart.update('none');
+      } catch(e) { console.error('Dashboard refresh error:', e); }
+      try {
+        const r = await fetch('/web/api/providers');
+        const providers = await r.json();
+        document.getElementById('providers-count').textContent = providers.length;
+        const tbody = document.getElementById('providers-table');
+        if (providers.length === 0) {
+          tbody.innerHTML = '<tr><td colspan="4" style="color:#64748b">No external providers configured. Add one in <a href="/web/settings" style="color:#00ffff">Settings</a>.</td></tr>';
+        } else {
+          tbody.innerHTML = providers.map(p => `<tr><td>${p.name}</td><td>${p.provider_type.type || p.provider_type}</td><td>${p.models.join(', ')}</td><td><span class="badge ${p.enabled ? 'badge-active' : 'badge-inactive'}">${p.enabled ? 'Active' : 'Disabled'}</span></td></tr>`).join('');
+        }
+      } catch(e) {}
+    }
+    initCharts();
+    refresh();
+    setInterval(refresh, 5000);
+  </script>
+</body>
+</html>

@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Cascade LLM — Settings</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: #0a0f1a; color: #e2e8f0; min-height: 100vh;
+    }
+    header {
+      padding: 1.5rem 1rem; text-align: center;
+      border-bottom: 1px solid rgba(0,255,255,0.1);
+      background: linear-gradient(180deg, rgba(0,255,255,0.03) 0%, transparent 100%);
+    }
+    header h1 { font-size: 1.5rem; letter-spacing: -0.02em; }
+    header h1 span { color: #00ffff; }
+    header p { color: #94a3b8; margin: 0.3rem 0 0; font-size: 0.85rem; }
+    nav { display: flex; justify-content: center; gap: 1rem; margin-top: 0.8rem; }
+    nav a {
+      color: #94a3b8; text-decoration: none; font-size: 0.85rem;
+      padding: 0.3rem 0.8rem; border-radius: 6px; transition: all 0.15s;
+    }
+    nav a:hover, nav a.active { color: #00ffff; background: rgba(0,255,255,0.08); }
+    main { max-width: 900px; margin: 0 auto; padding: 1.5rem 1rem; }
+    .section {
+      background: rgba(20,27,45,0.8); backdrop-filter: blur(12px);
+      border: 1px solid rgba(0,255,255,0.1); border-radius: 12px;
+      padding: 1.5rem; margin-bottom: 1.5rem;
+    }
+    .section h2 { font-size: 1rem; color: #00ffff; margin-bottom: 1rem; }
+    .field { margin-bottom: 1rem; }
+    .field label { display: block; font-size: 0.8rem; color: #94a3b8; margin-bottom: 0.3rem; text-transform: uppercase; letter-spacing: 0.05em; }
+    .field input, .field select {
+      width: 100%; padding: 0.6rem 0.8rem; border-radius: 8px;
+      border: 1px solid rgba(0,255,255,0.15); background: rgba(10,15,26,0.8);
+      color: #e2e8f0; font-size: 0.9rem; outline: none; transition: border-color 0.15s;
+    }
+    .field input:focus, .field select:focus { border-color: rgba(0,255,255,0.4); }
+    .field-row { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
+    .btn {
+      padding: 0.6rem 1.5rem; border-radius: 8px; border: none; cursor: pointer;
+      font-size: 0.85rem; font-weight: 600; transition: all 0.15s;
+    }
+    .btn-primary { background: rgba(0,255,255,0.15); color: #00ffff; border: 1px solid rgba(0,255,255,0.3); }
+    .btn-primary:hover { background: rgba(0,255,255,0.25); }
+    .btn-danger { background: rgba(236,72,153,0.15); color: #ec4899; border: 1px solid rgba(236,72,153,0.3); }
+    .btn-danger:hover { background: rgba(236,72,153,0.25); }
+    .btn-row { display: flex; gap: 0.8rem; margin-top: 1rem; }
+    .provider-list { margin-top: 1rem; }
+    .provider-item {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 0.8rem; border-radius: 8px; margin-bottom: 0.5rem;
+      background: rgba(10,15,26,0.5); border: 1px solid rgba(255,255,255,0.05);
+    }
+    .provider-item .info { flex: 1; }
+    .provider-item .info .name { font-weight: 600; }
+    .provider-item .info .meta { font-size: 0.8rem; color: #64748b; margin-top: 0.2rem; }
+    .badge { display: inline-block; padding: 0.15rem 0.55rem; border-radius: 9999px; font-size: 0.7rem; font-weight: 600; }
+    .badge-active { background: rgba(52,211,153,0.15); color: #34d399; }
+    .toast {
+      position: fixed; bottom: 2rem; right: 2rem; padding: 0.8rem 1.5rem;
+      border-radius: 8px; font-size: 0.85rem; opacity: 0; transition: opacity 0.3s;
+      background: rgba(52,211,153,0.9); color: #0a0f1a; font-weight: 600; z-index: 100;
+    }
+    .toast.show { opacity: 1; }
+    footer { text-align: center; padding: 1.5rem; color: #64748b; font-size: 0.8rem; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1><span>Cascade</span> LLM — Settings</h1>
+    <p>Configure providers, routing, and audio endpoints</p>
+    <nav>
+      <a href="/web/">Dashboard</a>
+      <a href="/web/settings" class="active">Settings</a>
+      <a href="/metrics" target="_blank">Prometheus</a>
+    </nav>
+  </header>
+  <main>
+    <div class="section">
+      <h2>Routing Settings</h2>
+      <div class="field-row">
+        <div class="field">
+          <label>Router Threshold</label>
+          <input type="number" id="router-threshold" step="0.1" min="0" max="1">
+        </div>
+        <div class="field">
+          <label>Confidence Threshold</label>
+          <input type="number" id="confidence-threshold" step="0.1" min="0" max="1">
+        </div>
+      </div>
+      <div class="field">
+        <label>Route Tools to Large Model</label>
+        <select id="route-tools">
+          <option value="true">Yes</option>
+          <option value="false">No</option>
+        </select>
+      </div>
+    </div>
+
+    <div class="section">
+      <h2>Audio Endpoints</h2>
+      <div class="field-row">
+        <div class="field">
+          <label>TTS URL</label>
+          <input type="text" id="tts-url" placeholder="http://netai-tts:8800">
+        </div>
+        <div class="field">
+          <label>STT URL</label>
+          <input type="text" id="stt-url" placeholder="http://netai-stt:5092">
+        </div>
+      </div>
+    </div>
+
+    <div class="section">
+      <h2>Providers</h2>
+      <div class="provider-list" id="provider-list">
+        <div style="color:#64748b;font-size:0.85rem">Loading...</div>
+      </div>
+      <h2 style="margin-top:1.5rem">Add Provider</h2>
+      <div class="field-row">
+        <div class="field">
+          <label>Name</label>
+          <input type="text" id="provider-name" placeholder="My OpenAI">
+        </div>
+        <div class="field">
+          <label>Type</label>
+          <select id="provider-type">
+            <option value="local">Local (llama.cpp)</option>
+            <option value="open_ai">OpenAI</option>
+            <option value="anthropic">Anthropic</option>
+            <option value="gemini">Gemini</option>
+            <option value="ollama">Ollama</option>
+            <option value="custom">Custom</option>
+          </select>
+        </div>
+      </div>
+      <div class="field-row">
+        <div class="field">
+          <label>Base URL</label>
+          <input type="text" id="provider-url" placeholder="https://api.openai.com/v1">
+        </div>
+        <div class="field">
+          <label>API Key</label>
+          <input type="password" id="provider-key" placeholder="sk-...">
+        </div>
+      </div>
+      <div class="field">
+        <label>Models (comma-separated)</label>
+        <input type="text" id="provider-models" placeholder="gpt-4o, gpt-4o-mini">
+      </div>
+      <div class="btn-row">
+        <button class="btn btn-primary" onclick="addProvider()">Add Provider</button>
+      </div>
+    </div>
+
+    <div class="btn-row" style="justify-content:flex-end">
+      <button class="btn btn-primary" onclick="saveSettings()">Save Settings</button>
+    </div>
+  </main>
+  <div class="toast" id="toast">Settings saved</div>
+  <footer>Cascade LLM Gateway v0.2.0 — NetAI Stack SE</footer>
+  <script>
+    function showToast(msg) {
+      const t = document.getElementById('toast');
+      t.textContent = msg;
+      t.classList.add('show');
+      setTimeout(() => t.classList.remove('show'), 2000);
+    }
+    async function loadSettings() {
+      try {
+        const r = await fetch('/web/api/settings');
+        const s = await r.json();
+        document.getElementById('router-threshold').value = s.routing?.router_threshold ?? 0.5;
+        document.getElementById('confidence-threshold').value = s.routing?.confidence_threshold ?? 0.7;
+        document.getElementById('route-tools').value = s.routing?.route_tools_to_large ? 'true' : 'false';
+        document.getElementById('tts-url').value = s.audio?.tts_url ?? '';
+        document.getElementById('stt-url').value = s.audio?.stt_url ?? '';
+      } catch(e) { console.error(e); }
+    }
+    async function loadProviders() {
+      try {
+        const r = await fetch('/web/api/providers');
+        const providers = await r.json();
+        const el = document.getElementById('provider-list');
+        if (providers.length === 0) {
+          el.innerHTML = '<div style="color:#64748b;font-size:0.85rem">No external providers configured.</div>';
+          return;
+        }
+        el.innerHTML = providers.map(p => `
+          <div class="provider-item">
+            <div class="info">
+              <div class="name">${p.name} <span class="badge badge-active">${p.provider_type.type || p.provider_type}</span></div>
+              <div class="meta">${p.base_url} — ${p.models.join(', ')}</div>
+            </div>
+            <button class="btn btn-danger" style="padding:0.3rem 0.8rem;font-size:0.75rem" onclick="deleteProvider('${p.id}')">Remove</button>
+          </div>
+        `).join('');
+      } catch(e) { console.error(e); }
+    }
+    async function saveSettings() {
+      const settings = {
+        routing: {
+          router_threshold: parseFloat(document.getElementById('router-threshold').value),
+          confidence_threshold: parseFloat(document.getElementById('confidence-threshold').value),
+          route_tools_to_large: document.getElementById('route-tools').value === 'true'
+        },
+        audio: {
+          tts_url: document.getElementById('tts-url').value || null,
+          stt_url: document.getElementById('stt-url').value || null
+        },
+        providers: []
+      };
+      try {
+        await fetch('/web/api/settings', { method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(settings) });
+        showToast('Settings saved');
+      } catch(e) { showToast('Error saving settings'); }
+    }
+    async function addProvider() {
+      const name = document.getElementById('provider-name').value.trim();
+      const type = document.getElementById('provider-type').value;
+      const url = document.getElementById('provider-url').value.trim();
+      const key = document.getElementById('provider-key').value.trim();
+      const models = document.getElementById('provider-models').value.split(',').map(m => m.trim()).filter(Boolean);
+      if (!name || !url || models.length === 0) { showToast('Fill in all fields'); return; }
+      const provider = {
+        id: 'p_' + Date.now(), name, provider_type: {type}, base_url: url,
+        api_key: key || null, models, enabled: true, priority: 10,
+        capabilities: { chat: true, streaming: true }
+      };
+      try {
+        await fetch('/web/api/providers', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(provider) });
+        document.getElementById('provider-name').value = '';
+        document.getElementById('provider-url').value = '';
+        document.getElementById('provider-key').value = '';
+        document.getElementById('provider-models').value = '';
+        loadProviders();
+        showToast('Provider added');
+      } catch(e) { showToast('Error adding provider'); }
+    }
+    async function deleteProvider(id) {
+      try {
+        await fetch(`/web/api/providers/${id}`, { method: 'DELETE' });
+        loadProviders();
+        showToast('Provider removed');
+      } catch(e) { showToast('Error removing provider'); }
+    }
+    loadSettings();
+    loadProviders();
+  </script>
+</body>
+</html>
