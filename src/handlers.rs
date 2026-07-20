@@ -8,7 +8,9 @@ use axum::{
     Json,
 };
 use http_body_util::BodyExt;
+use base64::Engine;
 use std::sync::Arc;
+use tracing::info;
 
 fn json_response(body: serde_json::Value, status: StatusCode) -> Response {
     let body_str = body.to_string();
@@ -17,6 +19,67 @@ fn json_response(body: serde_json::Value, status: StatusCode) -> Response {
     resp.headers_mut()
         .insert("content-type", HeaderValue::from_static("application/json"));
     resp
+}
+
+fn extract_audio_from_messages(messages: &[ChatMessage]) -> Option<(String, String)> {
+    for msg in messages {
+        if let Some(MessageContent::Parts(parts)) = &msg.content {
+            for part in parts {
+                if let MessageContentPart::InputAudio { input_audio } = part {
+                    let format = input_audio.format.clone().unwrap_or_else(|| "mp3".to_string());
+                    return Some((input_audio.data.clone(), format));
+                }
+            }
+        }
+    }
+    None
+}
+
+async fn transcribe_audio(state: &Arc<GatewayState>, audio_data: &str, format: &str) -> Result<String, String> {
+    let stt_url = &state.config.stt_url;
+    
+    let audio_bytes = base64::engine::general_purpose::STANDARD
+        .decode(audio_data)
+        .map_err(|e| format!("Failed to decode base64 audio: {}", e))?;
+    
+    let mime_type = match format {
+        "mp3" | "mpeg" => "audio/mpeg",
+        "wav" => "audio/wav",
+        "ogg" => "audio/ogg",
+        "flac" => "audio/flac",
+        "webm" => "audio/webm",
+        _ => "audio/mpeg",
+    };
+    
+    let part_name = format!("file.{}", format);
+    let file_part = reqwest::multipart::Part::bytes(audio_bytes)
+        .file_name(part_name)
+        .mime_str(mime_type)
+        .map_err(|e| format!("Failed to create multipart part: {}", e))?;
+    
+    let form = reqwest::multipart::Form::new()
+        .part("file", file_part)
+        .text("model", "parakeet-tdt-0.6b-v3")
+        .text("response_format", "text");
+    
+    let url = format!("{}/v1/audio/transcriptions", stt_url);
+    info!("STT proxy: transcribing audio via {}", url);
+    
+    let resp = state.http_client
+        .post(&url)
+        .multipart(form)
+        .send()
+        .await
+        .map_err(|e| format!("STT request failed: {}", e))?;
+    
+    let status = resp.status();
+    let body = resp.text().await.map_err(|e| format!("Failed to read STT response: {}", e))?;
+    
+    if !status.is_success() {
+        return Err(format!("STT returned {}: {}", status, body));
+    }
+    
+    Ok(body)
 }
 
 pub async fn chat_completions(
@@ -63,6 +126,47 @@ pub async fn chat_completions(
         .get("x-tier")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("standard");
+
+    if let Some((audio_data, format)) = extract_audio_from_messages(&json.messages) {
+        info!("Audio content detected, routing to STT");
+        match transcribe_audio(&state, &audio_data, &format).await {
+            Ok(transcription) => {
+                let response = serde_json::json!({
+                    "id": "cascade-audio-transcription",
+                    "object": "chat.completion",
+                    "created": chrono::Utc::now().timestamp(),
+                    "model": json.model,
+                    "choices": [{
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": transcription
+                        },
+                        "finish_reason": "stop"
+                    }],
+                    "usage": {
+                        "prompt_tokens": 0,
+                        "completion_tokens": 0,
+                        "total_tokens": 0
+                    }
+                });
+                return json_response(response, StatusCode::OK);
+            }
+            Err(e) => {
+                return json_response(
+                    serde_json::json!({
+                        "error": {
+                            "message": format!("Audio transcription failed: {}", e),
+                            "type": "cascade_proxy_error",
+                            "param": serde_json::Value::Null,
+                            "code": 500
+                        }
+                    }),
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                );
+            }
+        }
+    }
 
     match state
         .route_request_with_fallback(json, is_streaming, tier, &headers)

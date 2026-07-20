@@ -281,6 +281,9 @@ impl GatewayState {
                                 MessageContentPart::ImageUrl { .. } => {
                                     total_chars += 100;
                                 }
+                                MessageContentPart::InputAudio { .. } => {
+                                    total_chars += 500;
+                                }
                             }
                         }
                     }
@@ -742,6 +745,7 @@ impl GatewayState {
                                     j, text.len(), text
                                 ),
                                 MessageContentPart::ImageUrl { .. } => info!("  PART_{}: ImageUrl", j),
+                                MessageContentPart::InputAudio { .. } => info!("  PART_{}: InputAudio", j),
                             }
                         }
                     }

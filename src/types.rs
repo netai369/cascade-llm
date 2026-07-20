@@ -6,6 +6,14 @@ use serde_json::Value;
 pub enum MessageContentPart {
     Text { text: String },
     ImageUrl { image_url: ImageUrlTarget },
+    InputAudio { input_audio: InputAudioData },
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct InputAudioData {
+    pub data: String,
+    #[serde(default)]
+    pub format: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
