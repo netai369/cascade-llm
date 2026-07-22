@@ -87,6 +87,10 @@ pub async fn chat_completions(
     req: Request<Body>,
 ) -> Response {
     let headers = req.headers().clone();
+    let origin = headers
+        .get("x-request-origin")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("unknown");
     let body_bytes = match req.into_body().collect().await {
         Ok(b) => b.to_bytes(),
         Err(_) => {
@@ -170,7 +174,7 @@ pub async fn chat_completions(
     }
 
     match state
-        .route_request_with_fallback(json, is_streaming, tier, &headers)
+        .route_request_with_fallback(json, is_streaming, tier, &headers, origin)
         .await
     {
         Ok((hdrs, res_body)) => {
@@ -192,21 +196,45 @@ pub async fn chat_completions(
     }
 }
 
-pub async fn list_models(State(state): State<Arc<GatewayState>>) -> Response {
-    let mut model_ids = vec![state.config.main_model_name.clone(), state.config.small_model_name.clone()];
-    for provider in &state.config.providers {
-        for model in &provider.models {
-            if !model_ids.contains(model) {
-                model_ids.push(model.clone());
+async fn fetch_models_from(client: &reqwest::Client, base_url: &str, model_type: &str) -> Vec<serde_json::Value> {
+    let url = format!("{}/models", base_url.trim_end_matches('/'));
+    match client.get(&url).send().await {
+        Ok(resp) if resp.status().is_success() => {
+            match resp.json::<serde_json::Value>().await {
+                Ok(val) => {
+                    let mut models = val.get("data")
+                        .and_then(|d| d.as_array())
+                        .cloned()
+                        .unwrap_or_default();
+                    for m in &mut models {
+                        if let Some(obj) = m.as_object_mut() {
+                            obj.insert("model_type".to_string(), serde_json::Value::String(model_type.to_string()));
+                        }
+                    }
+                    models
+                }
+                Err(e) => { tracing::warn!("Failed to parse models from {}: {}", url, e); vec![] }
             }
         }
+        Ok(resp) => { tracing::warn!("Models fetch from {} returned HTTP {}", url, resp.status()); vec![] }
+        Err(e) => { tracing::warn!("Failed to connect to {}: {}", url, e); vec![] }
     }
-    let models: Vec<ModelInfo> = model_ids.iter().map(|id| build_model_info(id)).collect();
-    let model_list = ModelList {
-        object: "list".to_string(),
-        data: models,
-    };
-    json_response(serde_json::to_value(model_list).unwrap(), StatusCode::OK)
+}
+
+pub async fn list_models(State(state): State<Arc<GatewayState>>) -> Response {
+    let large_models = fetch_models_from(&state.http_client, &state.config.large_text_url.replace("/v1/chat/completions", ""), "Main").await;
+    let small_models = fetch_models_from(&state.http_client, &state.config.small_mllm_url.replace("/v1/chat/completions", ""), "Small").await;
+
+    let mut all_models = large_models;
+    all_models.extend(small_models);
+
+    json_response(
+        serde_json::json!({
+            "data": all_models,
+            "object": "list"
+        }),
+        StatusCode::OK,
+    )
 }
 
 pub async fn get_model(State(state): State<Arc<GatewayState>>) -> Response {
@@ -288,6 +316,13 @@ pub async fn dashboard_api(State(state): State<Arc<GatewayState>>) -> Response {
         }
     }
 
+    let origin_counts = state.metrics.get_origin_counts().clone();
+    let requests_by_origin: std::collections::HashMap<String, u64> = origin_counts
+        .iter()
+        .filter(|(_, count)| **count > 0)
+        .map(|(k, v)| (k.clone(), *v))
+        .collect();
+
     let metrics = DashboardMetrics {
         requests_total: total_requests,
         requests_by_backend,
@@ -299,6 +334,7 @@ pub async fn dashboard_api(State(state): State<Arc<GatewayState>>) -> Response {
         uptime_seconds: uptime,
         session_cache_entries: cache_entries,
         large_model_multimodal: state.config.large_model_multimodal,
+        requests_by_origin,
     };
     json_response(serde_json::to_value(metrics).unwrap(), StatusCode::OK)
 }

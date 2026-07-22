@@ -79,6 +79,11 @@ impl AppConfig {
                 tts_url: Some(self.tts_url.clone()),
                 stt_url: Some(self.stt_url.clone()),
             },
+            main_model_name: Some(self.main_model_name.clone()),
+            small_model_name: Some(self.small_model_name.clone()),
+            small_mllm_url: Some(self.small_mllm_url.clone()),
+            large_mllm_url: Some(self.large_mllm_url.clone()),
+            large_text_url: Some(self.large_text_url.clone()),
         }
     }
 }

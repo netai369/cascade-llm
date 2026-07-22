@@ -19,12 +19,13 @@
     header h1 { font-size: 1.5rem; letter-spacing: -0.02em; }
     header h1 span { color: #00ffff; }
     header p { color: #94a3b8; margin: 0.3rem 0 0; font-size: 0.85rem; }
-    nav { display: flex; justify-content: center; gap: 1rem; margin-top: 0.8rem; }
+    nav { display: flex; justify-content: center; gap: 1rem; margin-top: 0.8rem; flex-wrap: wrap; }
     nav a {
       color: #94a3b8; text-decoration: none; font-size: 0.85rem;
       padding: 0.3rem 0.8rem; border-radius: 6px; transition: all 0.15s;
     }
     nav a:hover, nav a.active { color: #00ffff; background: rgba(0,255,255,0.08); }
+    nav a.back-link { color: #64748b; font-size: 0.75rem; }
     main { max-width: 1200px; margin: 0 auto; padding: 1.5rem 1rem; }
     .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 1rem; margin-bottom: 1.5rem; }
     .card {
@@ -71,6 +72,7 @@
     <h1><span>Cascade</span> LLM Gateway</h1>
     <p>Unified AI Router — Multi-Provider — Real-time Monitoring</p>
     <nav>
+      <a href="/menu/" class="back-link" title="Back to main menu">← Menu</a>
       <a href="./" class="active">Dashboard</a>
       <a href="settings">Settings</a>
       <a href="metrics" target="_blank">Metrics</a>
@@ -100,6 +102,13 @@
       <table>
         <thead><tr><th>Name</th><th>Type</th><th>Models</th><th>Status</th></tr></thead>
         <tbody id="providers-table"><tr><td colspan="4" style="color:#64748b">Loading...</td></tr></tbody>
+      </table>
+    </div>
+    <div class="provider-section" id="local-models-section" style="display:none;">
+      <h3>Local Models</h3>
+      <table>
+        <thead><tr><th>Name</th><th>Type</th><th>URL</th><th>Models</th><th>Status</th></tr></thead>
+        <tbody id="local-models-table"><tr><td colspan="5" style="color:#64748b">No local models configured</td></tr></tbody>
       </table>
     </div>
   </main>
@@ -155,6 +164,18 @@
           tbody.innerHTML = providers.map(p => `<tr><td>${p.name}</td><td>${p.provider_type.type || p.provider_type}</td><td>${p.models.join(', ')}</td><td><span class="badge ${p.enabled ? 'badge-active' : 'badge-inactive'}">${p.enabled ? 'Active' : 'Disabled'}</span></td></tr>`).join('');
         }
       } catch(e) {}
+      try {
+        const r = await fetch('/models');
+        const models = await r.json();
+        const localModels = models.data.filter(m => m.owned_by === 'netai-stack' || m.owned_by === 'llamacpp');
+        const tbody = document.getElementById('local-models-table');
+        if (localModels.length === 0) {
+          tbody.innerHTML = '<tr><td colspan="5" style="color:#64748b">No local models configured</td></tr>';
+        } else {
+          tbody.innerHTML = localModels.map(m => `<tr><td>${m.id}</td><td>${m.model_type || 'Unknown'}</td><td>${m.owned_by}</td><td>${m.id}</td><td><span class="badge badge-active">Active</span></td></tr>`).join('');
+        }
+        document.getElementById('local-models-section').style.display = 'block';
+      } catch(e) { console.error('Local models fetch error:', e); }
     }
     initCharts();
     refresh();

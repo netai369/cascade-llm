@@ -356,7 +356,9 @@ impl GatewayState {
         payload: &ChatCompletionRequest,
         url: &str,
         is_streaming: bool,
+        _origin: &str,
     ) -> Result<(HeaderMap, Body), StatusCode> {
+
         let backend_response = self
             .http_client
             .post(url)
@@ -679,6 +681,7 @@ impl GatewayState {
         is_streaming: bool,
         tier: &str,
         headers: &HeaderMap,
+        origin: &str,
     ) -> Result<(HeaderMap, Body), StatusCode> {
         let has_image = self.detect_image(&payload.messages);
         let has_tools = payload.tools.is_some() || payload.functions.is_some();
@@ -695,9 +698,9 @@ impl GatewayState {
             .or_else(|| headers.get("x-librechat-conversation-id"))
             .and_then(|v| v.to_str().ok().map(|s| s.to_string()));
 
-        let has_reliable_session_key = session_key.is_some();
+    let has_reliable_session_key = session_key.is_some();
 
-        let aggregated_text = language::extract_text(&payload.messages);
+    let aggregated_text = language::extract_text(&payload.messages);
         let session_key = session_key.or_else(|| {
             payload.user.as_ref().map(|u| {
                 use std::collections::hash_map::DefaultHasher;
@@ -799,7 +802,7 @@ impl GatewayState {
 
         if let Some(target) = target_override {
             info!("SESSION AFFINITY ROUTE: Proxying directly to target={}", target);
-            let result = self.proxy_to_backend(&injected_payload, &target, is_streaming).await;
+            let result = self.proxy_to_backend(&injected_payload, &target, is_streaming, origin).await;
             match &result {
                 Ok(_) => {
                     self.circuit_breaker.record_success(&target).await;
@@ -839,7 +842,7 @@ impl GatewayState {
                 large_url
             );
             let result = self
-                .proxy_to_backend(&modified_payload, &large_url, is_streaming)
+                .proxy_to_backend(&modified_payload, &large_url, is_streaming, origin)
                 .await;
             match &result {
                 Ok(_) => {
@@ -861,7 +864,7 @@ impl GatewayState {
         if has_tools && self.config.route_tools_to_large {
             let target = &large_url;
             info!("TOOLS DETECTED + route_tools_to_large=true: routing to large text model");
-            let result = self.proxy_to_backend(&injected_payload, target, is_streaming).await;
+            let result = self.proxy_to_backend(&injected_payload, target, is_streaming, origin).await;
             match &result {
                 Ok(_) => {
                     self.circuit_breaker.record_success(target).await;
@@ -893,7 +896,7 @@ impl GatewayState {
 
         if !use_small {
             let result = self
-                .proxy_to_backend(&injected_payload, &target_url, is_streaming)
+                .proxy_to_backend(&injected_payload, &target_url, is_streaming, origin)
                 .await;
             match &result {
                 Ok(_) => {
@@ -931,7 +934,7 @@ impl GatewayState {
 
         if is_streaming {
             let result = self
-                .proxy_to_backend(&small_payload, &target_url, true)
+                .proxy_to_backend(&small_payload, &target_url, true, origin)
                 .await;
             match &result {
                 Ok(_) => {
@@ -980,7 +983,7 @@ impl GatewayState {
             self.circuit_breaker.record_failure(&target_url).await;
             self.metrics.record_fallback("primary_failed");
             let result = self
-                .proxy_to_backend(&injected_payload, &large_url, false)
+                .proxy_to_backend(&injected_payload, &large_url, false, origin)
                 .await;
             if result.is_ok() {
                 self.circuit_breaker.record_success(&large_url).await;
@@ -1034,7 +1037,7 @@ impl GatewayState {
         info!("Rerouting original request to large text model");
         self.metrics.record_fallback("quality_low");
         let result = self
-            .proxy_to_backend(&injected_payload, &large_url, false)
+            .proxy_to_backend(&injected_payload, &large_url, false, origin)
             .await;
         if result.is_ok() {
             self.circuit_breaker.record_success(&large_url).await;

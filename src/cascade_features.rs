@@ -25,6 +25,7 @@ use tracing::{error, warn};
 pub struct MetricsRegistry {
     pub requests_total: prometheus::CounterVec,
     pub fallback_triggered: prometheus::CounterVec,
+    origin_counts: std::collections::HashMap<String, u64>,
 }
 
 #[allow(dead_code)]
@@ -48,6 +49,9 @@ impl MetricsRegistry {
         )
         .unwrap();
 
+        let origin_counts: std::collections::HashMap<String, u64> =
+            std::collections::HashMap::new();
+
         // Pre-initialize label values so metrics appear in /metrics from startup
         // (prometheus prunes empty MetricFamilies during gather)
         for backend in &["small", "large", "large_multimodal", "large_text", "fallback"] {
@@ -60,6 +64,7 @@ impl MetricsRegistry {
         Self {
             requests_total,
             fallback_triggered,
+            origin_counts,
         }
     }
 
@@ -69,6 +74,15 @@ impl MetricsRegistry {
 
     pub fn record_fallback(&self, reason: &str) {
         self.fallback_triggered.with_label_values(&[reason]).inc();
+    }
+
+    pub fn record_request_origin(&mut self, origin: &str) {
+        let entry = self.origin_counts.entry(origin.to_string()).or_insert(0);
+        *entry += 1;
+    }
+
+    pub fn get_origin_counts(&self) -> &std::collections::HashMap<String, u64> {
+        &self.origin_counts
     }
 }
 

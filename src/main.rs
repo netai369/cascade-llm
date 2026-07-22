@@ -70,6 +70,7 @@ async fn main() {
         .merge(cascade_features::build_router::<Arc<state::GatewayState>>())
         .route("/v1/chat/completions", post(handlers::chat_completions))
         .route("/v1/models", get(handlers::list_models))
+        .route("/models", get(handlers::list_models))
         .route("/model", get(handlers::get_model))
         .route("/health", get(handlers::health_check))
         .route("/v1/audio/speech", post(handlers::tts))
@@ -95,11 +96,20 @@ async fn main() {
             "/web/api/providers",
             get(handlers::list_providers).post(handlers::add_provider),
         )
-        .route(
-            "/web/api/providers/:id",
-            get(handlers::get_provider).delete(handlers::delete_provider),
-        )
-        .with_state(state)
+.route(
+    "/web/api/providers/:id",
+    get(handlers::get_provider).delete(handlers::delete_provider),
+  )
+  .route("/api/dashboard", get(handlers::dashboard_api))
+  .route(
+    "/api/providers",
+    get(handlers::list_providers).post(handlers::add_provider),
+  )
+  .route(
+    "/api/providers/:id",
+    get(handlers::get_provider).delete(handlers::delete_provider),
+  )
+  .with_state(state)
         .layer(DefaultBodyLimit::disable());
 
     let addr = SocketAddr::from(([0, 0, 0, 0], 3000));

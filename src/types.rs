@@ -184,6 +184,11 @@ pub struct Settings {
     pub providers: Vec<ProviderConfig>,
     pub routing: RoutingSettings,
     pub audio: AudioSettings,
+    pub main_model_name: Option<String>,
+    pub small_model_name: Option<String>,
+    pub small_mllm_url: Option<String>,
+    pub large_mllm_url: Option<String>,
+    pub large_text_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -207,4 +212,5 @@ pub struct DashboardMetrics {
     pub uptime_seconds: u64,
     pub session_cache_entries: u64,
     pub large_model_multimodal: bool,
+    pub requests_by_origin: std::collections::HashMap<String, u64>,
 }
