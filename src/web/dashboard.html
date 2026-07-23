@@ -165,7 +165,7 @@
         }
       } catch(e) {}
       try {
-        const r = await fetch('/models');
+        const r = await fetch('models');
         const models = await r.json();
         const localModels = models.data.filter(m => m.owned_by === 'netai-stack' || m.owned_by === 'llamacpp');
         const tbody = document.getElementById('local-models-table');
