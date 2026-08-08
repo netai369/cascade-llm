@@ -81,20 +81,6 @@ pub fn get_system_prompt(language: &str) -> &'static str {
     }
 }
 
-pub fn get_image_prompt(language: &str) -> &'static str {
-    match language {
-        "de" => "Beschreibe dieses Bild im Detail. Konzentriere dich auf Objekte, Texte, Personen und alles Auffällige. Sei präzise aber kurz.",
-        "fr" => "Décris cette image en détail. Concentre-toi sur les objets, le texte, les personnes et tout ce qui est remarquable. Sois précis mais concis.",
-        "it" => "Descrivi questa immagine in dettaglio. Concentrati su oggetti, testo, persone e tutto ciò che è notevole. Sii preciso ma conciso.",
-        "es" => "Describe esta imagen en detalle. Céntrate en objetos, texto, personas y todo lo notable. Sé preciso pero conciso.",
-        "pl" => "Opisz ten obraz szczegółowo. Skup się na obiektach, tekście, osobach i wszystkim co jest godne uwagi. Bądź precyzyjny ale zwięzły.",
-        "hu" => "Írd le részletesen ezt a képet. Koncentrálj az objektumokra, szövegre, emberekre és minden figyelemre méltó dologra. Legy pontos, de tömör.",
-        "sl" => "Podrobno opišite to sliko. Osredotočite se na predmete, besedilo, ljudi in vse opazne. Bodite natančni, a jedrnati.",
-        "hr" => "Detaljno opišite ovu sliku. Usredotočite se na objekte, tekst, ljude i sve što je primjetno. Budite precizni, ali sažeti.",
-        _ => "Describe this image in detail. Focus on objects, text, people, and anything notable. Keep it concise but thorough.",
-    }
-}
-
 pub fn inject_language_prompt(
     language: &str,
     mut payload: ChatCompletionRequest,

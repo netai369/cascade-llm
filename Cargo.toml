@@ -1,6 +1,6 @@
 [package]
 name = "cascade-llm"
-version = "0.2.0"
+version = "0.5.0"
 edition = "2021"
 description = "Unified AI gateway with multi-provider routing, web UI, TTS/STT, and media generation"
 license = "MIT"

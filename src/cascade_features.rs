@@ -54,10 +54,13 @@ impl MetricsRegistry {
 
         // Pre-initialize label values so metrics appear in /metrics from startup
         // (prometheus prunes empty MetricFamilies during gather)
-        for backend in &["small", "large", "large_multimodal", "large_text", "fallback"] {
+        for backend in &[
+            "small", "large", "large_multimodal", "large_text", "fallback",
+            "ocr", "auxiliary", "inference",
+        ] {
             requests_total.with_label_values(&[backend]);
         }
-        for reason in &["primary_failed", "quality_low", "timeout"] {
+        for reason in &["primary_failed", "quality_low", "timeout", "backend_unavailable"] {
             fallback_triggered.with_label_values(&[reason]);
         }
 

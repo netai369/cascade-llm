@@ -182,17 +182,26 @@ pub async fn chat_completions(
             *response.headers_mut() = hdrs;
             response
         }
-        Err(status) => json_response(
-            serde_json::json!({
-                "error": {
-                    "message": format!("HTTP {}", status.as_u16()),
-                    "type": "cascade_proxy_error",
-                    "param": serde_json::Value::Null,
-                    "code": serde_json::Value::Number(status.as_u16().into())
-                }
-            }),
-            status,
-        ),
+        Err(e) => {
+            let status = StatusCode::from_u16(e.status).unwrap_or(StatusCode::BAD_GATEWAY);
+            let (err_type, details) = if e.unreachable {
+                ("cascade_backend_unavailable".to_string(), format!("{} is unreachable: {}", e.backend, e.context))
+            } else {
+                ("cascade_backend_error".to_string(), format!("{}: {}", e.backend, e.context))
+            };
+            json_response(
+                serde_json::json!({
+                    "error": {
+                        "message": details,
+                        "type": err_type,
+                        "backend": e.backend,
+                        "param": serde_json::Value::Null,
+                        "code": serde_json::Value::Number(status.as_u16().into())
+                    }
+                }),
+                status,
+            )
+        }
     }
 }
 
@@ -223,10 +232,21 @@ async fn fetch_models_from(client: &reqwest::Client, base_url: &str, model_type:
 
 pub async fn list_models(State(state): State<Arc<GatewayState>>) -> Response {
     let large_models = fetch_models_from(&state.http_client, &state.config.large_text_url.replace("/v1/chat/completions", ""), "Main").await;
-    let small_models = fetch_models_from(&state.http_client, &state.config.small_mllm_url.replace("/v1/chat/completions", ""), "Small").await;
+    let small_models = fetch_models_from(&state.http_client, &state.config.small_mllm_url.replace("/v1/chat/completions", ""), "Compression").await;
+    let ocr_models = fetch_models_from(&state.http_client, &state.config.ocr_server_url.replace("/v1/chat/completions", ""), "OCR").await;
 
     let mut all_models = large_models;
     all_models.extend(small_models);
+    all_models.extend(if ocr_models.is_empty() {
+        // Backend not reachable yet — still advertise the configured OCR model id.
+        serde_json::to_value(build_model_info(&state.config.ocr_model_name))
+            .ok()
+            .filter(|m| m.is_object())
+            .into_iter()
+            .collect()
+    } else {
+        ocr_models
+    });
 
     json_response(
         serde_json::json!({
@@ -249,6 +269,9 @@ pub async fn health_check(State(state): State<Arc<GatewayState>>) -> Response {
             "large_model_multimodal": state.config.large_model_multimodal,
             "router_threshold": state.config.router_threshold,
             "confidence_threshold": state.config.confidence_threshold,
+            "ocr_server_url": state.config.ocr_server_url,
+            "auxiliary_server_url": state.config.small_mllm_url,
+            "inference_server_url": state.config.large_text_url,
             "session_cache_entries": state.session_cache.entry_count() as u64,
             "uptime_seconds": state.start_time.elapsed().as_secs(),
             "providers": state.config.providers.len(),
@@ -301,7 +324,7 @@ pub async fn dashboard_api(State(state): State<Arc<GatewayState>>) -> Response {
     let uptime = state.start_time.elapsed().as_secs();
     let cache_entries = state.session_cache.entry_count() as u64;
 
-    let known_backends = ["small", "large", "large_multimodal", "session_affinity", "stt_proxy"];
+    let known_backends = ["small", "large", "large_multimodal", "session_affinity", "stt_proxy", "ocr", "auxiliary", "inference"];
     let mut requests_by_backend = std::collections::HashMap::new();
     let mut total_requests: u64 = 0;
     for backend in &known_backends {

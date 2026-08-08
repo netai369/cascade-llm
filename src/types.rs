@@ -7,6 +7,10 @@ pub enum MessageContentPart {
     Text { text: String },
     ImageUrl { image_url: ImageUrlTarget },
     InputAudio { input_audio: InputAudioData },
+    /// File attachment (PDF, image, office docs). Kept tolerant to any shape so
+    /// requests with uploads never fail deserialization. Inspected by the router
+    /// to detect vision / document-parsing payloads.
+    File { #[serde(default)] file: Value },
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -69,6 +73,85 @@ pub struct ChatCompletionRequest {
     pub stop: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub response_format: Option<Value>,
+    /// Arbitrary request metadata (route hints, document/OCR flags). Parsed by the
+    /// multi-endpoint router to override payload inspection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<Value>,
+    /// Convenience top-level route hint, e.g. `"ocr"`, `"auxiliary"`, `"inference"`.
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "route")]
+    pub route_hint: Option<String>,
+}
+
+/// Payload inspection result: which of the three specialized backends a request
+/// should be forwarded to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RouteDecision {
+    /// Vision / document parsing -> ocr-server (PaddleOCR-VL)
+    Ocr,
+    /// Agent context compression / summarization -> auxiliary-server (LFM2.5-2.6B)
+    Auxiliary,
+    /// Default chat & reasoning -> inference-server (main LLM)
+    Inference,
+    /// Legacy complexity-based routing (explicit `auto` mode only)
+    Auto,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RouteBackend {
+    OcrServer,
+    AuxiliaryServer,
+    InferenceServer,
+}
+
+/// Structured proxy failure carrying enough context for a clean client-facing
+/// JSON error (e.g. structured 503 when the OCR endpoint is unreachable).
+#[derive(Debug, Clone)]
+pub struct ProxyError {
+    pub status: u16,
+    pub backend: String,
+    pub context: String,
+    /// True when the failure is a transport/connectivity issue (endpoint down),
+    /// rather than an HTTP error returned by the backend itself.
+    pub unreachable: bool,
+}
+
+impl ProxyError {
+    pub fn new(
+        status: impl Into<u16>,
+        backend: impl Into<String>,
+        context: impl Into<String>,
+    ) -> Self {
+        Self {
+            status: status.into(),
+            backend: backend.into(),
+            context: context.into(),
+            unreachable: false,
+        }
+    }
+
+    pub fn unreachable(
+        status: impl Into<u16>,
+        backend: impl Into<String>,
+        context: impl Into<String>,
+    ) -> Self {
+        Self {
+            status: status.into(),
+            backend: backend.into(),
+            context: context.into(),
+            unreachable: true,
+        }
+    }
+}
+
+impl From<axum::http::StatusCode> for ProxyError {
+    fn from(s: axum::http::StatusCode) -> Self {
+        Self {
+            status: s.as_u16(),
+            backend: "backend".to_string(),
+            context: format!("backend request failed with HTTP {}", s.as_u16()),
+            unreachable: false,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -189,6 +272,8 @@ pub struct Settings {
     pub small_mllm_url: Option<String>,
     pub large_mllm_url: Option<String>,
     pub large_text_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ocr_server_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

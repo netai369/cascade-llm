@@ -5,8 +5,10 @@ pub struct AppConfig {
     pub small_mllm_url: String,
     pub large_mllm_url: String,
     pub large_text_url: String,
+    pub ocr_server_url: String,
     pub main_model_name: String,
     pub small_model_name: String,
+    pub ocr_model_name: String,
     pub router_threshold: f64,
     pub confidence_threshold: f64,
     pub large_model_multimodal: bool,
@@ -24,15 +26,19 @@ impl AppConfig {
     pub fn from_env() -> Self {
         Self {
             small_mllm_url: std::env::var("SMALL_MLLM_URL")
-                .unwrap_or_else(|_| "http://localhost:8082/v1/chat/completions".to_string()),
+                .unwrap_or_else(|_| "http://auxiliary-server:8081/v1/chat/completions".to_string()),
             large_mllm_url: std::env::var("LARGE_MLLM_URL")
-                .unwrap_or_else(|_| "http://localhost:8080/v1/chat/completions".to_string()),
+                .unwrap_or_else(|_| "http://inference-server:8080/v1/chat/completions".to_string()),
             large_text_url: std::env::var("LARGE_TEXT_URL")
-                .unwrap_or_else(|_| "http://localhost:8080/v1/chat/completions".to_string()),
+                .unwrap_or_else(|_| "http://inference-server:8080/v1/chat/completions".to_string()),
+            ocr_server_url: std::env::var("OCR_URL")
+                .unwrap_or_else(|_| "http://ocr-server:8082/v1/chat/completions".to_string()),
             main_model_name: std::env::var("MAIN_MODEL_NAME")
-                .unwrap_or_else(|_| "gpt-3.5-turbo".to_string()),
+                .unwrap_or_else(|_| "Qwythos-9B-v2".to_string()),
             small_model_name: std::env::var("SMALL_MODEL_NAME")
-                .unwrap_or_else(|_| "gpt-4o-mini".to_string()),
+                .unwrap_or_else(|_| "LFM2.5-2.6B".to_string()),
+            ocr_model_name: std::env::var("OCR_MODEL_NAME")
+                .unwrap_or_else(|_| "PaddleOCR-VL-1.6".to_string()),
             router_threshold: std::env::var("ROUTER_THRESHOLD")
                 .unwrap_or_else(|_| "0.5".to_string())
                 .parse::<f64>()
@@ -84,6 +90,7 @@ impl AppConfig {
             small_mllm_url: Some(self.small_mllm_url.clone()),
             large_mllm_url: Some(self.large_mllm_url.clone()),
             large_text_url: Some(self.large_text_url.clone()),
+            ocr_server_url: Some(self.ocr_server_url.clone()),
         }
     }
 }

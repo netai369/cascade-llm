@@ -8,7 +8,6 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use futures_util::stream::StreamExt;
 use moka::future::Cache;
-use regex::Regex;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -284,6 +283,9 @@ impl GatewayState {
                                 MessageContentPart::InputAudio { .. } => {
                                     total_chars += 500;
                                 }
+                                MessageContentPart::File { .. } => {
+                                    total_chars += 300;
+                                }
                             }
                         }
                     }
@@ -297,43 +299,24 @@ impl GatewayState {
         score
     }
 
-    fn extract_confidence(&self, body: &[u8]) -> Option<f64> {
-        let value: serde_json::Value = serde_json::from_slice(body).ok()?;
-        let choices = value.get("choices")?.as_array()?;
-        let logprobs = choices.first()?.get("logprobs")?;
-        let content = logprobs.get("content")?.as_array()?;
-        if content.is_empty() {
-            return None;
-        }
-        let sum: f64 = content
-            .iter()
-            .filter_map(|t| t.get("logprob")?.as_f64())
-            .sum();
-        let mean = sum / content.len() as f64;
-        Some(mean.exp())
-    }
-
     fn pick_model(&self, has_image: bool, complexity: f64, tier: &str) -> (bool, &str) {
         if tier == "premium" {
             info!("PREMIUM TIER: routing to large model");
             return (false, &self.config.large_text_url);
         }
 
-        if has_image {
-            if self.config.large_model_multimodal && complexity > self.config.router_threshold {
+        if has_image && self.config.large_model_multimodal {
+            if complexity > self.config.router_threshold {
                 info!(
                     "MODEL SELECTION: image present, complexity {:.2} > threshold {}, routing to large multimodal model",
                     complexity, self.config.router_threshold
                 );
-                (false, &self.config.large_mllm_url)
-            } else if self.config.large_model_multimodal {
+                (false, &self.config.large_text_url)
+            } else {
                 info!(
                     "MODEL SELECTION: image present but complexity {:.2} <= threshold {}, routing to small multimodal model",
                     complexity, self.config.router_threshold
                 );
-                (true, &self.config.small_mllm_url)
-            } else {
-                info!("MODEL SELECTION: image present but large model is text-only, routing to small multimodal model");
                 (true, &self.config.small_mllm_url)
             }
         } else if complexity > self.config.router_threshold {
@@ -351,28 +334,264 @@ impl GatewayState {
         }
     }
 
+    // =========================================================================
+    // MULTI-ENDPOINT ROUTING  (OCR / Document / Agent-Compression / Inference)
+    // =========================================================================
+
+    /// Extracts a backend route hint from request headers.
+    fn header_route_hint(&self, headers: &HeaderMap) -> Option<String> {
+        for name in [
+            "x-cascade-route",
+            "x-cascade-mode",
+            "x-router-mode",
+            "x-route-mode",
+            "x-router",
+        ] {
+            if let Some(v) = headers.get(name) {
+                if let Ok(s) = v.to_str() {
+                    let s = s.trim().to_lowercase();
+                    if !s.is_empty() {
+                        return Some(s);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Extracts a backend route hint from the request body (metadata / top-level `route`).
+    fn payload_route_hint(&self, payload: &ChatCompletionRequest) -> Option<String> {
+        if let Some(r) = &payload.route_hint {
+            let r = r.trim().to_lowercase();
+            if !r.is_empty() {
+                return Some(r);
+            }
+        }
+        if let Some(meta) = &payload.metadata {
+            if let Some(obj) = meta.as_object() {
+                for key in ["route", "mode", "target", "routing"] {
+                    if let Some(v) = obj.get(key).and_then(|v| v.as_str()) {
+                        let v = v.trim().to_lowercase();
+                        if !v.is_empty() {
+                            return Some(v);
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Maps a hint string to a concrete route decision.
+    fn hint_to_decision(&self, hint: &str) -> RouteDecision {
+        match hint {
+            "ocr" | "vision" | "document" | "doc" | "docparse" | "vlm" | "image" | "images" => {
+                RouteDecision::Ocr
+            }
+            "aux" | "auxiliary" | "compression" | "compress" | "compaction" | "summary"
+            | "summarize" | "subagent" | "agent" => RouteDecision::Auxiliary,
+            "auto" | "adaptive" | "complexity" | "legacy" => RouteDecision::Auto,
+            _ => RouteDecision::Inference,
+        }
+    }
+
+    /// True when the conversation carries image content (Condition A signal).
+    fn has_image(&self, payload: &ChatCompletionRequest) -> bool {
+        payload.messages.iter().any(|m| match &m.content {
+            Some(MessageContent::Parts(parts)) => parts.iter().any(
+                |p| matches!(p, MessageContentPart::ImageUrl { .. }),
+            ),
+            _ => false,
+        })
+    }
+
+    /// True when the conversation contains uploaded file attachments / document artifacts.
+    fn has_file_attachment(&self, payload: &ChatCompletionRequest) -> bool {
+        payload.messages.iter().any(|m| match &m.content {
+            Some(MessageContent::Parts(parts)) => parts.iter().any(|p| matches!(p, MessageContentPart::File { .. })),
+            _ => false,
+        })
+    }
+
+    /// Condition A — document / OCR parsing payloads (PaddleOCR-VL).
+    ///
+    /// Only *document* traffic (uploaded files, explicit `document`/`ocr` flags,
+    /// system-level OCR markers) is routed to the OCR backend. Plain image_url
+    /// chats are general vision and fall through to the multimodal inference
+    /// model (Qwythos-9B w/ mmproj), which can describe photos — PaddleOCR-VL
+    /// is a document/OCR model, not a chat VLM.
+    fn is_ocr_payload(&self, payload: &ChatCompletionRequest) -> bool {
+        if self.has_file_attachment(payload) {
+            // Uploaded documents (PDF/scans) and image attachments go to the OCR server.
+            info!("ROUTE_OCR: file attachment detected in payload");
+            return true;
+        }
+
+        if let Some(meta) = &payload.metadata {
+            if let Some(obj) = meta.as_object() {
+                for key in ["document", "ocr", "parse_document", "parseDocument"] {
+                    if let Some(v) = obj.get(key) {
+                        if v.as_bool().unwrap_or(false) {
+                            info!("ROUTE_OCR: explicit '{}' flag in metadata", key);
+                            return true;
+                        }
+                        if let Some(s) = v.as_str() {
+                            if !s.is_empty() && !s.eq_ignore_ascii_case("false") {
+                                info!("ROUTE_OCR: explicit '{}' flag in metadata", key);
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        const DOC_MARKERS: &[&str] = &[
+            "paddleocr",
+            "paddleocr-vl",
+            "[ocr]",
+            "[document]",
+            "<ocr>",
+            "<document>",
+            "parse document",
+            "parse this document",
+            "convert document",
+            "convert this document",
+            "document to markdown",
+            "extract text from this document",
+            "extract tables",
+            "dokument parsen",
+            "dokument in markdown",
+        ];
+        for m in &payload.messages {
+            if m.role == "system" {
+                if let Some(MessageContent::Text(t)) = &m.content {
+                    let low = t.to_lowercase();
+                    if DOC_MARKERS.iter().any(|k| low.contains(k)) {
+                        info!("ROUTE_OCR: document parsing marker in system message");
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// Condition B — agent context compression / summarization payloads.
+    /// Only system-level messages carry Hermes compression hooks, so the detector
+    /// is scoped to `role == "system"` to avoid hijacking ordinary user content.
+    fn is_agent_compression_payload(&self, payload: &ChatCompletionRequest) -> bool {
+        const COMPRESS_MARKERS: &[&str] = &[
+            "compression",
+            "compress the following",
+            "compress the conversation",
+            "conversation summary",
+            "conversation_summary",
+            "summarize the conversation",
+            "summarise the conversation",
+            "condense the conversation",
+            "compact the conversation",
+            "context compaction",
+            "context_compaction",
+            "agent scratchpad",
+            "sub-agent",
+            "sub_agent",
+            "subagent",
+            "hermes compression",
+        ];
+        for m in &payload.messages {
+            if m.role == "system" {
+                if let Some(MessageContent::Text(t)) = &m.content {
+                    let low = t.to_lowercase();
+                    if COMPRESS_MARKERS.iter().any(|k| low.contains(k)) {
+                        info!("ROUTE_AUXILIARY: compression marker in system message");
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// Returns the routing decision for a request based on headers, metadata
+    /// and payload structure — the three-condition multi-endpoint dispatcher.
+    fn inspect_route(&self, payload: &ChatCompletionRequest, headers: &HeaderMap) -> RouteDecision {
+        // Explicit header hint wins for OCR / aux / auto.
+        if let Some(hint) = self.header_route_hint(headers) {
+            let decision = self.hint_to_decision(&hint);
+            if decision == RouteDecision::Ocr {
+                info!("ROUTE_HEADER_HINT: '{hint}' -> OCR");
+                return decision;
+            }
+            if (decision == RouteDecision::Auxiliary && !self.has_image(payload))
+                || decision == RouteDecision::Auto
+            {
+                info!("ROUTE_HEADER_HINT: '{hint}' -> {:?}", decision);
+                return decision;
+            }
+        }
+
+        // Metadata / top-level body hint.
+        if let Some(hint) = self.payload_route_hint(payload) {
+            let decision = self.hint_to_decision(&hint);
+            if decision == RouteDecision::Auxiliary && !self.has_image(payload) {
+                info!("ROUTE_BODY_HINT: '{hint}' -> auxiliary");
+                return decision;
+            }
+            if decision == RouteDecision::Auto {
+                info!("ROUTE_BODY_HINT: '{hint}' -> auto (legacy)");
+                return decision;
+            }
+            if decision == RouteDecision::Inference {
+                info!("ROUTE_BODY_HINT: '{hint}' -> inference");
+                return decision;
+            }
+        }
+
+        // Condition A: vision / OCR / document parsing.
+        if self.is_ocr_payload(payload) {
+            return RouteDecision::Ocr;
+        }
+        // Condition B: agent context compression / sub-agent execution.
+        if self.is_agent_compression_payload(payload) {
+            return RouteDecision::Auxiliary;
+        }
+        // Condition C: default — main inference / RAG / reasoning.
+        RouteDecision::Inference
+    }
+
     async fn proxy_to_backend(
         &self,
         payload: &ChatCompletionRequest,
         url: &str,
         is_streaming: bool,
         _origin: &str,
-    ) -> Result<(HeaderMap, Body), StatusCode> {
+    ) -> Result<(HeaderMap, Body), ProxyError> {
+        // Strip router-internal fields so they are never forwarded to the backend.
+        let mut clean = payload.clone();
+        clean.metadata = None;
+        clean.route_hint = None;
 
         let backend_response = self
             .http_client
             .post(url)
-            .json(payload)
+            .json(&clean)
             .send()
             .await
-            .map_err(|_| StatusCode::BAD_GATEWAY)?;
+            .map_err(|e| {
+                ProxyError::unreachable(StatusCode::SERVICE_UNAVAILABLE, url, format!("backend unreachable: {}", e))
+            })?;
 
         let status = backend_response.status();
         if !status.is_success() {
             let err_body = backend_response.text().await.unwrap_or_default();
             warn!("Backend error HTTP {} from {}: {}", status, url, err_body);
             let error_code = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-            return Err(error_code);
+            return Err(ProxyError::new(
+                error_code.as_u16(),
+                url,
+                format!("backend returned HTTP {}: {}", status, err_body.chars().take(300).collect::<String>()),
+            ));
         }
 
         let mut headers = HeaderMap::new();
@@ -446,7 +665,7 @@ impl GatewayState {
         let body_bytes = backend_response
             .bytes()
             .await
-            .map_err(|_| StatusCode::BAD_GATEWAY)?;
+            .map_err(|_| ProxyError::unreachable(StatusCode::SERVICE_UNAVAILABLE, url, "failed to read backend response"))?;
 
         if let Ok(mut event) = serde_json::from_slice::<serde_json::Value>(&body_bytes) {
             if let Some(choices) = event.get_mut("choices").and_then(|c| c.as_array_mut()) {
@@ -455,6 +674,9 @@ impl GatewayState {
                         if let Some(reasoning) = delta.get("reasoning_content").and_then(|v| v.as_str()) {
                             delta["content"] = serde_json::json!([{"type":"think","think":reasoning}]);
                             delta.as_object_mut().unwrap().remove("reasoning_content");
+                        } else if let Some(reasoning) = delta.get("reasoning").and_then(|v| v.as_str()) {
+                            delta["content"] = serde_json::json!([{"type":"think","think":reasoning}]);
+                            delta.as_object_mut().unwrap().remove("reasoning");
                         } else if let Some(text) = delta.get("content").and_then(|v| v.as_str()) {
                             if !text.is_empty() {
                                 delta["content"] = serde_json::json!([{"type":"text","text":text}]);
@@ -485,96 +707,6 @@ impl GatewayState {
         let bytes = resp.bytes().await.ok()?;
         let encoded = BASE64_STANDARD.encode(&bytes);
         Some(format!("data:{};base64,{}", content_type, encoded))
-    }
-
-    async fn describe_image(&self, image_url: &str, language: &str) -> Option<String> {
-        let url_preview = if image_url.starts_with("data:") {
-            format!("data:...<{} bytes>", image_url.len())
-        } else {
-            image_url.to_string()
-        };
-        info!("Downloading image for description: {}", url_preview);
-
-        let data_url = self.download_image_as_base64(image_url).await?;
-        info!("Image downloaded, size: {} bytes", data_url.len());
-
-        let prompt_text = language::get_image_prompt(language);
-        info!(
-            "IMAGE_DESCRIPTION_LANGUAGE: {}, PROMPT_LENGTH: {}",
-            language,
-            prompt_text.len()
-        );
-
-        let desc_payload = ChatCompletionRequest {
-            model: "vision".to_string(),
-            messages: vec![ChatMessage {
-                role: "user".to_string(),
-                content: Some(MessageContent::Parts(vec![
-                    MessageContentPart::Text {
-                        text: prompt_text.to_string(),
-                    },
-                    MessageContentPart::ImageUrl {
-                        image_url: ImageUrlTarget { url: data_url },
-                    },
-                ])),
-                tool_calls: None,
-                tool_call_id: None,
-                name: None,
-            }],
-            stream: Some(false),
-            temperature: Some(0.2),
-            max_tokens: Some(512),
-            logprobs: None,
-            top_logprobs: None,
-            tools: None,
-            tool_choice: None,
-            functions: None,
-            function_call: None,
-            user: None,
-            stop: None,
-            response_format: None,
-        };
-
-        let resp = self
-            .http_client
-            .post(&self.config.small_mllm_url)
-            .json(&desc_payload)
-            .send()
-            .await
-            .ok()?;
-
-        if !resp.status().is_success() {
-            info!("Image description failed: HTTP {}", resp.status());
-            return None;
-        }
-
-        let body: serde_json::Value = resp.json().await.ok()?;
-        info!(
-            "Vision raw response: {}",
-            body.to_string().chars().take(200).collect::<String>()
-        );
-
-        let msg = body.get("choices")?.as_array()?.first()?.get("message")?;
-
-        let content = msg
-            .get("content")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-        let reasoning = msg
-            .get("reasoning_content")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-
-        let description = match (content, reasoning) {
-            (Some(ref c), _) if !c.is_empty() => Some(c.clone()),
-            (_, Some(ref r)) if !r.is_empty() => Some(r.clone()),
-            _ => None,
-        };
-
-        description.map(|desc| {
-            let re = Regex::new(r"\\?u[eE][0-9a-fA-F]{3}[^\s:]*[:\s]*").unwrap();
-            re.replace_all(&desc, "").to_string()
-        })
     }
 
     async fn inline_all_images(&self, payload: &mut ChatCompletionRequest) {
@@ -617,40 +749,6 @@ impl GatewayState {
         }
     }
 
-    fn replace_images_with_text(&self, payload: &mut ChatCompletionRequest, descriptions: &[String]) {
-        let mut desc_idx = 0;
-        for msg in payload.messages.iter_mut() {
-            if let Some(ref mut content) = msg.content {
-                if let MessageContent::Parts(parts) = content {
-                    let mut new_parts = Vec::new();
-                    for part in parts.drain(..) {
-                        match part {
-                            MessageContentPart::ImageUrl { .. } => {
-                                if desc_idx < descriptions.len() {
-                                    new_parts.push(MessageContentPart::Text {
-                                        text: format!(
-                                            "[System - Image Description: {}]",
-                                            descriptions[desc_idx]
-                                        ),
-                                    });
-                                    desc_idx += 1;
-                                }
-                            }
-                            _ => new_parts.push(part),
-                        }
-                    }
-                    if new_parts.len() == 1 {
-                        if let MessageContentPart::Text { text } = new_parts.remove(0) {
-                            msg.content = Some(MessageContent::Text(text));
-                        }
-                    } else {
-                        msg.content = Some(MessageContent::Parts(new_parts));
-                    }
-                }
-            }
-        }
-    }
-
     fn extract_image_urls(&self, messages: &[ChatMessage]) -> Vec<String> {
         let mut urls = Vec::new();
         for msg in messages {
@@ -675,6 +773,10 @@ impl GatewayState {
         url.to_string()
     }
 
+    // --------------------------------------------------------------------------
+    // Main entry point: three-condition routing dispatch
+    // --------------------------------------------------------------------------
+
     pub async fn route_request_with_fallback(
         &self,
         payload: ChatCompletionRequest,
@@ -682,8 +784,154 @@ impl GatewayState {
         tier: &str,
         headers: &HeaderMap,
         origin: &str,
-    ) -> Result<(HeaderMap, Body), StatusCode> {
-        let has_image = self.detect_image(&payload.messages);
+    ) -> Result<(HeaderMap, Body), ProxyError> {
+        let decision = self.inspect_route(&payload, headers);
+        info!(
+            "ROUTE_OUTCOME: decision={:?}, model={}, messages={}, tier={}, streaming={}",
+            decision,
+            payload.model,
+            payload.messages.len(),
+            tier,
+            is_streaming
+        );
+
+        match decision {
+            RouteDecision::Ocr => self.route_ocr(&payload, is_streaming, origin).await,
+            RouteDecision::Auxiliary => self.route_auxiliary(&payload, is_streaming, origin).await,
+            RouteDecision::Inference => self.route_inference(&payload, is_streaming, origin).await,
+            RouteDecision::Auto => self.route_auto(payload, is_streaming, tier, headers, origin).await,
+        }
+    }
+
+    async fn private_proxy(
+        &self,
+        payload: &ChatCompletionRequest,
+        url: &str,
+        backend: RouteBackend,
+        is_streaming: bool,
+        origin: &str,
+    ) -> Result<(HeaderMap, Body), ProxyError> {
+        let backend_name = match backend {
+            RouteBackend::OcrServer => "ocr-server",
+            RouteBackend::AuxiliaryServer => "auxiliary-server",
+            RouteBackend::InferenceServer => "inference-server",
+        };
+        let metric_name = match backend {
+            RouteBackend::OcrServer => "ocr",
+            RouteBackend::AuxiliaryServer => "auxiliary",
+            RouteBackend::InferenceServer => "inference",
+        };
+
+        if self.circuit_breaker.is_open(url).await {
+            warn!("Circuit breaker OPEN for {}, refusing {}", url, backend_name);
+            self.metrics.record_fallback("backend_unavailable");
+            return Err(ProxyError::unreachable(
+                StatusCode::SERVICE_UNAVAILABLE,
+                backend_name,
+                format!("{} circuit breaker open (too many recent failures)", backend_name),
+            ));
+        }
+
+        match self.proxy_to_backend(payload, url, is_streaming, origin).await {
+            Ok(parts) => {
+                self.circuit_breaker.record_success(url).await;
+                self.metrics.record_request(metric_name);
+                info!("PROXY_OK: backend={}, url={}", backend_name, url);
+                Ok(parts)
+            }
+            Err(e) => {
+                self.circuit_breaker.record_failure(url).await;
+                self.metrics.record_fallback("backend_unavailable");
+                if e.unreachable {
+                    Err(ProxyError::unreachable(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        backend_name,
+                        format!("{} server unavailable: {}", backend_name, e.context),
+                    ))
+                } else {
+                    Err(ProxyError::new(
+                        e.status,
+                        backend_name,
+                        format!("{} returned: {}", backend_name, e.context),
+                    ))
+                }
+            }
+        }
+    }
+
+    /// Condition A — dedicated vision / document parsing (OCR) endpoint.
+    async fn route_ocr(
+        &self,
+        payload: &ChatCompletionRequest,
+        is_streaming: bool,
+        origin: &str,
+    ) -> Result<(HeaderMap, Body), ProxyError> {
+        let mut payload = payload.clone();
+        self.inline_all_images(&mut payload).await;
+        let url = &self.config.ocr_server_url;
+        info!(
+            "ROUTE_A: OCR -> {} ({} messages)",
+            url,
+            payload.messages.len()
+        );
+        let _ = self.extract_image_urls(&payload.messages);
+        self.private_proxy(&payload, url, RouteBackend::OcrServer, is_streaming, origin).await
+    }
+
+    /// Condition B — agent context compression / fast text (auxiliary) endpoint.
+    async fn route_auxiliary(
+        &self,
+        payload: &ChatCompletionRequest,
+        is_streaming: bool,
+        origin: &str,
+    ) -> Result<(HeaderMap, Body), ProxyError> {
+        let mut payload = payload.clone();
+        // If a remote image slipped in, inline it before forwarding.
+        self.inline_all_images(&mut payload).await;
+        let url = &self.config.small_mllm_url;
+        info!(
+            "ROUTE_B: Auxiliary(compression) -> {} ({} messages)",
+            url,
+            payload.messages.len()
+        );
+        self.private_proxy(&payload, url, RouteBackend::AuxiliaryServer, is_streaming, origin).await
+    }
+
+    /// Condition C — default chat & reasoning (main inference) endpoint.
+    async fn route_inference(
+        &self,
+        payload: &ChatCompletionRequest,
+        is_streaming: bool,
+        origin: &str,
+    ) -> Result<(HeaderMap, Body), ProxyError> {
+        let mut payload = payload.clone();
+        // Qwythos-9B is multimodal — inline any remote image URLs before forwarding.
+        self.inline_all_images(&mut payload).await;
+        let lang = language::detect_language(&payload.messages);
+        payload = language::inject_language_prompt(lang, payload);
+        let url = &self.config.large_text_url;
+        info!(
+            "ROUTE_C: Inference(default) -> {} ({} messages, lang={})",
+            url,
+            payload.messages.len(),
+            lang
+        );
+        self.private_proxy(&payload, url, RouteBackend::InferenceServer, is_streaming, origin).await
+    }
+
+    // --------------------------------------------------------------------------
+    // Legacy complexity/session routing, reachable via explicit "auto" mode.
+    // --------------------------------------------------------------------------
+
+    async fn route_auto(
+        &self,
+        payload: ChatCompletionRequest,
+        is_streaming: bool,
+        tier: &str,
+        headers: &HeaderMap,
+        origin: &str,
+    ) -> Result<(HeaderMap, Body), ProxyError> {
+        let has_image = self.has_image(&payload);
         let has_tools = payload.tools.is_some() || payload.functions.is_some();
         let complexity_score = self.evaluate_complexity(&payload.messages);
         let language = language::detect_language(&payload.messages);
@@ -698,9 +946,7 @@ impl GatewayState {
             .or_else(|| headers.get("x-librechat-conversation-id"))
             .and_then(|v| v.to_str().ok().map(|s| s.to_string()));
 
-    let has_reliable_session_key = session_key.is_some();
-
-    let aggregated_text = language::extract_text(&payload.messages);
+        let aggregated_text = language::extract_text(&payload.messages);
         let session_key = session_key.or_else(|| {
             payload.user.as_ref().map(|u| {
                 use std::collections::hash_map::DefaultHasher;
@@ -718,50 +964,15 @@ impl GatewayState {
         };
 
         info!(
-            "[REQ_START] has_image={}, has_tools={}, history_has_tools={}, session_key={:?}, cached_route={:?}, tier={}, has_reliable_session_key={}",
-            has_image, has_tools, history_has_tools, session_key, cached_route, tier, has_reliable_session_key
+            "[AUTO_REQ_START] has_image={}, has_tools={}, history_has_tools={}, session={:?}, cached={:?}, tier={}",
+            has_image, has_tools, history_has_tools, session_key, cached_route, tier
         );
-        info!(
-            "[REQ] user_text={:?}",
-            language::extract_text(&payload.messages)
-        );
-        info!("DETECTED_LANGUAGE: {}", language);
-        info!(
-            "REQUEST_MESSAGES: count={}, aggregated_text_length={}, aggregated_text_preview={}",
-            payload.messages.len(),
-            aggregated_text.len(),
-            aggregated_text.chars().take(200).collect::<String>()
-        );
-        for (i, msg) in payload.messages.iter().enumerate() {
-            if let Some(ref content) = msg.content {
-                match content {
-                    MessageContent::Text(t) => info!(
-                        "MSG_{}: role={}, type=Text, length={}, text={:?}",
-                        i, msg.role, t.len(), t
-                    ),
-                    MessageContent::Parts(parts) => {
-                        info!("MSG_{}: role={}, type=Parts, part_count={}", i, msg.role, parts.len());
-                        for (j, part) in parts.iter().enumerate() {
-                            match part {
-                                MessageContentPart::Text { text } => info!(
-                                    "  PART_{}_TEXT: length={}, text={:?}",
-                                    j, text.len(), text
-                                ),
-                                MessageContentPart::ImageUrl { .. } => info!("  PART_{}: ImageUrl", j),
-                                MessageContentPart::InputAudio { .. } => info!("  PART_{}: InputAudio", j),
-                            }
-                        }
-                    }
-                }
-            } else {
-                info!("MSG_{}: role={}, type=None", i, msg.role);
-            }
-        }
+        info!("AUTO: complexity={:.2}, threshold={:.2}", complexity_score, self.config.router_threshold);
 
-        let mut injected_payload = language::inject_language_prompt(language, payload);
-        if has_image {
-            self.inline_all_images(&mut injected_payload).await;
-        }
+        let injected_payload = language::inject_language_prompt(language, payload);
+        let mut injected_payload = injected_payload;
+        injected_payload.metadata = None;
+        injected_payload.route_hint = None;
 
         self.load_tracker.record(complexity_score);
 
@@ -776,10 +987,7 @@ impl GatewayState {
             info!("SESSION AFFINITY: candidate from cache target_url={}", url);
             Some(url)
         } else if history_has_tools {
-            info!(
-                "SESSION AFFINITY: History has tools but no cached route. Forcing large model target_url={}",
-                large_url
-            );
+            info!("SESSION AFFINITY: History has tools but no cached route. Forcing large model target_url={}", large_url);
             if let Some(ref key) = session_key {
                 self.session_cache
                     .insert(key.clone(), large_url.clone())
@@ -801,7 +1009,7 @@ impl GatewayState {
         }
 
         if let Some(target) = target_override {
-            info!("SESSION AFFINITY ROUTE: Proxying directly to target={}", target);
+            info!("SESSION AFFINITY ROUTE: target={}", target);
             let result = self.proxy_to_backend(&injected_payload, &target, is_streaming, origin).await;
             match &result {
                 Ok(_) => {
@@ -815,134 +1023,40 @@ impl GatewayState {
             return result;
         }
 
-        if has_image && has_tools {
-            info!("IMAGE + TOOLS: describing images with small vision model first");
-
-            let image_urls = self.extract_image_urls(&injected_payload.messages);
-
-            let description_futures = image_urls.iter().map(|url| async {
-                match self.describe_image(url, language).await {
-                    Some(desc) => {
-                        info!(
-                            "Image description: {}",
-                            desc.chars().take(100).collect::<String>()
-                        );
-                        desc
-                    }
-                    None => "[Image could not be described]".to_string(),
-                }
-            });
-            let descriptions = futures_util::future::join_all(description_futures).await;
-
-            let mut modified_payload = injected_payload.clone();
-            self.replace_images_with_text(&mut modified_payload, &descriptions);
-
-            info!(
-                "IMAGE + TOOLS: routing text+descriptions+tools to large text model ({})",
-                large_url
-            );
-            let result = self
-                .proxy_to_backend(&modified_payload, &large_url, is_streaming, origin)
-                .await;
-            match &result {
-                Ok(_) => {
-                    self.circuit_breaker.record_success(&large_url).await;
-                    if let Some(ref key) = session_key {
-                        self.session_cache
-                            .insert(key.clone(), large_url.clone())
-                            .await;
-                    }
-                }
-                Err(_) => {
-                    self.circuit_breaker.record_failure(&large_url).await;
-                }
-            }
-            self.metrics.record_request("large");
-            return result;
-        }
-
-        if has_tools && self.config.route_tools_to_large {
-            let target = &large_url;
-            info!("TOOLS DETECTED + route_tools_to_large=true: routing to large text model");
-            let result = self.proxy_to_backend(&injected_payload, target, is_streaming, origin).await;
-            match &result {
-                Ok(_) => {
-                    self.circuit_breaker.record_success(target).await;
-                    if let Some(ref key) = session_key {
-                        self.session_cache
-                            .insert(key.clone(), target.clone())
-                            .await;
-                    }
-                }
-                Err(_) => {
-                    self.circuit_breaker.record_failure(target).await;
-                }
-            }
-            self.metrics.record_request("large");
-            return result;
-        }
-
-        info!(
-            "Routing decision: has_image={}, complexity_score={:.2}, threshold={}, large_multimodal={}",
-            has_image,
-            complexity_score,
-            self.config.router_threshold,
-            self.config.large_model_multimodal
-        );
-
         let (use_small, target_url) = self.pick_model(has_image, complexity_score, tier);
         let target_url = target_url.to_owned();
-        info!("SELECTED_URL: {}", target_url);
+        info!("AUTO SELECTED_URL: {}", target_url);
 
         if !use_small {
-            let result = self
-                .proxy_to_backend(&injected_payload, &target_url, is_streaming, origin)
-                .await;
+            let result = self.proxy_to_backend(&injected_payload, &target_url, is_streaming, origin).await;
             match &result {
                 Ok(_) => {
                     self.circuit_breaker.record_success(&target_url).await;
                     if let Some(ref key) = session_key {
-                        self.session_cache
-                            .insert(key.clone(), target_url.clone())
-                            .await;
+                        self.session_cache.insert(key.clone(), target_url.clone()).await;
                     }
                 }
                 Err(_) => {
                     self.circuit_breaker.record_failure(&target_url).await;
                 }
             }
-            self.metrics.record_request(
-                if has_image && self.config.large_model_multimodal {
-                    "large_multimodal"
-                } else {
-                    "large"
-                },
-            );
+            self.metrics.record_request("large");
             return result;
         }
 
-        info!("SMALL_MODEL_PATH: target_url={}, use_small=true", target_url);
+        info!("AUTO SMALL_MODEL_PATH: target_url={}", target_url);
         let mut small_payload = injected_payload.clone();
-        info!(
-            "SMALL_MODEL_PAYLOAD_SENT: messages={}",
-            small_payload.messages.len()
-        );
-
         if small_payload.max_tokens.is_none() {
             small_payload.max_tokens = Some(4096);
         }
 
         if is_streaming {
-            let result = self
-                .proxy_to_backend(&small_payload, &target_url, true, origin)
-                .await;
+            let result = self.proxy_to_backend(&small_payload, &target_url, true, origin).await;
             match &result {
                 Ok(_) => {
                     self.circuit_breaker.record_success(&target_url).await;
                     if let Some(ref key) = session_key {
-                        self.session_cache
-                            .insert(key.clone(), target_url.clone())
-                            .await;
+                        self.session_cache.insert(key.clone(), target_url.clone()).await;
                     }
                 }
                 Err(_) => {
@@ -953,10 +1067,8 @@ impl GatewayState {
             return result;
         }
 
-        let mut small_payload = small_payload;
         small_payload.logprobs = Some(true);
         small_payload.top_logprobs = Some(0);
-
         if let Some(max_tokens) = injected_payload.max_tokens {
             small_payload.max_tokens = Some(max_tokens);
         }
@@ -967,26 +1079,24 @@ impl GatewayState {
             .json(&small_payload)
             .send()
             .await
-            .map_err(|_| StatusCode::BAD_GATEWAY)?;
+            .map_err(|e| ProxyError::unreachable(StatusCode::BAD_GATEWAY, &target_url, format!("{}", e)))?;
 
         let status = backend_response.status();
         let body_bytes = backend_response
             .bytes()
             .await
-            .map_err(|_| StatusCode::BAD_GATEWAY)?;
+            .map_err(|_| ProxyError::unreachable(StatusCode::BAD_GATEWAY, &target_url, "read failure"))?;
 
         if !status.is_success() {
-            info!(
-                "Small model returned HTTP {}, rerouting original request to large model",
-                status
-            );
+            info!("Small model returned HTTP {}, rerouting original request to large model", status);
             self.circuit_breaker.record_failure(&target_url).await;
             self.metrics.record_fallback("primary_failed");
-            let result = self
-                .proxy_to_backend(&injected_payload, &large_url, false, origin)
-                .await;
+            let result = self.proxy_to_backend(&injected_payload, &large_url, false, origin).await;
             if result.is_ok() {
                 self.circuit_breaker.record_success(&large_url).await;
+                if let Some(ref key) = session_key {
+                    self.session_cache.insert(key.clone(), large_url.clone()).await;
+                }
             }
             self.metrics.record_request("large");
             return result;
@@ -997,17 +1107,11 @@ impl GatewayState {
         let confidence = self.extract_confidence(&body_bytes);
         let keep_small = match confidence {
             Some(c) if c >= self.config.confidence_threshold => {
-                info!(
-                    "SMALL MODEL CONFIDENCE: {:.4} >= threshold {:.4}, keeping response",
-                    c, self.config.confidence_threshold
-                );
+                info!("SMALL MODEL CONFIDENCE: {:.4} >= threshold {:.4}, keeping", c, self.config.confidence_threshold);
                 true
             }
             Some(c) => {
-                info!(
-                    "SMALL MODEL CONFIDENCE: {:.4} < threshold {:.4}, rerouting to large model",
-                    c, self.config.confidence_threshold
-                );
+                info!("SMALL MODEL CONFIDENCE: {:.4} < threshold {:.4}, rerouting to large", c, self.config.confidence_threshold);
                 false
             }
             None => {
@@ -1018,51 +1122,46 @@ impl GatewayState {
 
         if keep_small {
             if let Some(ref key) = session_key {
-                self.session_cache
-                    .insert(key.clone(), target_url.clone())
-                    .await;
+                self.session_cache.insert(key.clone(), target_url.clone()).await;
             }
-            let mut headers = HeaderMap::new();
-            headers.insert("content-type", HeaderValue::from_static("application/json"));
+            let mut hdrs = HeaderMap::new();
+            hdrs.insert("content-type", HeaderValue::from_static("application/json"));
             if let Some(c) = confidence {
                 let val = format!("{:.4}", c);
                 if let Ok(hv) = HeaderValue::from_str(&val) {
-                    headers.insert("x-confidence", hv);
+                    hdrs.insert("x-confidence", hv);
                 }
             }
             self.metrics.record_request("small");
-            return Ok((headers, Body::from(body_bytes)));
+            return Ok((hdrs, Body::from(body_bytes)));
         }
 
         info!("Rerouting original request to large text model");
         self.metrics.record_fallback("quality_low");
-        let result = self
-            .proxy_to_backend(&injected_payload, &large_url, false, origin)
-            .await;
+        let result = self.proxy_to_backend(&injected_payload, &large_url, false, origin).await;
         if result.is_ok() {
             self.circuit_breaker.record_success(&large_url).await;
             if let Some(ref key) = session_key {
-                self.session_cache
-                    .insert(key.clone(), large_url.clone())
-                    .await;
+                self.session_cache.insert(key.clone(), large_url.clone()).await;
             }
         }
         self.metrics.record_request("large");
         result
     }
 
-    fn detect_image(&self, messages: &[ChatMessage]) -> bool {
-        for msg in messages {
-            if let Some(ref content) = msg.content {
-                if let MessageContent::Parts(parts) = content {
-                    for part in parts {
-                        if matches!(part, MessageContentPart::ImageUrl { .. }) {
-                            return true;
-                        }
-                    }
-                }
-            }
+    fn extract_confidence(&self, body: &[u8]) -> Option<f64> {
+        let value: serde_json::Value = serde_json::from_slice(body).ok()?;
+        let choices = value.get("choices")?.as_array()?;
+        let logprobs = choices.first()?.get("logprobs")?;
+        let content = logprobs.get("content")?.as_array()?;
+        if content.is_empty() {
+            return None;
         }
-        false
+        let sum: f64 = content
+            .iter()
+            .filter_map(|t| t.get("logprob")?.as_f64())
+            .sum();
+        let mean = sum / content.len() as f64;
+        Some(mean.exp())
     }
 }
