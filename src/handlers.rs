@@ -263,6 +263,20 @@ pub async fn get_model(State(state): State<Arc<GatewayState>>) -> Response {
 }
 
 pub async fn health_check(State(state): State<Arc<GatewayState>>) -> Response {
+    let extract_backends = state.extraction_backends.read().await;
+    let extract_summary: Vec<serde_json::Value> = extract_backends
+        .iter()
+        .map(|b| {
+            serde_json::json!({
+                "id": b.id,
+                "type": b.backend_type,
+                "enabled": b.enabled,
+                "healthy": b.healthy,
+                "priority": b.priority,
+            })
+        })
+        .collect();
+
     json_response(
         serde_json::json!({
             "status": "ok",
@@ -272,9 +286,11 @@ pub async fn health_check(State(state): State<Arc<GatewayState>>) -> Response {
             "ocr_server_url": state.config.ocr_server_url,
             "auxiliary_server_url": state.config.small_mllm_url,
             "inference_server_url": state.config.large_text_url,
+            "extract_fallback_url": state.config.extract_fallback_url,
             "session_cache_entries": state.session_cache.entry_count() as u64,
             "uptime_seconds": state.start_time.elapsed().as_secs(),
             "providers": state.config.providers.len(),
+            "extraction_backends": extract_summary,
         }),
         StatusCode::OK,
     )
@@ -427,4 +443,98 @@ pub async fn delete_provider(
         serde_json::json!({"status": "deleted", "id": id}),
         StatusCode::OK,
     )
+}
+
+// ============================================================================
+// EXTRACTION ENDPOINT  (/v1/extraction)
+// ============================================================================
+
+pub async fn extraction_completions(
+    State(state): State<Arc<GatewayState>>,
+    req: Request<Body>,
+) -> Response {
+    let body_bytes = match req.into_body().collect().await {
+        Ok(b) => b.to_bytes(),
+        Err(_) => {
+            return json_response(
+                serde_json::json!({
+                    "error": { "message": "Invalid request body", "type": "proxy_error", "code": 400 }
+                }),
+                StatusCode::BAD_REQUEST,
+            );
+        }
+    };
+
+    let json: ChatCompletionRequest = match serde_json::from_slice(&body_bytes) {
+        Ok(j) => j,
+        Err(_) => {
+            return json_response(
+                serde_json::json!({
+                    "error": { "message": "Invalid JSON", "type": "proxy_error", "code": 400 }
+                }),
+                StatusCode::BAD_REQUEST,
+            );
+        }
+    };
+
+    let is_streaming = json.stream.unwrap_or(false);
+
+    match state.route_extraction(json, is_streaming).await {
+        Ok((hdrs, body)) => {
+            let mut response = Response::new(body);
+            *response.headers_mut() = hdrs;
+            response
+        }
+        Err(e) => {
+            let status = StatusCode::from_u16(e.status).unwrap_or(StatusCode::BAD_GATEWAY);
+            json_response(
+                serde_json::json!({
+                    "error": {
+                        "message": e.context,
+                        "type": if e.unreachable { "extraction_backend_unavailable" } else { "extraction_backend_error" },
+                        "backend": e.backend,
+                        "param": serde_json::Value::Null,
+                        "code": status.as_u16()
+                    }
+                }),
+                status,
+            )
+        }
+    }
+}
+
+pub async fn list_extraction_backends(
+    State(state): State<Arc<GatewayState>>,
+) -> Response {
+    let backends = state.extraction_backends.read().await;
+    json_response(
+        serde_json::json!({ "backends": *backends }),
+        StatusCode::OK,
+    )
+}
+
+pub async fn register_extraction_backend_handler(
+    State(state): State<Arc<GatewayState>>,
+    Json(entry): Json<ExtractionBackendEntry>,
+) -> Response {
+    state.register_extraction_backend(entry.clone()).await;
+    json_response(
+        serde_json::json!({ "status": "ok", "id": entry.id }),
+        StatusCode::OK,
+    )
+}
+
+pub async fn remove_extraction_backend_handler(
+    State(state): State<Arc<GatewayState>>,
+    Path(id): Path<String>,
+) -> Response {
+    let removed = state.remove_extraction_backend(&id).await;
+    if removed {
+        json_response(serde_json::json!({ "status": "deleted", "id": id }), StatusCode::OK)
+    } else {
+        json_response(
+            serde_json::json!({ "error": "Backend not found" }),
+            StatusCode::NOT_FOUND,
+        )
+    }
 }

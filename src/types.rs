@@ -1,6 +1,58 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+// ============================================================================
+// EXTRACTION BACKEND REGISTRY
+// ============================================================================
+
+/// Type of extraction backend for `/v1/extraction` routing.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExtractionBackendType {
+    /// Cloud GPU instance (Vast.ai, RunPod, etc.)
+    CloudGpu,
+    /// Cloud LLM API (OpenRouter, Gemini, etc.)
+    CloudLlm,
+    /// Local auxiliary server (fallback)
+    Local,
+}
+
+/// An extraction backend registered with cascade-LLM.
+/// Backends are selected by (enabled, priority) — lower priority wins.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExtractionBackendEntry {
+    pub id: String,
+    pub backend_type: ExtractionBackendType,
+    pub name: String,
+    /// Base URL (must accept `/v1/chat/completions` appended)
+    pub url: String,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub api_key: Option<String>,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Selection priority — lower wins. CloudGpu=10, CloudLlm=20, Local=99.
+    #[serde(default = "default_priority")]
+    pub priority: u32,
+    /// Max cost per hour in USD (cloud backends only; None = unlimited).
+    #[serde(default)]
+    pub max_cost_per_hour: Option<f64>,
+    /// ISO-8601 timestamp of last validation.
+    #[serde(default)]
+    pub last_validated: Option<String>,
+    /// Whether the backend is currently healthy.
+    #[serde(default = "default_true")]
+    pub healthy: bool,
+}
+
+impl ExtractionBackendEntry {
+    /// Returns the full chat completions URL for this backend.
+    pub fn completions_url(&self) -> String {
+        format!("{}/v1/chat/completions", self.url.trim_end_matches('/'))
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum MessageContentPart {
@@ -274,6 +326,12 @@ pub struct Settings {
     pub large_text_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ocr_server_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extract_cloud_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extract_cloud_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extract_fallback_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -141,6 +141,8 @@ pub struct GatewayState {
     pub metrics: Arc<crate::cascade_features::MetricsRegistry>,
     pub db: Arc<Db>,
     pub start_time: Instant,
+    /// Registry of extraction backends for `/v1/extraction`.
+    pub extraction_backends: Arc<tokio::sync::RwLock<Vec<ExtractionBackendEntry>>>,
 }
 
 impl GatewayState {
@@ -165,6 +167,9 @@ impl GatewayState {
                 .time_to_live(Duration::from_secs(3600))
                 .build(),
             image_semaphore: Arc::new(Semaphore::new(config.max_concurrent_images)),
+            extraction_backends: Arc::new(tokio::sync::RwLock::new(
+                config.build_extraction_backends(),
+            )),
             config,
             http_client,
             metrics,
@@ -1163,5 +1168,158 @@ impl GatewayState {
             .sum();
         let mean = sum / content.len() as f64;
         Some(mean.exp())
+    }
+
+    // =========================================================================
+    // EXTRACTION ENDPOINT  (POST /v1/extraction)
+    // =========================================================================
+
+    /// Selects the best available extraction backend: lowest enabled priority
+    /// whose circuit breaker is closed, sorted by `max_cost_per_hour` when
+    /// tied.
+    async fn select_extraction_backend(&self) -> Option<ExtractionBackendEntry> {
+        let backends = self.extraction_backends.read().await;
+        let mut candidates: Vec<&ExtractionBackendEntry> = backends
+            .iter()
+            .filter(|b| b.enabled && b.healthy)
+            .collect();
+        candidates.sort_by_key(|b| b.priority);
+
+        for candidate in candidates {
+            if !self.circuit_breaker.is_open(&candidate.url).await {
+                return Some(candidate.clone());
+            }
+            info!(
+                "EXTRACT_SKIP: backend '{}' (priority {}) circuit breaker open",
+                candidate.id, candidate.priority
+            );
+        }
+
+        warn!("EXTRACT: no healthy extraction backend available");
+        None
+    }
+
+    /// Registers or updates an extraction backend.
+    pub async fn register_extraction_backend(&self, entry: ExtractionBackendEntry) {
+        let mut backends = self.extraction_backends.write().await;
+        if let Some(existing) = backends.iter_mut().find(|b| b.id == entry.id) {
+            *existing = entry.clone();
+            info!("EXTRACT_REGISTER: updated backend '{}' (priority {})", entry.id, entry.priority);
+        } else {
+            info!("EXTRACT_REGISTER: added backend '{}' (priority {})", entry.id, entry.priority);
+            backends.push(entry);
+        }
+    }
+
+    /// Removes an extraction backend by id.
+    pub async fn remove_extraction_backend(&self, id: &str) -> bool {
+        let mut backends = self.extraction_backends.write().await;
+        let len_before = backends.len();
+        backends.retain(|b| b.id != id);
+        let removed = backends.len() < len_before;
+        if removed {
+            info!("EXTRACT_REGISTER: removed backend '{}'", id);
+        }
+        removed
+    }
+
+    /// Routes an extraction request to the best available backend with
+    /// fallback.  The payload is forwarded as-is to the backend's
+    /// `/v1/chat/completions` endpoint.
+    pub async fn route_extraction(
+        &self,
+        payload: ChatCompletionRequest,
+        is_streaming: bool,
+    ) -> Result<(HeaderMap, Body), ProxyError> {
+        let backend = self
+            .select_extraction_backend()
+            .await
+            .ok_or_else(|| {
+                ProxyError::unreachable(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "extraction",
+                    "no healthy extraction backend available",
+                )
+            })?;
+
+        let url = backend.completions_url();
+        info!(
+            "EXTRACT_ROUTE: backend='{}' type={:?} url={}",
+            backend.id, backend.backend_type, url
+        );
+
+        // Strip internal fields before forwarding
+        let mut clean = payload.clone();
+        clean.metadata = None;
+        clean.route_hint = None;
+
+        // Forward with API key if provided
+        let mut req_builder = self.http_client.post(&url).json(&clean);
+        if let Some(api_key) = &backend.api_key {
+            if !api_key.is_empty() {
+                req_builder = req_builder.header("Authorization", format!("Bearer {}", api_key));
+            }
+        }
+
+        let backend_response = match req_builder.send().await {
+            Ok(resp) => resp,
+            Err(e) => {
+                self.circuit_breaker.record_failure(&url).await;
+                return Err(ProxyError::unreachable(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    &backend.id,
+                    format!("extraction backend unreachable: {}", e),
+                ));
+            }
+        };
+
+        let status = backend_response.status();
+        if !status.is_success() {
+            self.circuit_breaker.record_failure(&url).await;
+            let err_body = backend_response.text().await.unwrap_or_default();
+            let error_code =
+                StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+            return Err(ProxyError::new(
+                error_code.as_u16(),
+                &backend.id,
+                format!(
+                    "extraction backend returned HTTP {}: {}",
+                    status,
+                    err_body.chars().take(300).collect::<String>()
+                ),
+            ));
+        }
+
+        self.circuit_breaker.record_success(&url).await;
+        self.metrics.record_request("extraction");
+
+        let mut headers = HeaderMap::new();
+        if is_streaming {
+            headers.insert("content-type", HeaderValue::from_static("text/event-stream"));
+            headers.insert("cache-control", HeaderValue::from_static("no-cache"));
+            headers.insert("connection", HeaderValue::from_static("keep-alive"));
+        } else {
+            headers.insert("content-type", HeaderValue::from_static("application/json"));
+        }
+
+        if is_streaming {
+            let stream = backend_response
+                .bytes_stream()
+                .map(|item| item.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)));
+            return Ok((headers, Body::from_stream(stream)));
+        }
+
+        let body_bytes = backend_response
+            .bytes()
+            .await
+            .map_err(|_| {
+                ProxyError::unreachable(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    &backend.id,
+                    "failed to read extraction response",
+                )
+            })?;
+
+        Ok((headers, Body::from(body_bytes)))
     }
 }

@@ -20,6 +20,12 @@ pub struct AppConfig {
     pub providers: Vec<ProviderConfig>,
     pub tts_url: String,
     pub stt_url: String,
+
+    // Extraction endpoint
+    pub extract_cloud_url: Option<String>,
+    pub extract_cloud_model: Option<String>,
+    pub extract_cloud_api_key: Option<String>,
+    pub extract_fallback_url: String,
 }
 
 impl AppConfig {
@@ -70,7 +76,57 @@ impl AppConfig {
                 .unwrap_or_else(|_| "http://netai-tts:8800".to_string()),
             stt_url: std::env::var("STT_URL")
                 .unwrap_or_else(|_| "http://netai-stt:5092".to_string()),
+
+            extract_cloud_url: std::env::var("EXTRACT_CLOUD_URL").ok().filter(|s| !s.is_empty()),
+            extract_cloud_model: std::env::var("EXTRACT_CLOUD_MODEL").ok().filter(|s| !s.is_empty()),
+            extract_cloud_api_key: std::env::var("EXTRACT_CLOUD_API_KEY").ok().filter(|s| !s.is_empty()),
+            extract_fallback_url: std::env::var("EXTRACT_FALLBACK_URL")
+                .unwrap_or_else(|_| "http://auxiliary-server:8080".to_string()),
         }
+    }
+
+    /// Builds the initial extraction backend entries from env vars.
+    /// Called at startup; the local fallback is always registered.
+    pub fn build_extraction_backends(&self) -> Vec<ExtractionBackendEntry> {
+        let mut backends = Vec::new();
+
+        if let Some(url) = &self.extract_cloud_url {
+            backends.push(ExtractionBackendEntry {
+                id: "cloud".to_string(),
+                backend_type: if self.extract_cloud_model.as_deref().unwrap_or("").contains('/')
+                    || url.contains("openrouter") || url.contains("googleapis")
+                {
+                    ExtractionBackendType::CloudLlm
+                } else {
+                    ExtractionBackendType::CloudGpu
+                },
+                name: "Cloud extraction backend".to_string(),
+                url: url.clone(),
+                model: self.extract_cloud_model.clone(),
+                api_key: self.extract_cloud_api_key.clone(),
+                enabled: true,
+                priority: 10,
+                max_cost_per_hour: None,
+                last_validated: None,
+                healthy: true,
+            });
+        }
+
+        backends.push(ExtractionBackendEntry {
+            id: "local".to_string(),
+            backend_type: ExtractionBackendType::Local,
+            name: "Local auxiliary server".to_string(),
+            url: self.extract_fallback_url.clone(),
+            model: Some(self.small_model_name.clone()),
+            api_key: None,
+            enabled: true,
+            priority: 99,
+            max_cost_per_hour: None,
+            last_validated: None,
+            healthy: true,
+        });
+
+        backends
     }
 
     pub fn to_settings(&self) -> Settings {
@@ -91,6 +147,9 @@ impl AppConfig {
             large_mllm_url: Some(self.large_mllm_url.clone()),
             large_text_url: Some(self.large_text_url.clone()),
             ocr_server_url: Some(self.ocr_server_url.clone()),
+            extract_cloud_url: self.extract_cloud_url.clone(),
+            extract_cloud_model: self.extract_cloud_model.clone(),
+            extract_fallback_url: Some(self.extract_fallback_url.clone()),
         }
     }
 }

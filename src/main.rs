@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use axum::{
     extract::DefaultBodyLimit,
-    routing::{get, post},
+    routing::{delete, get, post},
     Router,
 };
 use tokio::net::TcpListener;
@@ -109,6 +109,19 @@ async fn main() {
   .route(
     "/api/providers/:id",
     get(handlers::get_provider).delete(handlers::delete_provider),
+  )
+  .route(
+    "/extraction/v1/chat/completions",
+    post(handlers::extraction_completions),
+  )
+  .route(
+    "/extraction/v1/backends",
+    get(handlers::list_extraction_backends)
+      .post(handlers::register_extraction_backend_handler),
+  )
+  .route(
+    "/extraction/v1/backends/:id",
+    delete(handlers::remove_extraction_backend_handler),
   )
   .with_state(state)
         .layer(DefaultBodyLimit::disable());
