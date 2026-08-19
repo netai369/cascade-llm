@@ -15,41 +15,26 @@ use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
 use tracing::{info, warn};
 
-pub async fn fetch_large_model_multimodal_async(inference_url: &str) -> bool {
-    let models_url = format!("{}/models", inference_url.trim_end_matches('/'));
-    match reqwest::Client::new()
-        .get(&models_url)
-        .send()
-        .await
-    {
-        Ok(resp) => match resp.json::<serde_json::Value>().await {
-            Ok(json) => {
-                let empty_vec = Vec::new();
-                let models = json
-                    .get("models")
-                    .and_then(|m| m.as_array())
-                    .unwrap_or(&empty_vec);
-                for model in models {
-                    let empty_caps = Vec::new();
-                    let caps = model
-                        .get("capabilities")
-                        .and_then(|c| c.as_array())
-                        .unwrap_or(&empty_caps);
-                    if caps.iter().any(|c| c.as_str() == Some("multimodal")) {
-                        info!("Auto-detected: large model supports multimodal");
-                        return true;
-                    }
+pub async fn fetch_large_model_multimodal_async(capability_url: &str) -> bool {
+    let url = capability_url.trim_end_matches('/');
+    match reqwest::Client::new().get(url).send().await {
+        Ok(resp) => {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            if status.is_success() && body.trim() == "multimodal" {
+                info!("Auto-detected: large model supports multimodal via capability signal");
+                true
+            } else {
+                if status.is_success() {
+                    info!("Auto-detected: large model is text-only (capability endpoint returned: {})", body.trim());
+                } else {
+                    warn!("Multimodal capability endpoint returned HTTP {}: {}", status, body.trim());
                 }
-                info!("Auto-detected: large model is text-only");
                 false
             }
-            Err(e) => {
-                warn!("Failed to parse /models response JSON: {}, defaulting to false", e);
-                false
-            }
-        },
+        }
         Err(e) => {
-            warn!("Failed to fetch /models endpoint (inference server not ready?): {}", e);
+            warn!("Failed to fetch multimodal capability endpoint (main inference server not ready?): {}", e);
             false
         }
     }
@@ -308,6 +293,13 @@ impl GatewayState {
         if tier == "premium" {
             info!("PREMIUM TIER: routing to large model");
             return (false, &self.config.large_text_url);
+        }
+
+        if has_image && !self.config.large_model_multimodal {
+            info!(
+                "MODEL SELECTION: image present but large model is text-only, routing to auxiliary multimodal model"
+            );
+            return (true, &self.config.small_mllm_url);
         }
 
         if has_image && self.config.large_model_multimodal {
@@ -608,60 +600,109 @@ impl GatewayState {
             headers.insert("content-type", HeaderValue::from_static("application/json"));
         }
 
-        if is_streaming {
-            let on_chunk = move |bytes: &mut Vec<u8>| {
-                let s = match std::str::from_utf8(bytes) {
-                    Ok(s) => s,
-                    Err(_) => return,
-                };
-                if !s.starts_with("data: ") && !s.starts_with("data:{") {
-                    return;
-                }
-                let trimmed = s.trim_start_matches("data: ").trim();
-                if trimmed == "[DONE]" {
-                    return;
-                }
-                if let Ok(mut event) = serde_json::from_str::<serde_json::Value>(trimmed) {
-                    let mut modified = false;
-                    if let Some(delta) = event.get_mut("delta") {
-                        if let Some(reasoning) = delta.get("reasoning_content").and_then(|v| v.as_str()) {
-                            delta["content"] = serde_json::json!([{"type":"think","think":reasoning}]);
-                            delta.as_object_mut().unwrap().remove("reasoning_content");
-                            modified = true;
-                        } else if let Some(reasoning) = delta.get("reasoning").and_then(|v| v.as_str()) {
-                            delta["content"] = serde_json::json!([{"type":"think","think":reasoning}]);
-                            delta.as_object_mut().unwrap().remove("reasoning");
-                            modified = true;
-                        } else if let Some(text) = delta.get("content").and_then(|v| v.as_str()) {
-                            if !text.is_empty() {
-                                delta["content"] = serde_json::json!([{"type":"text","text":text}]);
-                                modified = true;
-                            }
-                        }
-                    }
-                    if modified {
-                        if let Ok(new_s) = serde_json::to_string(&event) {
-                            *bytes = if s.starts_with("data: ") {
-                                format!("data: {}\n\n", new_s).into_bytes()
-                            } else {
-                                format!("{}\n\n", new_s).into_bytes()
-                            };
-                        }
-                    }
+        fn normalize_event_json(raw: &str) -> Option<String> {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() || trimmed == "[DONE]" {
+                return None;
+            }
+            let trimmed = trimmed.strip_prefix("data: ").unwrap_or(trimmed);
+            let trimmed = trimmed.strip_prefix("data:").unwrap_or(trimmed).trim();
+            if trimmed.is_empty() || trimmed == "[DONE]" {
+                return None;
+            }
+
+            let mut event: serde_json::Value = serde_json::from_str(trimmed).ok()?;
+            let delta = match event.get_mut("delta") {
+                Some(delta) => delta,
+                None => {
+                    return Some(format!("data: {}", trimmed));
                 }
             };
 
+            info!(target: "cascade_llm::state", "NORMALIZE delta={}", serde_json::to_string(delta).unwrap_or_default());
+
+            if delta.get("tool_calls").is_some() || delta.get("function_call").is_some() {
+                return Some(format!("data: {}", trimmed));
+            }
+
+            if delta.get("role").is_none() {
+                delta["role"] = serde_json::Value::String("assistant".to_string());
+            }
+
+            let mut normalized = false;
+            if let Some(reasoning) = delta.get("reasoning_content").and_then(|v| v.as_str()) {
+                if !reasoning.is_empty() {
+                    delta["content"] = serde_json::Value::String(reasoning.to_string());
+                    delta.as_object_mut()?.remove("reasoning_content");
+                    normalized = true;
+                }
+            } else if let Some(reasoning) = delta.get("reasoning").and_then(|v| v.as_str()) {
+                if !reasoning.is_empty() {
+                    delta["content"] = serde_json::Value::String(reasoning.to_string());
+                    delta.as_object_mut()?.remove("reasoning");
+                    normalized = true;
+                }
+            }
+
+            if normalized {
+                Some(format!("data: {}", serde_json::to_string(&event).unwrap_or_default()))
+            } else {
+                Some(format!("data: {}", trimmed))
+            }
+        }
+
+        fn emit_complete_sse_events(buffer: &mut Vec<u8>) -> Vec<u8> {
+            info!(target: "cascade_llm::state", "EMIT: buffer_len={} first_bytes={:?}", buffer.len(), std::str::from_utf8(&buffer[..buffer.len().min(100)]).unwrap_or_default());
+            let mut out = Vec::new();
+            while let Some(idx) = buffer.windows(2).position(|w| w == b"\n\n") {
+                let end = idx + 2;
+                let frame = buffer[..end].to_vec();
+                buffer.drain(..end);
+                let text = match std::str::from_utf8(&frame) {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+                if let Some(normalized) = normalize_event_json(text) {
+                    out.extend_from_slice(normalized.as_bytes());
+                    out.extend_from_slice(b"\n\n");
+                }
+            }
+            while let Some(idx) = buffer.iter().position(|&b| b == b'\n') {
+                let line = buffer[..idx].to_vec();
+                buffer.drain(..=idx);
+                let text = match std::str::from_utf8(&line) {
+                    Ok(s) => s.trim(),
+                    Err(_) => continue,
+                };
+                if text.is_empty() || text == "[DONE]" {
+                    continue;
+                }
+                if let Some(normalized) = normalize_event_json(text) {
+                    out.extend_from_slice(normalized.as_bytes());
+                    out.extend_from_slice(b"\n\n");
+                }
+            }
+            out
+        }
+
+        if is_streaming {
+            let pending = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
             let stream = backend_response.bytes_stream().map(move |item| {
                 let mut chunk = match item {
-                    Ok(c) => Ok::<_, std::io::Error>(c),
-                    Err(e) => Err(std::io::Error::new(std::io::ErrorKind::Other, e)),
+                    Ok(c) => c,
+                    Err(e) => return Err(std::io::Error::new(std::io::ErrorKind::Other, e)),
                 };
-                if let Ok(ref mut c) = chunk {
-                    let mut buf = c.to_vec();
-                    on_chunk(&mut buf);
-                    *c = axum::body::Bytes::from(buf);
+
+                let mut local = pending.lock().unwrap();
+                local.extend_from_slice(&chunk);
+                let ready = emit_complete_sse_events(&mut local);
+                drop(local);
+
+                if ready.is_empty() {
+                    return Ok(axum::body::Bytes::new());
                 }
-                chunk
+
+                Ok(axum::body::Bytes::from(ready))
             });
             let body = Body::from_stream(stream);
             return Ok((headers, body));
@@ -676,15 +717,18 @@ impl GatewayState {
             if let Some(choices) = event.get_mut("choices").and_then(|c| c.as_array_mut()) {
                 if let Some(choice) = choices.get_mut(0) {
                     if let Some(delta) = choice.get_mut("delta") {
+                        if delta.get("tool_calls").is_some() || delta.get("function_call").is_some() {
+                            return Ok((headers, Body::from(body_bytes)));
+                        }
                         if let Some(reasoning) = delta.get("reasoning_content").and_then(|v| v.as_str()) {
-                            delta["content"] = serde_json::json!([{"type":"think","think":reasoning}]);
-                            delta.as_object_mut().unwrap().remove("reasoning_content");
+                            if !reasoning.is_empty() {
+                                delta["content"] = serde_json::Value::String(reasoning.to_string());
+                                delta.as_object_mut().unwrap().remove("reasoning_content");
+                            }
                         } else if let Some(reasoning) = delta.get("reasoning").and_then(|v| v.as_str()) {
-                            delta["content"] = serde_json::json!([{"type":"think","think":reasoning}]);
-                            delta.as_object_mut().unwrap().remove("reasoning");
-                        } else if let Some(text) = delta.get("content").and_then(|v| v.as_str()) {
-                            if !text.is_empty() {
-                                delta["content"] = serde_json::json!([{"type":"text","text":text}]);
+                            if !reasoning.is_empty() {
+                                delta["content"] = serde_json::Value::String(reasoning.to_string());
+                                delta.as_object_mut().unwrap().remove("reasoning");
                             }
                         }
                     }
@@ -909,6 +953,13 @@ impl GatewayState {
         is_streaming: bool,
         origin: &str,
     ) -> Result<(HeaderMap, Body), ProxyError> {
+        if self.has_image(payload) && !self.config.large_model_multimodal {
+            info!(
+                "ROUTE_C: image detected but large model is text-only -> auxiliary multimodal backend"
+            );
+            return self.route_auxiliary(payload, is_streaming, origin).await;
+        }
+
         let mut payload = payload.clone();
         // Qwythos-9B is multimodal — inline any remote image URLs before forwarding.
         self.inline_all_images(&mut payload).await;

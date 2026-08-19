@@ -41,7 +41,7 @@ async fn main() {
             info!("LARGE_MODEL_MULTIMODAL not set, auto-detecting...");
             match tokio::time::timeout(
                 std::time::Duration::from_secs(5),
-                state::fetch_large_model_multimodal_async(&app_config.inference_url),
+                state::fetch_large_model_multimodal_async(&app_config.multimodal_capability_url),
             )
             .await
             {

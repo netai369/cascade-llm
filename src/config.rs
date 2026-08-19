@@ -17,6 +17,7 @@ pub struct AppConfig {
     pub cb_reset_secs: u64,
     pub max_concurrent_images: usize,
     pub inference_url: String,
+    pub multimodal_capability_url: String,
     pub providers: Vec<ProviderConfig>,
     pub tts_url: String,
     pub stt_url: String,
@@ -71,6 +72,8 @@ impl AppConfig {
                 .unwrap_or(4),
             inference_url: std::env::var("INFERENCE_URL")
                 .unwrap_or_else(|_| "http://netai-inference:8080".to_string()),
+            multimodal_capability_url: std::env::var("MULTIMODAL_CAPABILITY_URL")
+                .unwrap_or_else(|_| "http://inference-server:80100/multimodal-capability".to_string()),
             providers: Vec::new(),
             tts_url: std::env::var("TTS_URL")
                 .unwrap_or_else(|_| "http://netai-tts:8800".to_string()),
