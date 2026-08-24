@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use axum::{
     extract::DefaultBodyLimit,
-    routing::{delete, get, post},
+    routing::{delete, get, post, put},
     Router,
 };
 use tokio::net::TcpListener;
@@ -39,18 +39,29 @@ async fn main() {
         Ok(v) => v.eq_ignore_ascii_case("true"),
         Err(_) => {
             info!("LARGE_MODEL_MULTIMODAL not set, auto-detecting...");
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                state::fetch_large_model_multimodal_async(&app_config.multimodal_capability_url),
-            )
-            .await
-            {
-                Ok(result) => result,
-                Err(_) => {
-                    warn!("Timeout fetching multimodal capability, defaulting to true");
-                    true
+            // Retry a few times: at boot the llama.cpp container may not be
+            // listening yet. Transport errors must NOT be read as "text-only".
+            let mut probe = false;
+            for attempt in 1..=3 {
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    state::fetch_large_model_multimodal_async(&app_config.multimodal_capability_url),
+                )
+                .await
+                {
+                    Ok(true) => { probe = true; break; }
+                    Ok(false) => {
+                        warn!("Multimodal capability probe attempt {} returned false (retrying)", attempt);
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    }
+                    Err(_) => {
+                        warn!("Multimodal capability probe timeout (attempt {}), defaulting to true", attempt);
+                        probe = true;
+                        break;
+                    }
                 }
             }
+            probe
         }
     };
     app_config.large_model_multimodal = large_model_multimodal;
@@ -122,6 +133,22 @@ async fn main() {
   .route(
     "/extraction/v1/backends/:id",
     delete(handlers::remove_extraction_backend_handler),
+  )
+  .route(
+    "/web/api/upstreams",
+    get(handlers::list_upstreams),
+  )
+  .route(
+    "/web/api/upstreams/:role",
+    put(handlers::put_upstream).delete(handlers::delete_upstream),
+  )
+  .route(
+    "/api/upstreams",
+    get(handlers::list_upstreams),
+  )
+  .route(
+    "/api/upstreams/:role",
+    put(handlers::put_upstream).delete(handlers::delete_upstream),
   )
   .with_state(state)
         .layer(DefaultBodyLimit::disable());

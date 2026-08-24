@@ -507,10 +507,139 @@ pub async fn list_extraction_backends(
     State(state): State<Arc<GatewayState>>,
 ) -> Response {
     let backends = state.extraction_backends.read().await;
+    // Redact secrets: never echo full API keys back out.
+    let masked: Vec<serde_json::Value> = backends
+        .iter()
+        .map(|b| {
+            let mut v = serde_json::to_value(b).unwrap_or(serde_json::Value::Null);
+            if let Some(obj) = v.as_object_mut() {
+                if let Some(Some(key)) = obj.get("api_key").map(|k| k.as_str().map(String::from)) {
+                    let tail: String = key.chars().rev().take(4).collect::<Vec<_>>().into_iter().rev().collect();
+                    obj.insert("api_key".to_string(), serde_json::Value::String(format!("***{tail}")));
+                }
+            }
+            v
+        })
+        .collect();
     json_response(
-        serde_json::json!({ "backends": *backends }),
+        serde_json::json!({ "backends": masked }),
         StatusCode::OK,
     )
+}
+
+// ---------------------------------------------------------------------------
+// Runtime upstream overrides (admin; guarded by CASCADE_ADMIN_KEY)
+// ---------------------------------------------------------------------------
+
+fn admin_authorized(state: &GatewayState, headers: &axum::http::HeaderMap) -> bool {
+    match state.config.admin_key.as_deref() {
+        Some(expected) => headers
+            .get("x-cascade-admin-key")
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v == expected)
+            .unwrap_or(false),
+        None => false,
+    }
+}
+
+fn mask_bearer(b: &Option<String>) -> Option<String> {
+    b.as_ref().map(|k| {
+        let tail: String = k.chars().rev().take(4).collect::<Vec<_>>().into_iter().rev().collect();
+        format!("***{tail}")
+    })
+}
+
+pub async fn list_upstreams(
+    State(state): State<Arc<GatewayState>>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    if !admin_authorized(&state, &headers) {
+        return json_response(serde_json::json!({"error": "forbidden"}), StatusCode::FORBIDDEN);
+    }
+    let map = state.upstream_overrides.read().await;
+    let roles: serde_json::Map<String, serde_json::Value> = map
+        .iter()
+        .map(|(role, o)| {
+            (role.clone(), serde_json::json!({
+                "url": o.url,
+                "bearer_set": o.bearer.is_some(),
+                "bearer_masked": mask_bearer(&o.bearer),
+            }))
+        })
+        .collect();
+    json_response(
+        serde_json::json!({
+            "overrides": roles,
+            "defaults": {
+                "inference": state.config.large_text_url,
+                "auxiliary": state.config.small_mllm_url,
+                "ocr": state.config.ocr_server_url,
+            }
+        }),
+        StatusCode::OK,
+    )
+}
+
+pub async fn put_upstream(
+    State(state): State<Arc<GatewayState>>,
+    Path(role): Path<String>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    if !admin_authorized(&state, &headers) {
+        return json_response(serde_json::json!({"error": "forbidden"}), StatusCode::FORBIDDEN);
+    }
+    let role = role.to_lowercase();
+    if !matches!(role.as_str(), "inference" | "auxiliary" | "ocr") {
+        return json_response(
+            serde_json::json!({"error": "role must be inference|auxiliary|ocr"}),
+            StatusCode::BAD_REQUEST,
+        );
+    }
+    let url = match body.get("url").and_then(|u| u.as_str()) {
+        Some(u) if u.starts_with("http://") || u.starts_with("https://") => u.to_string(),
+        _ => {
+            return json_response(
+                serde_json::json!({"error": "url must be http(s)"}),
+                StatusCode::BAD_REQUEST,
+            )
+        }
+    };
+    let bearer = body
+        .get("bearer")
+        .and_then(|b| b.as_str())
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+    let mut map = state.upstream_overrides.write().await;
+    match bearer {
+        None => {
+            // keep existing token when omitted, so callers can update URL only
+            if let Some(existing) = map.get(&role) {
+                let bearer = existing.bearer.clone();
+                map.insert(role.clone(), crate::types::UpstreamOverride { url, bearer });
+            } else {
+                map.insert(role.clone(), crate::types::UpstreamOverride { url, bearer: None });
+            }
+        }
+        Some(bearer) => {
+            map.insert(role.clone(), crate::types::UpstreamOverride { url, bearer: Some(bearer) });
+        }
+    }
+    info!("UPSTREAM_OVERRIDE_SET: role={}", role);
+    json_response(serde_json::json!({"status": "ok", "role": role}), StatusCode::OK)
+}
+
+pub async fn delete_upstream(
+    State(state): State<Arc<GatewayState>>,
+    Path(role): Path<String>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    if !admin_authorized(&state, &headers) {
+        return json_response(serde_json::json!({"error": "forbidden"}), StatusCode::FORBIDDEN);
+    }
+    let removed = state.upstream_overrides.write().await.remove(&role.to_lowercase());
+    info!("UPSTREAM_OVERRIDE_CLEARED: role={}, existed={}", role, removed.is_some());
+    json_response(serde_json::json!({"status": "cleared"}), StatusCode::OK)
 }
 
 pub async fn register_extraction_backend_handler(

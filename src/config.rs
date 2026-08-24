@@ -27,13 +27,15 @@ pub struct AppConfig {
     pub extract_cloud_model: Option<String>,
     pub extract_cloud_api_key: Option<String>,
     pub extract_fallback_url: String,
+    /// Shared secret guarding the upstream-override admin API (CASCADE_ADMIN_KEY).
+    pub admin_key: Option<String>,
 }
 
 impl AppConfig {
     pub fn from_env() -> Self {
         Self {
             small_mllm_url: std::env::var("SMALL_MLLM_URL")
-                .unwrap_or_else(|_| "http://auxiliary-server:8081/v1/chat/completions".to_string()),
+                .unwrap_or_else(|_| "http://auxiliary-server:8080/v1/chat/completions".to_string()),
             large_mllm_url: std::env::var("LARGE_MLLM_URL")
                 .unwrap_or_else(|_| "http://inference-server:8080/v1/chat/completions".to_string()),
             large_text_url: std::env::var("LARGE_TEXT_URL")
@@ -73,7 +75,7 @@ impl AppConfig {
             inference_url: std::env::var("INFERENCE_URL")
                 .unwrap_or_else(|_| "http://netai-inference:8080".to_string()),
             multimodal_capability_url: std::env::var("MULTIMODAL_CAPABILITY_URL")
-                .unwrap_or_else(|_| "http://inference-server:80100/multimodal-capability".to_string()),
+                .unwrap_or_else(|_| "http://inference-server:18081/multimodal-capability".to_string()),
             providers: Vec::new(),
             tts_url: std::env::var("TTS_URL")
                 .unwrap_or_else(|_| "http://netai-tts:8800".to_string()),
@@ -85,6 +87,7 @@ impl AppConfig {
             extract_cloud_api_key: std::env::var("EXTRACT_CLOUD_API_KEY").ok().filter(|s| !s.is_empty()),
             extract_fallback_url: std::env::var("EXTRACT_FALLBACK_URL")
                 .unwrap_or_else(|_| "http://auxiliary-server:8080".to_string()),
+            admin_key: std::env::var("CASCADE_ADMIN_KEY").ok().filter(|s| !s.is_empty()),
         }
     }
 

@@ -128,6 +128,9 @@ pub struct GatewayState {
     pub start_time: Instant,
     /// Registry of extraction backends for `/v1/extraction`.
     pub extraction_backends: Arc<tokio::sync::RwLock<Vec<ExtractionBackendEntry>>>,
+    /// Runtime upstream overrides keyed by role (inference|auxiliary|ocr).
+    pub upstream_overrides:
+        Arc<tokio::sync::RwLock<std::collections::HashMap<String, crate::types::UpstreamOverride>>>,
 }
 
 impl GatewayState {
@@ -140,6 +143,8 @@ impl GatewayState {
             reqwest::Client::builder()
                 .pool_max_idle_per_host(0)
                 .pool_idle_timeout(Duration::from_secs(90))
+                .connect_timeout(Duration::from_secs(5))
+                .timeout(Duration::from_secs(600))
                 .build()
                 .expect("Failed to build reqwest client"),
         );
@@ -154,6 +159,9 @@ impl GatewayState {
             image_semaphore: Arc::new(Semaphore::new(config.max_concurrent_images)),
             extraction_backends: Arc::new(tokio::sync::RwLock::new(
                 config.build_extraction_backends(),
+            )),
+            upstream_overrides: Arc::new(tokio::sync::RwLock::new(
+                std::collections::HashMap::new(),
             )),
             config,
             http_client,
@@ -520,6 +528,12 @@ impl GatewayState {
                 info!("ROUTE_HEADER_HINT: '{hint}' -> OCR");
                 return decision;
             }
+            if decision == RouteDecision::Inference {
+                // Symmetric with the body hint: an explicit inference hint pins
+                // the main backend (skips OCR/aux content detection).
+                info!("ROUTE_HEADER_HINT: '{hint}' -> Inference");
+                return decision;
+            }
             if (decision == RouteDecision::Auxiliary && !self.has_image(payload))
                 || decision == RouteDecision::Auto
             {
@@ -561,6 +575,7 @@ impl GatewayState {
         &self,
         payload: &ChatCompletionRequest,
         url: &str,
+        bearer: Option<&str>,
         is_streaming: bool,
         _origin: &str,
     ) -> Result<(HeaderMap, Body), ProxyError> {
@@ -569,11 +584,11 @@ impl GatewayState {
         clean.metadata = None;
         clean.route_hint = None;
 
-        let backend_response = self
-            .http_client
-            .post(url)
-            .json(&clean)
-            .send()
+        let mut request = self.http_client.post(url).json(&clean);
+        if let Some(token) = bearer {
+            request = request.bearer_auth(token);
+        }
+        let backend_response = request.send()
             .await
             .map_err(|e| {
                 ProxyError::unreachable(StatusCode::SERVICE_UNAVAILABLE, url, format!("backend unreachable: {}", e))
@@ -662,6 +677,11 @@ impl GatewayState {
                     Ok(s) => s,
                     Err(_) => continue,
                 };
+                if text.trim() == "data: [DONE]" {
+                    // OpenAI-strict clients need the terminator; pass it through.
+                    out.extend_from_slice(b"data: [DONE]\n\n");
+                    continue;
+                }
                 if let Some(normalized) = normalize_event_json(text) {
                     out.extend_from_slice(normalized.as_bytes());
                     out.extend_from_slice(b"\n\n");
@@ -860,6 +880,19 @@ impl GatewayState {
         is_streaming: bool,
         origin: &str,
     ) -> Result<(HeaderMap, Body), ProxyError> {
+        self.private_proxy_with_bearer(payload, url, None, backend, is_streaming, origin)
+            .await
+    }
+
+    async fn private_proxy_with_bearer(
+        &self,
+        payload: &ChatCompletionRequest,
+        url: &str,
+        bearer: Option<&str>,
+        backend: RouteBackend,
+        is_streaming: bool,
+        origin: &str,
+    ) -> Result<(HeaderMap, Body), ProxyError> {
         let backend_name = match backend {
             RouteBackend::OcrServer => "ocr-server",
             RouteBackend::AuxiliaryServer => "auxiliary-server",
@@ -881,8 +914,11 @@ impl GatewayState {
             ));
         }
 
-        match self.proxy_to_backend(payload, url, is_streaming, origin).await {
-            Ok(parts) => {
+        match self.proxy_to_backend(payload, url, bearer, is_streaming, origin).await {
+            Ok(mut parts) => {
+                if let Ok(v) = HeaderValue::from_str(backend_name) {
+                    parts.0.insert("x-cascade-route", v);
+                }
                 self.circuit_breaker.record_success(url).await;
                 self.metrics.record_request(metric_name);
                 info!("PROXY_OK: backend={}, url={}", backend_name, url);
@@ -908,6 +944,19 @@ impl GatewayState {
         }
     }
 
+    /// Resolve the effective upstream for a role: runtime override if present,
+    /// otherwise the static config URL. Returns (url, bearer).
+    async fn resolve_upstream(&self, role: &str, default_url: &str) -> (String, Option<String>) {
+        let map = self.upstream_overrides.read().await;
+        match map.get(role) {
+            Some(o) => {
+                info!("UPSTREAM_OVERRIDE: {} -> {}", role, o.url);
+                (o.url.clone(), o.bearer.clone())
+            }
+            None => (default_url.to_string(), None),
+        }
+    }
+
     /// Condition A — dedicated vision / document parsing (OCR) endpoint.
     async fn route_ocr(
         &self,
@@ -917,14 +966,14 @@ impl GatewayState {
     ) -> Result<(HeaderMap, Body), ProxyError> {
         let mut payload = payload.clone();
         self.inline_all_images(&mut payload).await;
-        let url = &self.config.ocr_server_url;
+        let (url, bearer) = self.resolve_upstream("ocr", &self.config.ocr_server_url).await;
         info!(
             "ROUTE_A: OCR -> {} ({} messages)",
             url,
             payload.messages.len()
         );
         let _ = self.extract_image_urls(&payload.messages);
-        self.private_proxy(&payload, url, RouteBackend::OcrServer, is_streaming, origin).await
+        self.private_proxy_with_bearer(&payload, &url, bearer.as_deref(), RouteBackend::OcrServer, is_streaming, origin).await
     }
 
     /// Condition B — agent context compression / fast text (auxiliary) endpoint.
@@ -937,13 +986,13 @@ impl GatewayState {
         let mut payload = payload.clone();
         // If a remote image slipped in, inline it before forwarding.
         self.inline_all_images(&mut payload).await;
-        let url = &self.config.small_mllm_url;
+        let (url, bearer) = self.resolve_upstream("auxiliary", &self.config.small_mllm_url).await;
         info!(
             "ROUTE_B: Auxiliary(compression) -> {} ({} messages)",
             url,
             payload.messages.len()
         );
-        self.private_proxy(&payload, url, RouteBackend::AuxiliaryServer, is_streaming, origin).await
+        self.private_proxy_with_bearer(&payload, &url, bearer.as_deref(), RouteBackend::AuxiliaryServer, is_streaming, origin).await
     }
 
     /// Condition C — default chat & reasoning (main inference) endpoint.
@@ -965,14 +1014,14 @@ impl GatewayState {
         self.inline_all_images(&mut payload).await;
         let lang = language::detect_language(&payload.messages);
         payload = language::inject_language_prompt(lang, payload);
-        let url = &self.config.large_text_url;
+        let (url, bearer) = self.resolve_upstream("inference", &self.config.large_text_url).await;
         info!(
             "ROUTE_C: Inference(default) -> {} ({} messages, lang={})",
             url,
             payload.messages.len(),
             lang
         );
-        self.private_proxy(&payload, url, RouteBackend::InferenceServer, is_streaming, origin).await
+        self.private_proxy_with_bearer(&payload, &url, bearer.as_deref(), RouteBackend::InferenceServer, is_streaming, origin).await
     }
 
     // --------------------------------------------------------------------------
@@ -1066,7 +1115,7 @@ impl GatewayState {
 
         if let Some(target) = target_override {
             info!("SESSION AFFINITY ROUTE: target={}", target);
-            let result = self.proxy_to_backend(&injected_payload, &target, is_streaming, origin).await;
+            let result = self.proxy_to_backend(&injected_payload, &target, None, is_streaming, origin).await;
             match &result {
                 Ok(_) => {
                     self.circuit_breaker.record_success(&target).await;
@@ -1084,7 +1133,7 @@ impl GatewayState {
         info!("AUTO SELECTED_URL: {}", target_url);
 
         if !use_small {
-            let result = self.proxy_to_backend(&injected_payload, &target_url, is_streaming, origin).await;
+            let result = self.proxy_to_backend(&injected_payload, &target_url, None, is_streaming, origin).await;
             match &result {
                 Ok(_) => {
                     self.circuit_breaker.record_success(&target_url).await;
@@ -1107,7 +1156,7 @@ impl GatewayState {
         }
 
         if is_streaming {
-            let result = self.proxy_to_backend(&small_payload, &target_url, true, origin).await;
+            let result = self.proxy_to_backend(&small_payload, &target_url, None, true, origin).await;
             match &result {
                 Ok(_) => {
                     self.circuit_breaker.record_success(&target_url).await;
@@ -1147,7 +1196,7 @@ impl GatewayState {
             info!("Small model returned HTTP {}, rerouting original request to large model", status);
             self.circuit_breaker.record_failure(&target_url).await;
             self.metrics.record_fallback("primary_failed");
-            let result = self.proxy_to_backend(&injected_payload, &large_url, false, origin).await;
+            let result = self.proxy_to_backend(&injected_payload, &large_url, None, false, origin).await;
             if result.is_ok() {
                 self.circuit_breaker.record_success(&large_url).await;
                 if let Some(ref key) = session_key {
@@ -1194,7 +1243,7 @@ impl GatewayState {
 
         info!("Rerouting original request to large text model");
         self.metrics.record_fallback("quality_low");
-        let result = self.proxy_to_backend(&injected_payload, &large_url, false, origin).await;
+        let result = self.proxy_to_backend(&injected_payload, &large_url, None, false, origin).await;
         if result.is_ok() {
             self.circuit_breaker.record_success(&large_url).await;
             if let Some(ref key) = session_key {
