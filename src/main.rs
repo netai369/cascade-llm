@@ -67,9 +67,45 @@ async fn main() {
     app_config.large_model_multimodal = large_model_multimodal;
 
     let metrics = Arc::new(cascade_features::MetricsRegistry::init());
-    let db = Arc::new(db::Db::new_in_memory().expect("Failed to init database"));
 
-    let state = Arc::new(state::GatewayState::new(app_config, metrics, db));
+    // Persisted settings/providers survive restarts (file DB; falls back to memory).
+    let db_path = std::env::var("CASCADE_DB").unwrap_or_else(|_| "/data/cascade.db".to_string());
+    let db = match db::Db::new(&db_path) {
+        Ok(d) => Arc::new(d),
+        Err(e) => {
+            warn!("Cannot open {} ({}), using in-memory DB", db_path, e);
+            Arc::new(db::Db::new_in_memory().expect("Failed to init database"))
+        }
+    };
+
+    // Restore saved settings BEFORE the state is built so thresholds/defaults
+    // apply from the first request on.
+    if let Ok(Some(raw)) = db.load_config("settings") {
+        match serde_json::from_str::<crate::types::Settings>(&raw) {
+            Ok(saved) => {
+                info!("Restoring persisted settings from {}", db_path);
+                app_config.router_threshold = saved.routing.router_threshold;
+                app_config.confidence_threshold = saved.routing.confidence_threshold;
+                app_config.route_tools_to_large = saved.routing.route_tools_to_large;
+                app_config.default_route = saved.routing.default_route.clone();
+                app_config.marker_mode = saved.routing.marker_mode.clone();
+                if let Some(u) = &saved.audio.tts_url { app_config.tts_url = u.clone(); }
+                if let Some(u) = &saved.audio.stt_url { app_config.stt_url = u.clone(); }
+            }
+            Err(e) => warn!("Persisted settings unreadable: {}", e),
+        }
+    }
+
+    let state = Arc::new(state::GatewayState::new(app_config, metrics, db.clone()));
+
+    // Providers saved earlier re-enter the runtime registry here.
+    match db.load_providers() {
+        Ok(list) if !list.is_empty() => {
+            state.runtime.write().await.providers = list;
+            info!("Restored persisted providers");
+        }
+        _ => {}
+    }
 
     let _fallback_manager = Arc::new(cascade_features::FallbackManager::new(
         state.config.small_mllm_url.clone(),

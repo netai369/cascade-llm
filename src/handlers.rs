@@ -91,6 +91,7 @@ pub async fn chat_completions(
         .get("x-request-origin")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("unknown");
+    state.metrics.record_request_origin(&origin);
     let body_bytes = match req.into_body().collect().await {
         Ok(b) => b.to_bytes(),
         Err(_) => {
@@ -365,11 +366,11 @@ pub async fn dashboard_api(State(state): State<Arc<GatewayState>>) -> Response {
     let metrics = DashboardMetrics {
         requests_total: total_requests,
         requests_by_backend,
-        fallback_count: state
-            .metrics
-            .fallback_triggered
-            .with_label_values(&[""])
-            .get() as u64,
+        fallback_count: ["primary_failed", "quality_low", "timeout",
+                         "backend_unavailable", "extraction_backend_unavailable"]
+            .iter()
+            .map(|r| state.metrics.fallback_triggered.with_label_values(&[r]).get() as u64)
+            .sum(),
         uptime_seconds: uptime,
         session_cache_entries: cache_entries,
         large_model_multimodal: state.config.large_model_multimodal,
@@ -379,14 +380,77 @@ pub async fn dashboard_api(State(state): State<Arc<GatewayState>>) -> Response {
 }
 
 pub async fn get_settings(State(state): State<Arc<GatewayState>>) -> Response {
-    let settings = state.config.to_settings();
-    json_response(serde_json::to_value(settings).unwrap(), StatusCode::OK)
+    let mut s = state.config.to_settings();
+    let rt = state.runtime.read().await;
+    // runtime wins over env defaults
+    s.routing.router_threshold = rt.router_threshold;
+    s.routing.confidence_threshold = rt.confidence_threshold;
+    s.routing.route_tools_to_large = rt.route_tools_to_large;
+    s.routing.default_route = rt.default_route.clone();
+    s.routing.marker_mode = rt.marker_mode.clone();
+    s.audio.tts_url = Some(rt.tts_url.clone());
+    s.audio.stt_url = Some(rt.stt_url.clone());
+    if !rt.providers.is_empty() {
+        s.providers = rt.providers.clone();
+    }
+    json_response(serde_json::to_value(s).unwrap(), StatusCode::OK)
 }
 
 pub async fn update_settings(
     State(state): State<Arc<GatewayState>>,
     Json(settings): Json<Settings>,
 ) -> Response {
+    // Apply to the live runtime…
+    {
+        let mut rt = state.runtime.write().await;
+        rt.router_threshold = settings.routing.router_threshold.clamp(0.0, 1.0);
+        rt.confidence_threshold = settings.routing.confidence_threshold.clamp(0.0, 1.0);
+        rt.route_tools_to_large = settings.routing.route_tools_to_large;
+        rt.default_route = settings
+            .routing
+            .default_route
+            .as_deref()
+            .map(|s| s.to_lowercase())
+            .filter(|s| matches!(s.as_str(), "inference" | "auxiliary" | "ocr" | "auto" | ""));
+        if rt.default_route.as_deref() == Some("") {
+            rt.default_route = None;
+        }
+        rt.marker_mode = match settings.routing.marker_mode.as_str() {
+            "prefix" => "prefix".to_string(),
+            _ => "substring".to_string(),
+        };
+        if let Some(u) = &settings.audio.tts_url {
+            rt.tts_url = u.clone();
+        }
+        if let Some(u) = &settings.audio.stt_url {
+            rt.stt_url = u.clone();
+        }
+        if !settings.providers.is_empty() {
+            rt.providers = settings.providers.clone();
+        }
+    }
+    // …chat URLs additionally flow into the upstream-override machinery so the
+    // routing layer actually uses them.
+    for (role, url_opt) in [
+        ("auxiliary", &settings.small_mllm_url),
+        ("inference", &settings.large_text_url),
+    ] {
+        if let Some(url) = url_opt {
+            let default = match role {
+                "auxiliary" => &state.config.small_mllm_url,
+                _ => &state.config.large_text_url,
+            };
+            if url != default && url.starts_with("http") {
+                let mut map = state.upstream_overrides.write().await;
+                let bearer = map.get(role).and_then(|o| o.bearer.clone());
+                map.insert(
+                    role.to_string(),
+                    crate::types::UpstreamOverride { url: url.clone(), bearer },
+                );
+            }
+        }
+    }
+    // Persist for next boot.
     if let Err(e) = state
         .db
         .save_config("settings", &serde_json::to_string(&settings).unwrap_or_default())
@@ -396,12 +460,14 @@ pub async fn update_settings(
             StatusCode::INTERNAL_SERVER_ERROR,
         );
     }
+    info!("SETTINGS updated via UI/API");
     json_response(serde_json::json!({"status": "ok"}), StatusCode::OK)
 }
 
 pub async fn list_providers(State(state): State<Arc<GatewayState>>) -> Response {
+    let rt = state.runtime.read().await;
     json_response(
-        serde_json::to_value(&state.config.providers).unwrap(),
+        serde_json::to_value(&rt.providers).unwrap_or(serde_json::Value::Array(vec![])),
         StatusCode::OK,
     )
 }
@@ -416,6 +482,11 @@ pub async fn add_provider(
             StatusCode::INTERNAL_SERVER_ERROR,
         );
     }
+    {
+        let mut rt = state.runtime.write().await;
+        rt.providers.retain(|p| p.id != provider.id);
+        rt.providers.push(provider.clone());
+    }
     json_response(
         serde_json::json!({"status": "created", "id": provider.id}),
         StatusCode::CREATED,
@@ -426,7 +497,7 @@ pub async fn get_provider(
     State(state): State<Arc<GatewayState>>,
     Path(id): Path<String>,
 ) -> Response {
-    match state.config.providers.iter().find(|p| p.id == id) {
+    match state.runtime.read().await.providers.iter().find(|p| p.id == id) {
         Some(p) => json_response(serde_json::to_value(p).unwrap(), StatusCode::OK),
         None => json_response(
             serde_json::json!({"error": "Provider not found"}),
@@ -436,9 +507,11 @@ pub async fn get_provider(
 }
 
 pub async fn delete_provider(
-    _state: State<Arc<GatewayState>>,
+    State(state): State<Arc<GatewayState>>,
     Path(id): Path<String>,
 ) -> Response {
+    state.db.delete_provider(&id);
+    state.runtime.write().await.providers.retain(|p| p.id != id);
     json_response(
         serde_json::json!({"status": "deleted", "id": id}),
         StatusCode::OK,

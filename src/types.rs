@@ -347,6 +347,31 @@ pub struct RoutingSettings {
     pub router_threshold: f64,
     pub confidence_threshold: f64,
     pub route_tools_to_large: bool,
+    /// Deterministic short-circuit applied before content detection.
+    #[serde(default)]
+    pub default_route: Option<String>,
+    /// How DOC/COMPRESSION markers are matched in system messages:
+    /// "substring" (legacy, compatible) or "prefix" (strict).
+    #[serde(default = "default_marker_mode")]
+    pub marker_mode: String,
+}
+
+fn default_marker_mode() -> String {
+    "substring".to_string()
+}
+
+/// Mutable-at-runtime subset of the configuration (settings page).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuntimeSettings {
+    pub router_threshold: f64,
+    pub confidence_threshold: f64,
+    pub route_tools_to_large: bool,
+    pub default_route: Option<String>,
+    pub marker_mode: String,
+    pub tts_url: String,
+    pub stt_url: String,
+    #[serde(default)]
+    pub providers: Vec<ProviderConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

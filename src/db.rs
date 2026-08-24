@@ -149,6 +149,11 @@ impl Db {
         Ok(())
     }
 
+    pub fn delete_provider(&self, id: &str) {
+        let conn = self.conn.lock().unwrap();
+        let _ = conn.execute("DELETE FROM providers WHERE id = ?1", params![id]);
+    }
+
     pub fn load_providers(&self) -> Result<Vec<ProviderConfig>, rusqlite::Error> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare("SELECT config FROM providers")?;

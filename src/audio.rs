@@ -16,7 +16,7 @@ pub async fn tts_handler(
 ) -> Response {
     let target_url = format!(
         "{}{}",
-        state.config.tts_url,
+        state.runtime.read().await.tts_url.clone(),
         req.uri().path().replacen("/v1/audio", "", 1)
     );
     info!("TTS proxy: {} -> {}", req.uri(), target_url);
@@ -29,7 +29,7 @@ pub async fn stt_handler(
 ) -> Response {
     let target_url = format!(
         "{}{}",
-        state.config.stt_url,
+        state.runtime.read().await.stt_url.clone(),
         req.uri().path().replacen("/v1/audio", "", 1)
     );
     info!("STT proxy: {} -> {}", req.uri(), target_url);

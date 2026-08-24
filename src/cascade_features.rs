@@ -25,7 +25,7 @@ use tracing::{error, warn};
 pub struct MetricsRegistry {
     pub requests_total: prometheus::CounterVec,
     pub fallback_triggered: prometheus::CounterVec,
-    origin_counts: std::collections::HashMap<String, u64>,
+    origin_counts: std::sync::Mutex<std::collections::HashMap<String, u64>>,
 }
 
 #[allow(dead_code)]
@@ -49,8 +49,8 @@ impl MetricsRegistry {
         )
         .unwrap();
 
-        let origin_counts: std::collections::HashMap<String, u64> =
-            std::collections::HashMap::new();
+        let origin_counts: std::sync::Mutex<std::collections::HashMap<String, u64>> =
+            std::sync::Mutex::new(std::collections::HashMap::new());
 
         // Pre-initialize label values so metrics appear in /metrics from startup
         // (prometheus prunes empty MetricFamilies during gather)
@@ -79,13 +79,13 @@ impl MetricsRegistry {
         self.fallback_triggered.with_label_values(&[reason]).inc();
     }
 
-    pub fn record_request_origin(&mut self, origin: &str) {
-        let entry = self.origin_counts.entry(origin.to_string()).or_insert(0);
-        *entry += 1;
+    pub fn record_request_origin(&self, origin: &str) {
+        let mut map = self.origin_counts.lock().unwrap();
+        *map.entry(origin.to_string()).or_insert(0) += 1;
     }
 
-    pub fn get_origin_counts(&self) -> &std::collections::HashMap<String, u64> {
-        &self.origin_counts
+    pub fn get_origin_counts(&self) -> std::collections::HashMap<String, u64> {
+        self.origin_counts.lock().unwrap().clone()
     }
 }
 

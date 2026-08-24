@@ -1,6 +1,26 @@
-use crate::types::{ChatMessage, ChatCompletionRequest, MessageContent, MessageContentPart};
+
+use once_cell::sync::Lazy;
 use lingua::{Language, LanguageDetectorBuilder};
+use tracing::debug;
 use tracing::info;
+use crate::types::{ChatCompletionRequest, ChatMessage, MessageContent, MessageContentPart};
+
+/// Built ONCE (building all-language detectors is expensive and was previously
+/// done multiple times per request). Restricted to the languages we actually
+/// inject prompts for.
+static DETECTOR: Lazy<lingua::LanguageDetector> = Lazy::new(|| {
+    LanguageDetectorBuilder::from_languages(&[
+        Language::English,
+        Language::German,
+        Language::French,
+        Language::Italian,
+        Language::Spanish,
+        Language::Polish,
+        Language::Hungarian,
+    ])
+    .with_minimum_relative_distance(0.3)
+    .build()
+});
 
 pub fn detect_language(messages: &[ChatMessage]) -> &'static str {
     let text = extract_text(messages);
@@ -14,16 +34,12 @@ pub fn detect_language(messages: &[ChatMessage]) -> &'static str {
     ];
     let lower = text.to_lowercase();
     if german_indicators.iter().any(|i| lower.contains(i)) {
-        info!("LANGUAGE_DETECTION: text={}, detected=German (heuristic)", text);
+        debug!("LANGUAGE_DETECTION: detected=German (heuristic)");
         return "de";
     }
 
-    let detector = LanguageDetectorBuilder::from_all_languages()
-        .with_minimum_relative_distance(0.3)
-        .build();
-
-    let result = detector.detect_language_of(&text);
-    info!("LANGUAGE_DETECTION: text={}, detected={:?}", text, result);
+    let result = DETECTOR.detect_language_of(&text);
+    debug!("LANGUAGE_DETECTION: detected={:?}", result);
     match result {
         Some(Language::German) => "de",
         Some(Language::French) => "fr",
@@ -38,7 +54,7 @@ pub fn detect_language(messages: &[ChatMessage]) -> &'static str {
 pub fn extract_text(messages: &[ChatMessage]) -> String {
     let mut text = String::new();
     for msg in messages {
-        info!("EXTRACT_TEXT: role={}, skipping={}", msg.role, msg.role == "system");
+        debug!("EXTRACT_TEXT: role={}", msg.role);
         if msg.role == "system" {
             continue;
         }

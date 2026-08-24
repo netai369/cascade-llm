@@ -92,12 +92,49 @@
           <input type="number" id="confidence-threshold" step="0.1" min="0" max="1">
         </div>
       </div>
+      <div class="field-row">
+        <div class="field">
+          <label>Route Tools to Large Model</label>
+          <select id="route-tools">
+            <option value="true">Yes</option>
+            <option value="false">No</option>
+          </select>
+        </div>
+        <div class="field">
+          <label>Default Route (deterministic override)</label>
+          <select id="default-route">
+            <option value="">Auto (content detection)</option>
+            <option value="inference">Inference (main chat)</option>
+            <option value="auxiliary">Auxiliary (compression/fast)</option>
+            <option value="ocr">OCR / Documents</option>
+          </select>
+        </div>
+      </div>
       <div class="field">
-        <label>Route Tools to Large Model</label>
-        <select id="route-tools">
-          <option value="true">Yes</option>
-          <option value="false">No</option>
+        <label>Marker Matching — how doc/compression triggers are detected</label>
+        <select id="marker-mode">
+          <option value="substring">Substring anywhere in system prompt (legacy, compatible)</option>
+          <option value="prefix">System prompt must START with marker (strict)</option>
         </select>
+        <p style="font-size:0.78rem;color:var(--text-faint);margin-top:0.4rem">
+          Substring mode routes any system prompt containing words like
+          “compression” or “parse this document” to the auxiliary/OCR backend.</p>
+      </div>
+    </div>
+
+    <div class="section">
+      <h2>Chat Upstream Overrides</h2>
+      <p style="font-size:0.82rem;color:var(--text-faint);margin-bottom:0.8rem">
+        Point the main/auxiliary chat route at any OpenAI-compatible endpoint
+        (e.g. a rented GPU node). Leave empty for local defaults. Bearer tokens
+        are set via API/provisioner and are never displayed.</p>
+      <div class="field">
+        <label>Inference URL (main chat)</label>
+        <input type="text" id="large-text-url" placeholder="(local inference-server)">
+      </div>
+      <div class="field">
+        <label>Auxiliary URL (compression / fast)</label>
+        <input type="text" id="small-mllm-url" placeholder="(local auxiliary-server)">
       </div>
     </div>
 
@@ -162,7 +199,7 @@
     </div>
   </main>
   <div class="toast" id="toast">Settings saved</div>
-  <footer>Cascade LLM Gateway v0.2.0 — NetAI Stack SE</footer>
+  <footer>Cascade LLM Gateway v0.6.0 — NetAI Stack SE</footer>
   <script>
     function showToast(msg) {
       const t = document.getElementById('toast');
@@ -177,14 +214,20 @@
         document.getElementById('router-threshold').value = s.routing?.router_threshold ?? 0.5;
         document.getElementById('confidence-threshold').value = s.routing?.confidence_threshold ?? 0.7;
         document.getElementById('route-tools').value = s.routing?.route_tools_to_large ? 'true' : 'false';
+        document.getElementById('default-route').value = s.routing?.default_route || '';
+        document.getElementById('marker-mode').value = s.routing?.marker_mode || 'substring';
+        document.getElementById('large-text-url').value = s.large_text_url ?? '';
+        document.getElementById('small-mllm-url').value = s.small_mllm_url ?? '';
         document.getElementById('tts-url').value = s.audio?.tts_url ?? '';
         document.getElementById('stt-url').value = s.audio?.stt_url ?? '';
       } catch(e) { console.error(e); }
     }
+    let currentProviders = [];
     async function loadProviders() {
       try {
         const r = await fetch('api/providers');
         const providers = await r.json();
+        currentProviders = providers;
         const el = document.getElementById('provider-list');
         if (providers.length === 0) {
           el.innerHTML = '<div style="color:var(--text-faint);font-size:0.85rem">No external providers configured.</div>';
@@ -206,13 +249,17 @@
         routing: {
           router_threshold: parseFloat(document.getElementById('router-threshold').value),
           confidence_threshold: parseFloat(document.getElementById('confidence-threshold').value),
-          route_tools_to_large: document.getElementById('route-tools').value === 'true'
+          route_tools_to_large: document.getElementById('route-tools').value === 'true',
+          default_route: document.getElementById('default-route').value || null,
+          marker_mode: document.getElementById('marker-mode').value || 'substring'
         },
         audio: {
           tts_url: document.getElementById('tts-url').value || null,
           stt_url: document.getElementById('stt-url').value || null
         },
-        providers: []
+        large_mllm_url: document.getElementById('large-text-url').value || null,
+        small_mllm_url: document.getElementById('small-mllm-url').value || null,
+        providers: currentProviders
       };
       try {
         await fetch('api/settings', { method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(settings) });

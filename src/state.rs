@@ -131,6 +131,17 @@ pub struct GatewayState {
     /// Runtime upstream overrides keyed by role (inference|auxiliary|ocr).
     pub upstream_overrides:
         Arc<tokio::sync::RwLock<std::collections::HashMap<String, crate::types::UpstreamOverride>>>,
+    /// Settings-page-controlled runtime values (persisted via Db).
+    pub runtime: Arc<tokio::sync::RwLock<crate::types::RuntimeSettings>>,
+}
+
+
+fn match_marker(content: &str, marker: &str, mode: &str) -> bool {
+    if mode == "prefix" {
+        content.trim_start().to_lowercase().starts_with(&marker.to_lowercase())
+    } else {
+        content.to_lowercase().contains(&marker.to_lowercase())
+    }
 }
 
 impl GatewayState {
@@ -163,6 +174,16 @@ impl GatewayState {
             upstream_overrides: Arc::new(tokio::sync::RwLock::new(
                 std::collections::HashMap::new(),
             )),
+            runtime: Arc::new(tokio::sync::RwLock::new(crate::types::RuntimeSettings {
+                router_threshold: config.router_threshold,
+                confidence_threshold: config.confidence_threshold,
+                route_tools_to_large: config.route_tools_to_large,
+                default_route: config.default_route.clone(),
+                marker_mode: config.marker_mode.clone(),
+                tts_url: config.tts_url.clone(),
+                stt_url: config.stt_url.clone(),
+                providers: Vec::new(),
+            })),
             config,
             http_client,
             metrics,
@@ -297,45 +318,33 @@ impl GatewayState {
         score
     }
 
-    fn pick_model(&self, has_image: bool, complexity: f64, tier: &str) -> (bool, &str) {
+    async fn pick_model(&self, has_image: bool, complexity: f64, tier: &str) -> (bool, String) {
+        let rt = self.runtime.read().await;
+        let router_threshold = rt.router_threshold;
+        let large_url = self.config.large_text_url.clone();
+        let small_url = self.config.small_mllm_url.clone();
+
         if tier == "premium" {
             info!("PREMIUM TIER: routing to large model");
-            return (false, &self.config.large_text_url);
+            return (false, large_url);
         }
 
         if has_image && !self.config.large_model_multimodal {
-            info!(
-                "MODEL SELECTION: image present but large model is text-only, routing to auxiliary multimodal model"
-            );
-            return (true, &self.config.small_mllm_url);
+            info!("MODEL SELECTION: image + text-only large -> auxiliary multimodal");
+            return (true, small_url);
         }
 
-        if has_image && self.config.large_model_multimodal {
-            if complexity > self.config.router_threshold {
-                info!(
-                    "MODEL SELECTION: image present, complexity {:.2} > threshold {}, routing to large multimodal model",
-                    complexity, self.config.router_threshold
-                );
-                (false, &self.config.large_text_url)
-            } else {
-                info!(
-                    "MODEL SELECTION: image present but complexity {:.2} <= threshold {}, routing to small multimodal model",
-                    complexity, self.config.router_threshold
-                );
-                (true, &self.config.small_mllm_url)
-            }
-        } else if complexity > self.config.router_threshold {
-            info!(
-                "MODEL SELECTION: text-only, complexity {:.2} > threshold {}, routing to large text model",
-                complexity, self.config.router_threshold
-            );
-            (false, &self.config.large_text_url)
+        let use_small = complexity <= router_threshold;
+        info!(
+            "MODEL SELECTION: complexity {:.2} vs threshold {:.2} -> {}",
+            complexity,
+            router_threshold,
+            if use_small { "small" } else { "large" }
+        );
+        if use_small {
+            (true, small_url)
         } else {
-            info!(
-                "MODEL SELECTION: text-only, complexity {:.2} <= threshold {}, routing to small model",
-                complexity, self.config.router_threshold
-            );
-            (true, &self.config.small_mllm_url)
+            (false, large_url)
         }
     }
 
@@ -425,7 +434,7 @@ impl GatewayState {
     /// chats are general vision and fall through to the multimodal inference
     /// model (Qwythos-9B w/ mmproj), which can describe photos — PaddleOCR-VL
     /// is a document/OCR model, not a chat VLM.
-    fn is_ocr_payload(&self, payload: &ChatCompletionRequest) -> bool {
+    fn is_ocr_payload(&self, payload: &ChatCompletionRequest, marker_mode: &str) -> bool {
         if self.has_file_attachment(payload) {
             // Uploaded documents (PDF/scans) and image attachments go to the OCR server.
             info!("ROUTE_OCR: file attachment detected in payload");
@@ -472,7 +481,7 @@ impl GatewayState {
             if m.role == "system" {
                 if let Some(MessageContent::Text(t)) = &m.content {
                     let low = t.to_lowercase();
-                    if DOC_MARKERS.iter().any(|k| low.contains(k)) {
+                    if DOC_MARKERS.iter().any(|k| match_marker(&low, k, marker_mode)) {
                         info!("ROUTE_OCR: document parsing marker in system message");
                         return true;
                     }
@@ -485,7 +494,7 @@ impl GatewayState {
     /// Condition B — agent context compression / summarization payloads.
     /// Only system-level messages carry Hermes compression hooks, so the detector
     /// is scoped to `role == "system"` to avoid hijacking ordinary user content.
-    fn is_agent_compression_payload(&self, payload: &ChatCompletionRequest) -> bool {
+    fn is_agent_compression_payload(&self, payload: &ChatCompletionRequest, marker_mode: &str) -> bool {
         const COMPRESS_MARKERS: &[&str] = &[
             "compression",
             "compress the following",
@@ -508,7 +517,7 @@ impl GatewayState {
             if m.role == "system" {
                 if let Some(MessageContent::Text(t)) = &m.content {
                     let low = t.to_lowercase();
-                    if COMPRESS_MARKERS.iter().any(|k| low.contains(k)) {
+                    if COMPRESS_MARKERS.iter().any(|k| match_marker(&low, k, marker_mode)) {
                         info!("ROUTE_AUXILIARY: compression marker in system message");
                         return true;
                     }
@@ -520,7 +529,20 @@ impl GatewayState {
 
     /// Returns the routing decision for a request based on headers, metadata
     /// and payload structure — the three-condition multi-endpoint dispatcher.
-    fn inspect_route(&self, payload: &ChatCompletionRequest, headers: &HeaderMap) -> RouteDecision {
+    async fn inspect_route(&self, payload: &ChatCompletionRequest, headers: &HeaderMap) -> RouteDecision {
+        // Settings-page deterministic short-circuit (default_route).
+        if let Some(dr) = self.runtime.read().await.default_route.clone() {
+            let d = match dr.to_lowercase().as_str() {
+                "inference" => Some(RouteDecision::Inference),
+                "auxiliary" => Some(RouteDecision::Auxiliary),
+                "ocr" => Some(RouteDecision::Ocr),
+                _ => None,
+            };
+            if let Some(d) = d {
+                info!("ROUTE_DEFAULT: settings pin {:?} (payload ignored)", d);
+                return d;
+            }
+        }
         // Explicit header hint wins for OCR / aux / auto.
         if let Some(hint) = self.header_route_hint(headers) {
             let decision = self.hint_to_decision(&hint);
@@ -559,12 +581,13 @@ impl GatewayState {
             }
         }
 
+        let marker_mode = self.runtime.read().await.marker_mode.clone();
         // Condition A: vision / OCR / document parsing.
-        if self.is_ocr_payload(payload) {
+        if self.is_ocr_payload(payload, &marker_mode) {
             return RouteDecision::Ocr;
         }
         // Condition B: agent context compression / sub-agent execution.
-        if self.is_agent_compression_payload(payload) {
+        if self.is_agent_compression_payload(payload, &marker_mode) {
             return RouteDecision::Auxiliary;
         }
         // Condition C: default — main inference / RAG / reasoning.
@@ -854,7 +877,15 @@ impl GatewayState {
         headers: &HeaderMap,
         origin: &str,
     ) -> Result<(HeaderMap, Body), ProxyError> {
-        let decision = self.inspect_route(&payload, headers);
+        let mut decision = self.inspect_route(&payload, headers).await;
+        // Settings: tools-bearing requests go to the large model (deterministic).
+        let has_tools = payload.tools.is_some() || payload.functions.is_some();
+        if has_tools && self.runtime.read().await.route_tools_to_large {
+            if decision == RouteDecision::Auxiliary {
+                info!("ROUTE_TOOLS_TO_LARGE: aux hint overridden -> Inference");
+                decision = RouteDecision::Inference;
+            }
+        }
         info!(
             "ROUTE_OUTCOME: decision={:?}, model={}, messages={}, tier={}, streaming={}",
             decision,
@@ -1128,7 +1159,7 @@ impl GatewayState {
             return result;
         }
 
-        let (use_small, target_url) = self.pick_model(has_image, complexity_score, tier);
+        let (use_small, target_url) = self.pick_model(has_image, complexity_score, tier).await;
         let target_url = target_url.to_owned();
         info!("AUTO SELECTED_URL: {}", target_url);
 
@@ -1211,12 +1242,12 @@ impl GatewayState {
 
         let confidence = self.extract_confidence(&body_bytes);
         let keep_small = match confidence {
-            Some(c) if c >= self.config.confidence_threshold => {
-                info!("SMALL MODEL CONFIDENCE: {:.4} >= threshold {:.4}, keeping", c, self.config.confidence_threshold);
+            Some(c) if c >= self.runtime.read().await.confidence_threshold => {
+                info!("SMALL MODEL CONFIDENCE: {:.4} >= threshold, keeping", c);
                 true
             }
             Some(c) => {
-                info!("SMALL MODEL CONFIDENCE: {:.4} < threshold {:.4}, rerouting to large", c, self.config.confidence_threshold);
+                info!("SMALL MODEL CONFIDENCE: {:.4} < threshold, rerouting to large", c);
                 false
             }
             None => {

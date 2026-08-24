@@ -29,6 +29,10 @@ pub struct AppConfig {
     pub extract_fallback_url: String,
     /// Shared secret guarding the upstream-override admin API (CASCADE_ADMIN_KEY).
     pub admin_key: Option<String>,
+    /// Deterministic routing mode: none|inference|auxiliary|ocr (CASCADE_DEFAULT_ROUTE).
+    pub default_route: Option<String>,
+    /// Marker matching mode for doc/compression detection: substring|prefix.
+    pub marker_mode: String,
 }
 
 impl AppConfig {
@@ -88,7 +92,8 @@ impl AppConfig {
             extract_fallback_url: std::env::var("EXTRACT_FALLBACK_URL")
                 .unwrap_or_else(|_| "http://auxiliary-server:8080".to_string()),
             admin_key: std::env::var("CASCADE_ADMIN_KEY").ok().filter(|s| !s.is_empty()),
-        }
+            default_route: std::env::var("CASCADE_DEFAULT_ROUTE").ok().filter(|s| !s.is_empty()),
+            marker_mode: std::env::var("MARKER_MODE").unwrap_or_else(|_| "substring".to_string()),        }
     }
 
     /// Builds the initial extraction backend entries from env vars.
@@ -142,6 +147,8 @@ impl AppConfig {
                 router_threshold: self.router_threshold,
                 confidence_threshold: self.confidence_threshold,
                 route_tools_to_large: self.route_tools_to_large,
+                default_route: self.default_route.clone(),
+                marker_mode: self.marker_mode.clone(),
             },
             audio: AudioSettings {
                 tts_url: Some(self.tts_url.clone()),
