@@ -1294,7 +1294,12 @@ impl GatewayState {
 
         info!("Rerouting original request to large text model");
         self.metrics.record_fallback("quality_low");
-        let result = self.proxy_to_backend(&injected_payload, &large_url, None, false, origin).await;
+        let mut result = self.proxy_to_backend(&injected_payload, &large_url, None, false, origin).await;
+        if let Ok(parts) = result.as_mut() {
+            if let Ok(v) = HeaderValue::from_str("auto-large") {
+                parts.0.insert("x-cascade-route", v);
+            }
+        }
         if result.is_ok() {
             self.circuit_breaker.record_success(&large_url).await;
             if let Some(ref key) = session_key {
