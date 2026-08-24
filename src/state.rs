@@ -1146,7 +1146,12 @@ impl GatewayState {
 
         if let Some(target) = target_override {
             info!("SESSION AFFINITY ROUTE: target={}", target);
-            let result = self.proxy_to_backend(&injected_payload, &target, None, is_streaming, origin).await;
+            let mut result = self.proxy_to_backend(&injected_payload, &target, None, is_streaming, origin).await;
+            if let Ok(parts) = result.as_mut() {
+                if let Ok(v) = HeaderValue::from_str("session-affinity") {
+                    parts.0.insert("x-cascade-route", v);
+                }
+            }
             match &result {
                 Ok(_) => {
                     self.circuit_breaker.record_success(&target).await;
@@ -1164,7 +1169,12 @@ impl GatewayState {
         info!("AUTO SELECTED_URL: {}", target_url);
 
         if !use_small {
-            let result = self.proxy_to_backend(&injected_payload, &target_url, None, is_streaming, origin).await;
+            let mut result = self.proxy_to_backend(&injected_payload, &target_url, None, is_streaming, origin).await;
+            if let Ok(parts) = result.as_mut() {
+                if let Ok(v) = HeaderValue::from_str(if use_small {"auto-small"} else {"auto-large"}) {
+                    parts.0.insert("x-cascade-route", v);
+                }
+            }
             match &result {
                 Ok(_) => {
                     self.circuit_breaker.record_success(&target_url).await;
@@ -1187,7 +1197,12 @@ impl GatewayState {
         }
 
         if is_streaming {
-            let result = self.proxy_to_backend(&small_payload, &target_url, None, true, origin).await;
+            let mut result = self.proxy_to_backend(&small_payload, &target_url, None, true, origin).await;
+            if let Ok(parts) = result.as_mut() {
+                if let Ok(v) = HeaderValue::from_str("auto-small") {
+                    parts.0.insert("x-cascade-route", v);
+                }
+            }
             match &result {
                 Ok(_) => {
                     self.circuit_breaker.record_success(&target_url).await;
@@ -1227,7 +1242,12 @@ impl GatewayState {
             info!("Small model returned HTTP {}, rerouting original request to large model", status);
             self.circuit_breaker.record_failure(&target_url).await;
             self.metrics.record_fallback("primary_failed");
-            let result = self.proxy_to_backend(&injected_payload, &large_url, None, false, origin).await;
+            let mut result = self.proxy_to_backend(&injected_payload, &large_url, None, false, origin).await;
+        if let Ok(parts) = result.as_mut() {
+            if let Ok(v) = HeaderValue::from_str("auto-large") {
+                parts.0.insert("x-cascade-route", v);
+            }
+        }
             if result.is_ok() {
                 self.circuit_breaker.record_success(&large_url).await;
                 if let Some(ref key) = session_key {

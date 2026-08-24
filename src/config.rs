@@ -82,9 +82,9 @@ impl AppConfig {
                 .unwrap_or_else(|_| "http://inference-server:18081/multimodal-capability".to_string()),
             providers: Vec::new(),
             tts_url: std::env::var("TTS_URL")
-                .unwrap_or_else(|_| "http://netai-tts:8800".to_string()),
+                .unwrap_or_else(|_| "http://netai-tts:8800/v1/audio".to_string()),
             stt_url: std::env::var("STT_URL")
-                .unwrap_or_else(|_| "http://netai-stt:5092".to_string()),
+                .unwrap_or_else(|_| "http://netai-stt:5092/v1/audio".to_string()),
 
             extract_cloud_url: std::env::var("EXTRACT_CLOUD_URL").ok().filter(|s| !s.is_empty()),
             extract_cloud_model: std::env::var("EXTRACT_CLOUD_MODEL").ok().filter(|s| !s.is_empty()),
