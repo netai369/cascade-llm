@@ -547,8 +547,10 @@ impl GatewayState {
         if let Some(hint) = self.header_route_hint(headers) {
             let decision = self.hint_to_decision(&hint);
             if decision == RouteDecision::Ocr {
-                info!("ROUTE_HEADER_HINT: '{hint}' -> OCR");
-                return decision;
+                // ROUTE A RETIRED (2026-08-25): docling does not speak OpenAI
+                // chat; documents are parsed upstream (LibreChat/knowledge-
+                // engine) and the multimodal auxiliary reads scans natively.
+                info!("ROUTE_HEADER_HINT: '{hint}' requested OCR — Route A retired, using content detection");
             }
             if decision == RouteDecision::Inference {
                 // Symmetric with the body hint: an explicit inference hint pins
@@ -582,10 +584,15 @@ impl GatewayState {
         }
 
         let marker_mode = self.runtime.read().await.marker_mode.clone();
-        // Condition A: vision / OCR / document parsing.
-        if self.is_ocr_payload(payload, &marker_mode) {
-            return RouteDecision::Ocr;
-        }
+        // CONDITION A RETIRED (2026-08-25): the OpenAI-chat OCR route never had a
+        // working backend after the docling migration (shape mismatch), nothing in
+        // the stack sends file parts/metadata through cascade, and the multimodal
+        // auxiliary (Gemma-4 mmproj) reads scanned documents natively.
+        // Re-enable when a dedicated chat-speaking VLM OCR endpoint returns.
+        // if self.is_ocr_payload(payload, &marker_mode) {
+        //     return RouteDecision::Ocr;
+        // }
+        let _ = marker_mode; // silence unused until Condition A returns
         // Condition B: agent context compression / sub-agent execution.
         if self.is_agent_compression_payload(payload, &marker_mode) {
             return RouteDecision::Auxiliary;
