@@ -411,7 +411,7 @@ pub async fn update_settings(
             .default_route
             .as_deref()
             .map(|s| s.to_lowercase())
-            .filter(|s| matches!(s.as_str(), "inference" | "auxiliary" | "ocr" | "auto" | ""));
+            .filter(|s| matches!(s.as_str(), "inference" | "auxiliary" | "auto" | ""));  // ocr retired
         if rt.default_route.as_deref() == Some("") {
             rt.default_route = None;
         }

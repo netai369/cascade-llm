@@ -535,7 +535,7 @@ impl GatewayState {
             let d = match dr.to_lowercase().as_str() {
                 "inference" => Some(RouteDecision::Inference),
                 "auxiliary" => Some(RouteDecision::Auxiliary),
-                "ocr" => Some(RouteDecision::Ocr),
+                // "ocr" => Some(RouteDecision::Ocr),  // Route A retired — falls through to None
                 _ => None,
             };
             if let Some(d) = d {
@@ -903,6 +903,7 @@ impl GatewayState {
         }
     }
 
+    #[allow(dead_code)]
     async fn private_proxy(
         &self,
         payload: &ChatCompletionRequest,
