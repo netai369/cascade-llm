@@ -58,6 +58,62 @@
       border: 1px solid var(--card-border); border-radius: 12px; padding: 1.2rem;
     }
     .provider-section h3 { font-size: 0.9rem; color: var(--text-muted); margin-bottom: 0.8rem; }
+    .node-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 0.8rem; }
+    .node-card {
+      background: var(--bg); border: 1px solid var(--card-border); border-radius: 10px;
+      padding: 0.9rem; font-size: 0.85rem; display: flex; flex-direction: column; gap: 0.45rem;
+    }
+    .node-card .node-head { display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; }
+    .role-badge {
+      display: inline-block; padding: 0.12rem 0.5rem; border-radius: 6px;
+      font-size: 0.7rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em;
+      background: var(--accent-soft-bg); color: var(--accent);
+    }
+    .cloud-badge {
+      display: inline-block; padding: 0.12rem 0.5rem; border-radius: 6px;
+      font-size: 0.7rem; font-weight: 600; background: var(--idle-bg); color: var(--idle);
+    }
+    .cost-badge {
+      display: inline-block; padding: 0.12rem 0.5rem; border-radius: 6px;
+      font-size: 0.7rem; font-weight: 600; background: rgba(236,72,153,0.12); color: #ec4899;
+    }
+    .health-dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; margin-right: 4px; }
+    .health-dot.up { background: var(--success); box-shadow: 0 0 6px var(--success); }
+    .health-dot.down { background: #ef4444; box-shadow: 0 0 6px #ef4444; }
+    .health-dot.unknown { background: var(--idle); }
+    .node-url { color: var(--text-faint); font-size: 0.75rem; word-break: break-all; font-family: ui-monospace, monospace; }
+    .node-stats { display: flex; gap: 0.8rem; flex-wrap: wrap; color: var(--text-muted); font-size: 0.78rem; }
+    .node-actions { display: flex; gap: 0.5rem; margin-top: 0.2rem; align-items: center; }
+    .switch { position: relative; width: 34px; height: 18px; flex-shrink: 0; }
+    .switch input { opacity: 0; width: 0; height: 0; }
+    .switch span {
+      position: absolute; inset: 0; border-radius: 9999px; cursor: pointer;
+      background: var(--idle-bg); transition: 0.15s;
+    }
+    .switch span::before {
+      content: ""; position: absolute; height: 13px; width: 13px; left: 3px; top: 2.5px;
+      border-radius: 50%; background: var(--idle); transition: 0.15s;
+    }
+    .switch input:checked + span { background: var(--success-bg); }
+    .switch input:checked + span::before { transform: translateX(15px); background: var(--success); }
+    .btn-sm {
+      font-size: 0.75rem; padding: 0.25rem 0.6rem; border-radius: 6px; cursor: pointer;
+      border: 1px solid var(--card-border); background: transparent; color: var(--text-muted);
+    }
+    .btn-sm:hover { border-color: var(--accent); color: var(--accent); }
+    .btn-sm.danger:hover { border-color: #ef4444; color: #ef4444; }
+    details.node-form { margin-top: 0.8rem; }
+    details.node-form summary { cursor: pointer; color: var(--accent); font-size: 0.82rem; }
+    .form-row { display: flex; gap: 0.5rem; flex-wrap: wrap; margin-top: 0.6rem; }
+    .form-row input, .form-row select {
+      background: var(--bg); color: var(--text); border: 1px solid var(--card-border);
+      border-radius: 6px; padding: 0.35rem 0.5rem; font-size: 0.8rem; flex: 1; min-width: 120px;
+    }
+    .key-row { display: flex; gap: 0.5rem; align-items: center; margin-bottom: 0.8rem; flex-wrap: wrap; }
+    .key-row input {
+      background: var(--bg); color: var(--text); border: 1px solid var(--card-border);
+      border-radius: 6px; padding: 0.35rem 0.5rem; font-size: 0.8rem; width: 220px;
+    }
     footer { text-align: center; padding: 1.5rem; color: var(--text-faint); font-size: 0.8rem; }
     @media (max-width: 640px) { header p { display: none; } }
     @media (max-width: 768px) { .charts { grid-template-columns: 1fr; } }
@@ -93,6 +149,35 @@
       </div>
     </div>
     <div class="provider-section">
+      <h3>Inference Nodes <span style="font-weight:400;font-size:0.75rem" id="node-strategy"></span></h3>
+      <div class="key-row">
+        <input type="password" id="admin-key" placeholder="Admin key (x-cascade-admin-key)" autocomplete="off">
+        <button class="btn-sm" onclick="saveKey()">Save</button>
+        <button class="btn-sm" onclick="probeNodes()">Probe now</button>
+        <span id="key-status" style="font-size:0.75rem;color:var(--text-faint)"></span>
+      </div>
+      <div class="node-grid" id="node-grid"></div>
+      <details class="node-form">
+        <summary>Register / update node</summary>
+        <div class="form-row">
+          <select id="nf-role"><option>main</option><option>auxiliary</option><option>ocr</option><option>image</option><option>rag_worker</option></select>
+          <input id="nf-url" placeholder="endpoint_url (e.g. http://10.0.0.45:8080/v1/chat/completions)">
+        </div>
+        <div class="form-row">
+          <input id="nf-bearer" placeholder="bearer_token (optional)">
+          <input id="nf-label" placeholder="label (optional)">
+          <input id="nf-provider" placeholder="provider, e.g. vast.ai (optional)">
+          <input id="nf-cost" type="number" step="0.001" placeholder="$ / h (optional)">
+        </div>
+        <div class="form-row">
+          <input id="nf-weight" type="number" min="1" max="64" value="1" placeholder="weight">
+          <input id="nf-ctx" type="number" placeholder="max_context_length (optional)">
+          <input id="nf-health" placeholder="health_url override (optional)">
+          <button class="btn-sm" onclick="submitNode()">PUT upstream</button>
+        </div>
+      </details>
+    </div>
+    <div class="provider-section">
       <h3>Configured Providers</h3>
       <table>
         <thead><tr><th>Name</th><th>Type</th><th>Models</th><th>Status</th></tr></thead>
@@ -107,7 +192,7 @@
       </table>
     </div>
   </main>
-  <footer>Cascade LLM Gateway v0.2.0 — NetAI Stack SE</footer>
+  <footer>Cascade LLM Gateway v0.6.0 — NetAI Stack SE</footer>
   <script>
     const backendData = {};
     let backendChart, distChart;
@@ -208,6 +293,123 @@
     initCharts();
     refresh();
     setInterval(refresh, 5000);
+
+    // =====================================================================
+    // Node control center (dynamic upstream registry)
+    // =====================================================================
+    function esc(s) {
+      return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+    }
+    function getKey() { return localStorage.getItem('cascade_admin_key') || ''; }
+    function saveKey() {
+      localStorage.setItem('cascade_admin_key', document.getElementById('admin-key').value);
+      refreshNodes();
+    }
+    function authHeaders() {
+      const k = getKey();
+      return k ? { 'x-cascade-admin-key': k } : {};
+    }
+    async function probeNodes() {
+      try {
+        await fetch('api/v1/admin/upstreams/probe', { method: 'POST', headers: authHeaders() });
+        refreshNodes();
+      } catch(e) { console.error('Probe failed:', e); }
+    }
+    async function toggleNode(id, active) {
+      await fetch(`api/v1/inference-nodes/${encodeURIComponent(id)}/${active ? 'activate' : 'deactivate'}`,
+        { method: 'POST', headers: authHeaders() });
+      refreshNodes();
+    }
+    async function deleteNode(role, id) {
+      if (!confirm(`Remove node ${id}?`)) return;
+      await fetch(`api/upstreams/${role}?id=${encodeURIComponent(id)}`, { method: 'DELETE', headers: authHeaders() });
+      refreshNodes();
+    }
+    async function submitNode() {
+      const role = document.getElementById('nf-role').value;
+      const payload = {
+        endpoint_url: document.getElementById('nf-url').value.trim(),
+        weight: parseInt(document.getElementById('nf-weight').value || '1', 10),
+      };
+      for (const [field, id] of [
+        ['bearer_token','nf-bearer'], ['label','nf-label'], ['provider','nf-provider'],
+        ['health_url','nf-health'],
+      ]) {
+        const v = document.getElementById(id).value.trim();
+        if (v) payload[field] = v;
+      }
+      const cost = parseFloat(document.getElementById('nf-cost').value || '0');
+      if (cost > 0) payload.cost_per_hour = cost;
+      const ctx = parseInt(document.getElementById('nf-ctx').value || '0', 10);
+      if (ctx > 0) payload.max_context_length = ctx;
+
+      try {
+        const r = await fetch(`api/upstreams/${role}`, {
+          method: 'PUT', headers: { 'Content-Type': 'application/json', ...authHeaders() },
+          body: JSON.stringify(payload),
+        });
+        if (!r.ok) { alert(`Register failed: HTTP ${r.status}`); return; }
+        ['nf-url','nf-bearer','nf-label','nf-provider','nf-cost','nf-ctx','nf-health'].forEach(id => document.getElementById(id).value = '');
+        refreshNodes();
+      } catch(e) { console.error(e); }
+    }
+
+    async function refreshNodes() {
+      document.getElementById('admin-key').value = getKey();
+      let d;
+      try {
+        const r = await fetch('api/v1/admin/upstreams', { headers: authHeaders() });
+        if (r.status === 403) {
+          document.getElementById('key-status').textContent = 'set admin key to manage nodes';
+          document.getElementById('node-grid').innerHTML =
+            '<div style="color:var(--text-faint);font-size:0.8rem">Admin key required — enter it above and press Save.</div>';
+          return;
+        }
+        d = await r.json();
+        document.getElementById('key-status').textContent = '';
+      } catch(e) { console.error('Nodes fetch error:', e); return; }
+
+      document.getElementById('node-strategy').textContent =
+        `strategy: ${String(d.strategy).replace('_','-')}`;
+      const grid = document.getElementById('node-grid');
+      const nodes = d.nodes || [];
+      if (nodes.length === 0) {
+        grid.innerHTML = '<div style="color:var(--text-faint);font-size:0.8rem">No dynamic nodes registered — static config URLs are in use. Register cloud GPUs or specialized workers below.</div>';
+        return;
+      }
+      grid.innerHTML = nodes.map(n => {
+        const healthCls = n.last_health_check ? (n.healthy ? 'up' : 'down') : 'unknown';
+        const healthTxt = n.last_health_check
+          ? (n.healthy ? `${n.last_latency_ms ?? '?'} ms` : `${n.consecutive_failures} fails`)
+          : 'no check yet';
+        const badges = [];
+        if (n.provider) badges.push(`<span class="cloud-badge">${esc(n.provider)}</span>`);
+        if (n.cost_per_hour != null) badges.push(`<span class="cost-badge">$${esc(n.cost_per_hour)}/h</span>`);
+        return `<div class="node-card">
+          <div class="node-head">
+            <span class="role-badge">${esc(n.role)}</span>
+            <span><span class="health-dot ${healthCls}"></span>${healthTxt}</span>
+            ${badges.join('')}
+          </div>
+          <div class="node-url">${esc(n.label || n.id)}</div>
+          <div class="node-url">${esc(n.endpoint_url)}</div>
+          <div class="node-stats">
+            <span>w:${esc(n.weight)}</span>
+            ${n.max_context_length ? `<span>ctx:${esc(n.max_context_length)}</span>` : ''}
+            ${n.latency_ema_ms != null ? `<span>ema:${esc(n.latency_ema_ms)}ms</span>` : ''}
+          </div>
+          <div class="node-actions">
+            <label class="switch" title="${n.active ? 'Active' : 'Inactive'} — click to toggle">
+              <input type="checkbox" ${n.active ? 'checked' : ''} onchange="toggleNode('${esc(n.id)}', this.checked)">
+              <span></span>
+            </label>
+            <button class="btn-sm danger" onclick="deleteNode('${esc(n.role)}','${esc(n.id)}')">Remove</button>
+          </div>
+        </div>`;
+      }).join('');
+    }
+    refreshNodes();
+    setInterval(refreshNodes, 10000);
   </script>
 </body>
 </html>

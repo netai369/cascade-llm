@@ -1,25 +1,10 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use axum::{
-    extract::DefaultBodyLimit,
-    routing::{delete, get, post, put},
-    Router,
-};
+use cascade_llm::{cascade_features, config, db, registry, router, state::{self, GatewayState}};
 use tokio::net::TcpListener;
 use tracing::{info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
-
-mod cascade_features;
-mod config;
-mod db;
-mod handlers;
-mod language;
-mod media;
-mod audio;
-mod providers;
-mod state;
-mod types;
 
 #[tokio::main]
 async fn main() {
@@ -81,7 +66,7 @@ async fn main() {
     // Restore saved settings BEFORE the state is built so thresholds/defaults
     // apply from the first request on.
     if let Ok(Some(raw)) = db.load_config("settings") {
-        match serde_json::from_str::<crate::types::Settings>(&raw) {
+        match serde_json::from_str::<cascade_llm::types::Settings>(&raw) {
             Ok(saved) => {
                 info!("Restoring persisted settings from {}", db_path);
                 app_config.router_threshold = saved.routing.router_threshold;
@@ -96,7 +81,19 @@ async fn main() {
         }
     }
 
-    let state = Arc::new(state::GatewayState::new(app_config, metrics, db.clone()));
+    let routing_strategy = app_config.routing_strategy;
+    let upstream_seeds = app_config.take_upstream_seeds();
+    let state = Arc::new(GatewayState::new(app_config, metrics, db.clone()));
+
+    state.registry.write().await.set_strategy(routing_strategy);
+    for seed in upstream_seeds {
+        match registry::canonical_role(&seed.role) {
+            Some(role) => {
+                state.registry.write().await.upsert(role, seed.node);
+            }
+            None => warn!("Config seed: unknown role '{}', skipping", seed.role),
+        }
+    }
 
     // Providers saved earlier re-enter the runtime registry here.
     match db.load_providers() {
@@ -107,93 +104,17 @@ async fn main() {
         _ => {}
     }
 
-    let _fallback_manager = Arc::new(cascade_features::FallbackManager::new(
-        state.config.small_mllm_url.clone(),
-        state.config.large_text_url.clone(),
-        state.http_client.clone(),
-    ));
+    // Background health prober: periodically probes all registered upstreams,
+    // demotes failing nodes and recovers healthy ones (zero-downtime swaps).
+    registry::spawn_health_prober(state.clone());
 
-    let app = Router::new()
-        .merge(cascade_features::build_router::<Arc<state::GatewayState>>())
-        .route("/v1/chat/completions", post(handlers::chat_completions))
-        .route("/v1/models", get(handlers::list_models))
-        .route("/models", get(handlers::list_models))
-        .route("/model", get(handlers::get_model))
-        .route("/health", get(handlers::health_check))
-        .route("/v1/audio/speech", post(handlers::tts))
-        .route("/v1/audio/transcriptions", post(handlers::stt))
-        .route(
-            "/v1/images/generations",
-            post(handlers::image_generation),
-        )
-        .route(
-            "/v1/video/generations",
-            post(handlers::video_generation),
-        )
-        .route("/web/models", get(handlers::list_models))
-        .route("/web/metrics", get(cascade_features::metrics_handler))
-        .route("/", get(handlers::dashboard))
-        .route("/web/", get(handlers::dashboard))
-        .route("/web/settings", get(handlers::settings_page))
-        .route("/web/api/dashboard", get(handlers::dashboard_api))
-        .route(
-            "/web/api/settings",
-            get(handlers::get_settings).put(handlers::update_settings),
-        )
-        .route(
-            "/web/api/providers",
-            get(handlers::list_providers).post(handlers::add_provider),
-        )
-.route(
-    "/web/api/providers/:id",
-    get(handlers::get_provider).delete(handlers::delete_provider),
-  )
-  .route("/api/dashboard", get(handlers::dashboard_api))
-  .route(
-    "/api/providers",
-    get(handlers::list_providers).post(handlers::add_provider),
-  )
-  .route(
-    "/api/providers/:id",
-    get(handlers::get_provider).delete(handlers::delete_provider),
-  )
-  .route(
-    "/extraction/v1/chat/completions",
-    post(handlers::extraction_completions),
-  )
-  .route(
-    "/extraction/v1/backends",
-    get(handlers::list_extraction_backends)
-      .post(handlers::register_extraction_backend_handler),
-  )
-  .route(
-    "/extraction/v1/backends/:id",
-    delete(handlers::remove_extraction_backend_handler),
-  )
-  .route(
-    "/web/api/upstreams",
-    get(handlers::list_upstreams),
-  )
-  .route(
-    "/web/api/upstreams/:role",
-    put(handlers::put_upstream).delete(handlers::delete_upstream),
-  )
-  .route(
-    "/api/upstreams",
-    get(handlers::list_upstreams),
-  )
-  .route(
-    "/api/upstreams/:role",
-    put(handlers::put_upstream).delete(handlers::delete_upstream),
-  )
-  .with_state(state)
-        .layer(DefaultBodyLimit::disable());
+    let app = router::build_router(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], 3000));
     info!("Cascade LLM Gateway listening on {}", addr);
     info!("Web UI: http://0.0.0.0:3000/web/");
     info!(
-        "Features: In-Flight Fallback, Streaming Quality Filter, Prometheus, Web Dashboard, Audio Proxy, Media Proxy"
+        "Features: Dynamic Upstream Registry, Health Prober, Multi-Modal Routing, RAG Workers, Prometheus, Web Dashboard"
     );
     let listener = TcpListener::bind(addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();

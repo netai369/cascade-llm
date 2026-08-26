@@ -128,9 +128,9 @@ pub struct GatewayState {
     pub start_time: Instant,
     /// Registry of extraction backends for `/v1/extraction`.
     pub extraction_backends: Arc<tokio::sync::RwLock<Vec<ExtractionBackendEntry>>>,
-    /// Runtime upstream overrides keyed by role (inference|auxiliary|ocr).
-    pub upstream_overrides:
-        Arc<tokio::sync::RwLock<std::collections::HashMap<String, crate::types::UpstreamOverride>>>,
+    /// Dynamic upstream registry (role -> weighted node pool), managed via the
+    /// admin API and probed by the background health checker.
+    pub registry: Arc<tokio::sync::RwLock<crate::registry::UpstreamRegistry>>,
     /// Settings-page-controlled runtime values (persisted via Db).
     pub runtime: Arc<tokio::sync::RwLock<crate::types::RuntimeSettings>>,
 }
@@ -171,8 +171,8 @@ impl GatewayState {
             extraction_backends: Arc::new(tokio::sync::RwLock::new(
                 config.build_extraction_backends(),
             )),
-            upstream_overrides: Arc::new(tokio::sync::RwLock::new(
-                std::collections::HashMap::new(),
+            registry: Arc::new(tokio::sync::RwLock::new(
+                crate::registry::UpstreamRegistry::default(),
             )),
             runtime: Arc::new(tokio::sync::RwLock::new(crate::types::RuntimeSettings {
                 router_threshold: config.router_threshold,
@@ -547,10 +547,14 @@ impl GatewayState {
         if let Some(hint) = self.header_route_hint(headers) {
             let decision = self.hint_to_decision(&hint);
             if decision == RouteDecision::Ocr {
-                // ROUTE A RETIRED (2026-08-25): docling does not speak OpenAI
-                // chat; documents are parsed upstream (LibreChat/knowledge-
-                // engine) and the multimodal auxiliary reads scans natively.
-                info!("ROUTE_HEADER_HINT: '{hint}' requested OCR — Route A retired, using content detection");
+                // Dynamic OCR route: honoured whenever an active `ocr` node is
+                // registered; otherwise content detection decides (the static
+                // default OCR URL is only used by explicit document payloads).
+                if self.has_active_role("ocr").await {
+                    info!("ROUTE_HEADER_HINT: '{hint}' -> Ocr (active ocr node)");
+                    return decision;
+                }
+                info!("ROUTE_HEADER_HINT: '{hint}' requested OCR — no active ocr node, using content detection");
             }
             if decision == RouteDecision::Inference {
                 // Symmetric with the body hint: an explicit inference hint pins
@@ -584,18 +588,16 @@ impl GatewayState {
         }
 
         let marker_mode = self.runtime.read().await.marker_mode.clone();
-        // CONDITION A RETIRED (2026-08-25): the OpenAI-chat OCR route never had a
-        // working backend after the docling migration (shape mismatch), nothing in
-        // the stack sends file parts/metadata through cascade, and the multimodal
-        // auxiliary (Gemma-4 mmproj) reads scanned documents natively.
-        // Re-enable when a dedicated chat-speaking VLM OCR endpoint returns.
-        // if self.is_ocr_payload(payload, &marker_mode) {
-        //     return RouteDecision::Ocr;
-        // }
-        let _ = marker_mode; // silence unused until Condition A returns
         // Condition B: agent context compression / sub-agent execution.
         if self.is_agent_compression_payload(payload, &marker_mode) {
             return RouteDecision::Auxiliary;
+        }
+        // CONDITION A (dynamic): document/OCR payloads go to the dedicated OCR
+        // node — but only when one is actually registered and healthy. Without
+        // a registry node the multimodal main/auxiliary backends handle scans
+        // natively (Route A stays retired by default).
+        if self.has_active_role("ocr").await && self.is_ocr_payload(payload, &marker_mode) {
+            return RouteDecision::Ocr;
         }
         // Condition C: default — main inference / RAG / reasoning.
         RouteDecision::Inference
@@ -919,10 +921,11 @@ impl GatewayState {
         is_streaming: bool,
         origin: &str,
     ) -> Result<(HeaderMap, Body), ProxyError> {
-        self.private_proxy_with_bearer(payload, url, None, backend, is_streaming, origin)
+        self.private_proxy_with_bearer(payload, url, None, backend, is_streaming, origin, None)
             .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn private_proxy_with_bearer(
         &self,
         payload: &ChatCompletionRequest,
@@ -931,6 +934,7 @@ impl GatewayState {
         backend: RouteBackend,
         is_streaming: bool,
         origin: &str,
+        node_id: Option<&str>,
     ) -> Result<(HeaderMap, Body), ProxyError> {
         let backend_name = match backend {
             RouteBackend::OcrServer => "ocr-server",
@@ -953,10 +957,17 @@ impl GatewayState {
             ));
         }
 
+        let start = Instant::now();
         match self.proxy_to_backend(payload, url, bearer, is_streaming, origin).await {
             Ok(mut parts) => {
                 if let Ok(v) = HeaderValue::from_str(backend_name) {
                     parts.0.insert("x-cascade-route", v);
+                }
+                if let Some(id) = node_id {
+                    if let Ok(v) = HeaderValue::from_str(id) {
+                        parts.0.insert("x-cascade-node", v);
+                    }
+                    self.registry.write().await.record_request_latency(id, start.elapsed().as_millis() as u64);
                 }
                 self.circuit_breaker.record_success(url).await;
                 self.metrics.record_request(metric_name);
@@ -983,17 +994,28 @@ impl GatewayState {
         }
     }
 
-    /// Resolve the effective upstream for a role: runtime override if present,
-    /// otherwise the static config URL. Returns (url, bearer).
-    async fn resolve_upstream(&self, role: &str, default_url: &str) -> (String, Option<String>) {
-        let map = self.upstream_overrides.read().await;
-        match map.get(role) {
-            Some(o) => {
-                info!("UPSTREAM_OVERRIDE: {} -> {}", role, o.url);
-                (o.url.clone(), o.bearer.clone())
-            }
-            None => (default_url.to_string(), None),
+    /// Resolve the effective upstream for a role. The dynamic registry wins
+    /// (weighted round-robin over active + healthy nodes); the static config
+    /// URL is the fallback when no node is registered.
+    /// Returns (url, bearer, node_id).
+    async fn resolve_upstream(&self, role: &str, default_url: &str) -> (String, Option<String>, Option<String>) {
+        let mut registry = self.registry.write().await;
+        if let Some(node) = registry.pick(role) {
+            info!("UPSTREAM_NODE: {} -> {} ({})", role, node.endpoint_url, node.id);
+            return (node.endpoint_url.clone(), node.bearer_token.clone(), Some(node.id));
         }
+        (default_url.to_string(), None, None)
+    }
+
+    /// Picks a node from the registry without falling back to static config.
+    /// Used by media/RAG handlers that need to know whether a node exists.
+    pub async fn pick_node(&self, role: &str) -> Option<crate::registry::UpstreamNode> {
+        self.registry.write().await.pick(role)
+    }
+
+    /// True when at least one active + healthy node is registered for the role.
+    pub async fn has_active_role(&self, role: &str) -> bool {
+        self.registry.read().await.has_active(role)
     }
 
     /// Condition A — dedicated vision / document parsing (OCR) endpoint.
@@ -1005,14 +1027,14 @@ impl GatewayState {
     ) -> Result<(HeaderMap, Body), ProxyError> {
         let mut payload = payload.clone();
         self.inline_all_images(&mut payload).await;
-        let (url, bearer) = self.resolve_upstream("ocr", &self.config.ocr_server_url).await;
+        let (url, bearer, node) = self.resolve_upstream("ocr", &self.config.ocr_server_url).await;
         info!(
             "ROUTE_A: OCR -> {} ({} messages)",
             url,
             payload.messages.len()
         );
         let _ = self.extract_image_urls(&payload.messages);
-        self.private_proxy_with_bearer(&payload, &url, bearer.as_deref(), RouteBackend::OcrServer, is_streaming, origin).await
+        self.private_proxy_with_bearer(&payload, &url, bearer.as_deref(), RouteBackend::OcrServer, is_streaming, origin, node.as_deref()).await
     }
 
     /// Condition B — agent context compression / fast text (auxiliary) endpoint.
@@ -1025,13 +1047,13 @@ impl GatewayState {
         let mut payload = payload.clone();
         // If a remote image slipped in, inline it before forwarding.
         self.inline_all_images(&mut payload).await;
-        let (url, bearer) = self.resolve_upstream("auxiliary", &self.config.small_mllm_url).await;
+        let (url, bearer, node) = self.resolve_upstream("auxiliary", &self.config.small_mllm_url).await;
         info!(
             "ROUTE_B: Auxiliary(compression) -> {} ({} messages)",
             url,
             payload.messages.len()
         );
-        self.private_proxy_with_bearer(&payload, &url, bearer.as_deref(), RouteBackend::AuxiliaryServer, is_streaming, origin).await
+        self.private_proxy_with_bearer(&payload, &url, bearer.as_deref(), RouteBackend::AuxiliaryServer, is_streaming, origin, node.as_deref()).await
     }
 
     /// Condition C — default chat & reasoning (main inference) endpoint.
@@ -1053,14 +1075,14 @@ impl GatewayState {
         self.inline_all_images(&mut payload).await;
         let lang = language::detect_language(&payload.messages);
         payload = language::inject_language_prompt(lang, payload);
-        let (url, bearer) = self.resolve_upstream("inference", &self.config.large_text_url).await;
+        let (url, bearer, node) = self.resolve_upstream("main", &self.config.large_text_url).await;
         info!(
             "ROUTE_C: Inference(default) -> {} ({} messages, lang={})",
             url,
             payload.messages.len(),
             lang
         );
-        self.private_proxy_with_bearer(&payload, &url, bearer.as_deref(), RouteBackend::InferenceServer, is_streaming, origin).await
+        self.private_proxy_with_bearer(&payload, &url, bearer.as_deref(), RouteBackend::InferenceServer, is_streaming, origin, node.as_deref()).await
     }
 
     // --------------------------------------------------------------------------
@@ -1485,5 +1507,93 @@ impl GatewayState {
             })?;
 
         Ok((headers, Body::from(body_bytes)))
+    }
+
+    // =========================================================================
+    // RAG WORKER ROUTING  (POST /v1/rag/extract)
+    // =========================================================================
+
+    /// Forwards a LightRAG graph-extraction job to an active `rag_worker`
+    /// node. The body is passed through untouched (extraction payloads are
+    /// worker-specific); responses are streamed back. Returns `None`-style
+    /// 503 upstream when no node is registered so callers/UI can react.
+    pub async fn route_rag_extract(
+        &self,
+        content_type: Option<&str>,
+        body: axum::body::Bytes,
+    ) -> Result<(HeaderMap, Body, String), ProxyError> {
+        let node = self.pick_node("rag_worker").await.ok_or_else(|| {
+            ProxyError::unreachable(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "rag_worker",
+                "no active rag_worker node registered (provision one via PUT /web/api/upstreams/rag_worker)",
+            )
+        })?;
+
+        if self.circuit_breaker.is_open(&node.endpoint_url).await {
+            self.metrics.record_fallback("backend_unavailable");
+            return Err(ProxyError::unreachable(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "rag_worker",
+                format!("rag_worker '{}' circuit breaker open", node.id),
+            ));
+        }
+
+        let mut request = self.http_client.post(&node.endpoint_url).body(body);
+        if let Some(token) = &node.bearer_token {
+            request = request.bearer_auth(token);
+        }
+        let ct = content_type.unwrap_or("application/json");
+        request = request.header("content-type", ct);
+
+        let backend_response = match request.send().await {
+            Ok(resp) => resp,
+            Err(e) => {
+                self.circuit_breaker
+                    .record_failure(&node.endpoint_url)
+                    .await;
+                return Err(ProxyError::unreachable(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "rag_worker",
+                    format!("rag_worker unreachable: {}", e),
+                ));
+            }
+        };
+
+        let status = backend_response.status();
+        if !status.is_success() {
+            self.circuit_breaker.record_failure(&node.endpoint_url).await;
+            let err_body = backend_response.text().await.unwrap_or_default();
+            return Err(ProxyError::new(
+                StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY).as_u16(),
+                "rag_worker",
+                format!("rag_worker returned HTTP {}: {}", status, err_body.chars().take(300).collect::<String>()),
+            ));
+        }
+
+        self.circuit_breaker.record_success(&node.endpoint_url).await;
+        self.metrics.record_request("rag_worker");
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "content-type",
+            HeaderValue::from_str(
+                backend_response
+                    .headers()
+                    .get("content-type")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("application/json"),
+            )
+            .unwrap_or(HeaderValue::from_static("application/json")),
+        );
+        if let Ok(v) = HeaderValue::from_str(&node.id) {
+            headers.insert("x-cascade-node", v);
+        }
+        headers.insert("x-cascade-route", HeaderValue::from_static("rag-worker"));
+
+        let stream = backend_response
+            .bytes_stream()
+            .map(|item| item.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)));
+        Ok((headers, Body::from_stream(stream), node.id))
     }
 }

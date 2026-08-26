@@ -9,11 +9,7 @@ use axum::{
     routing::get,
     Router,
 };
-use prometheus::{
-    opts,
-    register_counter_vec,
-    Encoder, TextEncoder,
-};
+use prometheus::{opts, Encoder, TextEncoder};
 use tracing::{error, warn};
 
 // ============================================================================
@@ -31,23 +27,36 @@ pub struct MetricsRegistry {
 #[allow(dead_code)]
 impl MetricsRegistry {
     pub fn init() -> Self {
-        let requests_total = register_counter_vec!(
-            opts!(
-                "cascade_requests_total",
-                "Total number of requests routed to each backend"
-            ),
-            &["selected_backend"]
-        )
-        .unwrap();
+        // Prometheus registers collectors in a process-global registry; use
+        // statics so repeated init calls (tests, hot reloads) are idempotent.
+        static REQUESTS: std::sync::OnceLock<prometheus::CounterVec> = std::sync::OnceLock::new();
+        static FALLBACKS: std::sync::OnceLock<prometheus::CounterVec> = std::sync::OnceLock::new();
 
-        let fallback_triggered = register_counter_vec!(
-            opts!(
-                "cascade_fallback_triggered_total",
-                "Total number of fallback activations"
-            ),
-            &["reason"]
-        )
-        .unwrap();
+        let requests_total = REQUESTS.get_or_init(|| {
+            let counter = prometheus::CounterVec::new(
+                opts!(
+                    "cascade_requests_total",
+                    "Total number of requests routed to each backend"
+                ),
+                &["selected_backend"],
+            )
+            .unwrap();
+            let _ = prometheus::register(Box::new(counter.clone()));
+            counter
+        }).clone();
+
+        let fallback_triggered = FALLBACKS.get_or_init(|| {
+            let counter = prometheus::CounterVec::new(
+                opts!(
+                    "cascade_fallback_triggered_total",
+                    "Total number of fallback activations"
+                ),
+                &["reason"],
+            )
+            .unwrap();
+            let _ = prometheus::register(Box::new(counter.clone()));
+            counter
+        }).clone();
 
         let origin_counts: std::sync::Mutex<std::collections::HashMap<String, u64>> =
             std::sync::Mutex::new(std::collections::HashMap::new());
@@ -56,7 +65,7 @@ impl MetricsRegistry {
         // (prometheus prunes empty MetricFamilies during gather)
         for backend in &[
             "small", "large", "large_multimodal", "large_text", "fallback",
-            "ocr", "auxiliary", "inference", "extraction",
+            "ocr", "auxiliary", "inference", "main", "image", "rag_worker", "extraction",
         ] {
             requests_total.with_label_values(&[backend]);
         }

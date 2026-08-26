@@ -14,8 +14,15 @@ pub async fn image_generation_handler(
     State(state): State<Arc<GatewayState>>,
     req: Request<Body>,
 ) -> Response {
-    let target_url = std::env::var("IMAGE_GENERATION_URL")
-        .unwrap_or_else(|_| "http://localhost:8080/v1/images/generations".to_string());
+    // Dynamic routing: an active `image` registry node wins; the static
+    // IMAGE_GENERATION_URL is the fallback for deployments without one.
+    let target_url = match state.pick_node("image").await {
+        Some(node) => {
+            info!("Image generation via node '{}' -> {}", node.id, node.endpoint_url);
+            node.endpoint_url
+        }
+        None => state.config.image_generation_url.clone(),
+    };
     info!("Image generation proxy: {} -> {}", req.uri(), target_url);
     proxy_request(state, req, &target_url).await
 }
@@ -24,8 +31,10 @@ pub async fn video_generation_handler(
     State(state): State<Arc<GatewayState>>,
     req: Request<Body>,
 ) -> Response {
-    let target_url = std::env::var("VIDEO_GENERATION_URL")
-        .unwrap_or_else(|_| "http://localhost:8080/v1/video/generations".to_string());
+    let target_url = match state.pick_node("image").await {
+        Some(node) if node.endpoint_url.contains("/v1/video") => node.endpoint_url,
+        _ => state.config.video_generation_url.clone(),
+    };
     info!("Video generation proxy: {} -> {}", req.uri(), target_url);
     proxy_request(state, req, &target_url).await
 }

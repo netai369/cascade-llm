@@ -6,15 +6,7 @@ use serde_json::Value;
 // ============================================================================
 
 /// Type of extraction backend for `/v1/extraction` routing.
-/// Runtime-overridable upstream for a chat role ("inference" | "auxiliary" | "ocr").
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UpstreamOverride {
-    pub url: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub bearer: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum ExtractionBackendType {
     /// Cloud GPU instance (Vast.ai, RunPod, etc.)

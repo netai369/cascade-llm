@@ -1,3 +1,4 @@
+use crate::registry::RegisterUpstreamRequest;
 use crate::state::GatewayState;
 use crate::types::*;
 use axum::{
@@ -429,24 +430,20 @@ pub async fn update_settings(
             rt.providers = settings.providers.clone();
         }
     }
-    // …chat URLs additionally flow into the upstream-override machinery so the
-    // routing layer actually uses them.
-    for (role, url_opt) in [
-        ("auxiliary", &settings.small_mllm_url),
-        ("inference", &settings.large_text_url),
+    // …chat URLs additionally flow into the dynamic registry as manual nodes
+    // so the routing layer actually uses them.
+    for (role, url_opt, default) in [
+        ("auxiliary", &settings.small_mllm_url, &state.config.small_mllm_url),
+        ("main", &settings.large_text_url, &state.config.large_text_url),
     ] {
         if let Some(url) = url_opt {
-            let default = match role {
-                "auxiliary" => &state.config.small_mllm_url,
-                _ => &state.config.large_text_url,
-            };
             if url != default && url.starts_with("http") {
-                let mut map = state.upstream_overrides.write().await;
-                let bearer = map.get(role).and_then(|o| o.bearer.clone());
-                map.insert(
-                    role.to_string(),
-                    crate::types::UpstreamOverride { url: url.clone(), bearer },
-                );
+                let req = RegisterUpstreamRequest {
+                    endpoint_url: Some(url.clone()),
+                    id: Some(format!("manual-{}", role)),
+                    ..Default::default()
+                };
+                state.registry.write().await.upsert(role, req);
             }
         }
     }
@@ -601,7 +598,7 @@ pub async fn list_extraction_backends(
 }
 
 // ---------------------------------------------------------------------------
-// Runtime upstream overrides (admin; guarded by CASCADE_ADMIN_KEY)
+// Dynamic upstream registry API (admin; guarded by CASCADE_ADMIN_KEY)
 // ---------------------------------------------------------------------------
 
 fn admin_authorized(state: &GatewayState, headers: &axum::http::HeaderMap) -> bool {
@@ -622,6 +619,16 @@ fn mask_bearer(b: &Option<String>) -> Option<String> {
     })
 }
 
+/// Public JSON view of a node — never leaks the bearer token.
+fn node_view(node: &crate::registry::UpstreamNode) -> serde_json::Value {
+    let mut v = serde_json::to_value(node).unwrap_or(serde_json::Value::Null);
+    if let Some(obj) = v.as_object_mut() {
+        obj.insert("bearer_set".into(), serde_json::json!(node.bearer_token.is_some()));
+        obj.insert("bearer_masked".into(), serde_json::json!(mask_bearer(&node.bearer_token)));
+    }
+    v
+}
+
 pub async fn list_upstreams(
     State(state): State<Arc<GatewayState>>,
     headers: axum::http::HeaderMap,
@@ -629,24 +636,30 @@ pub async fn list_upstreams(
     if !admin_authorized(&state, &headers) {
         return json_response(serde_json::json!({"error": "forbidden"}), StatusCode::FORBIDDEN);
     }
-    let map = state.upstream_overrides.read().await;
-    let roles: serde_json::Map<String, serde_json::Value> = map
+    let registry = state.registry.read().await;
+    // Backward-compatible flat view (first node per role) alongside the pool.
+    let overrides: serde_json::Map<String, serde_json::Value> = crate::registry::ROLES
         .iter()
-        .map(|(role, o)| {
-            (role.clone(), serde_json::json!({
-                "url": o.url,
-                "bearer_set": o.bearer.is_some(),
-                "bearer_masked": mask_bearer(&o.bearer),
-            }))
+        .filter_map(|role| {
+            registry
+                .nodes()
+                .into_iter()
+                .find(|n| n.role == *role)
+                .map(|n| (role.to_string(), serde_json::json!({"url": n.endpoint_url})))
         })
         .collect();
     json_response(
         serde_json::json!({
-            "overrides": roles,
+            "roles": crate::registry::ROLES,
+            "overrides": overrides,
+            "nodes": registry.nodes().iter().map(|n| node_view(n)).collect::<Vec<_>>(),
+            "strategy": registry.strategy(),
             "defaults": {
-                "inference": state.config.large_text_url,
+                "main": state.config.large_text_url,
                 "auxiliary": state.config.small_mllm_url,
                 "ocr": state.config.ocr_server_url,
+                "image": state.config.image_generation_url,
+                "rag_worker": null,
             }
         }),
         StatusCode::OK,
@@ -662,57 +675,235 @@ pub async fn put_upstream(
     if !admin_authorized(&state, &headers) {
         return json_response(serde_json::json!({"error": "forbidden"}), StatusCode::FORBIDDEN);
     }
-    let role = role.to_lowercase();
-    if !matches!(role.as_str(), "inference" | "auxiliary" | "ocr") {
-        return json_response(
-            serde_json::json!({"error": "role must be inference|auxiliary|ocr"}),
-            StatusCode::BAD_REQUEST,
-        );
-    }
-    let url = match body.get("url").and_then(|u| u.as_str()) {
-        Some(u) if u.starts_with("http://") || u.starts_with("https://") => u.to_string(),
-        _ => {
+    let role = match crate::registry::canonical_role(&role) {
+        Some(r) => r.to_string(),
+        None => {
             return json_response(
-                serde_json::json!({"error": "url must be http(s)"}),
+                serde_json::json!({"error": format!("role must be one of {}", crate::registry::ROLES.join("|"))}),
                 StatusCode::BAD_REQUEST,
             )
         }
     };
-    let bearer = body
-        .get("bearer")
-        .and_then(|b| b.as_str())
-        .filter(|s| !s.is_empty())
-        .map(String::from);
-    let mut map = state.upstream_overrides.write().await;
-    match bearer {
-        None => {
-            // keep existing token when omitted, so callers can update URL only
-            if let Some(existing) = map.get(&role) {
-                let bearer = existing.bearer.clone();
-                map.insert(role.clone(), crate::types::UpstreamOverride { url, bearer });
-            } else {
-                map.insert(role.clone(), crate::types::UpstreamOverride { url, bearer: None });
-            }
+    let req: RegisterUpstreamRequest = match serde_json::from_value(body) {
+        Ok(r) => r,
+        Err(e) => {
+            return json_response(
+                serde_json::json!({"error": format!("invalid payload: {}", e)}),
+                StatusCode::BAD_REQUEST,
+            )
         }
-        Some(bearer) => {
-            map.insert(role.clone(), crate::types::UpstreamOverride { url, bearer: Some(bearer) });
+    };
+    let url = match req.endpoint_url.as_deref() {
+        Some(u) if u.starts_with("http://") || u.starts_with("https://") => u.to_string(),
+        _ => {
+            return json_response(
+                serde_json::json!({"error": "endpoint_url must be http(s)"}),
+                StatusCode::BAD_REQUEST,
+            )
         }
-    }
-    info!("UPSTREAM_OVERRIDE_SET: role={}", role);
-    json_response(serde_json::json!({"status": "ok", "role": role}), StatusCode::OK)
+    };
+    let req = RegisterUpstreamRequest { endpoint_url: Some(url), ..req };
+
+    let result = state.registry.write().await.upsert(&role, req);
+    info!("UPSTREAM_PUT: role={} id={} created={}", role, result.node.id, result.created);
+    json_response(
+        serde_json::json!({
+            "status": "ok",
+            "role": role,
+            "created": result.created,
+            "node": node_view(&result.node),
+        }),
+        if result.created { StatusCode::CREATED } else { StatusCode::OK },
+    )
 }
 
 pub async fn delete_upstream(
     State(state): State<Arc<GatewayState>>,
     Path(role): Path<String>,
     headers: axum::http::HeaderMap,
+    axum::extract::Query(query): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Response {
     if !admin_authorized(&state, &headers) {
         return json_response(serde_json::json!({"error": "forbidden"}), StatusCode::FORBIDDEN);
     }
-    let removed = state.upstream_overrides.write().await.remove(&role.to_lowercase());
-    info!("UPSTREAM_OVERRIDE_CLEARED: role={}, existed={}", role, removed.is_some());
-    json_response(serde_json::json!({"status": "cleared"}), StatusCode::OK)
+    let role = match crate::registry::canonical_role(&role) {
+        Some(r) => r.to_string(),
+        None => {
+            return json_response(
+                serde_json::json!({"error": format!("role must be one of {}", crate::registry::ROLES.join("|"))}),
+                StatusCode::BAD_REQUEST,
+            )
+        }
+    };
+    // `?id=` targets a single node; without it the whole role pool is cleared.
+    if let Some(id) = query.get("id") {
+        let removed = state.registry.write().await.remove_id(id);
+        return match removed {
+            Some(n) if n.role == role => json_response(
+                serde_json::json!({"status": "cleared", "id": id}),
+                StatusCode::OK,
+            ),
+            _ => json_response(
+                serde_json::json!({"error": "node not found for this role"}),
+                StatusCode::NOT_FOUND,
+            ),
+        };
+    }
+    let removed = state.registry.write().await.remove_role(&role);
+    info!("UPSTREAM_DELETE: role={} removed={}", role, removed);
+    json_response(
+        serde_json::json!({"status": "cleared", "removed": removed}),
+        StatusCode::OK,
+    )
+}
+
+async fn set_node_active(
+    State(state): State<Arc<GatewayState>>,
+    Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
+    active: bool,
+) -> Response {
+    if !admin_authorized(&state, &headers) {
+        return json_response(serde_json::json!({"error": "forbidden"}), StatusCode::FORBIDDEN);
+    }
+    let found = state.registry.read().await.get(&id).is_some();
+    if !found {
+        return json_response(
+            serde_json::json!({"error": format!("node '{}' not found", id)}),
+            StatusCode::NOT_FOUND,
+        );
+    }
+    state.registry.write().await.set_active(&id, active);
+    info!("NODE_TOGGLE: id={} active={}", id, active);
+    json_response(
+        serde_json::json!({"status": "ok", "id": id, "active": active}),
+        StatusCode::OK,
+    )
+}
+
+pub async fn activate_node(
+    state: State<Arc<GatewayState>>,
+    path: Path<String>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    set_node_active(state, path, headers, true).await
+}
+
+pub async fn deactivate_node(
+    state: State<Arc<GatewayState>>,
+    path: Path<String>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    set_node_active(state, path, headers, false).await
+}
+
+/// Pool status for admins/UI: nodes incl. health, latency stats and cloud
+/// cost badges, plus effective strategy and static defaults.
+pub async fn admin_upstreams(
+    State(state): State<Arc<GatewayState>>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    if !admin_authorized(&state, &headers) {
+        return json_response(serde_json::json!({"error": "forbidden"}), StatusCode::FORBIDDEN);
+    }
+    let registry = state.registry.read().await;
+    let mut active_roles = serde_json::Map::new();
+    for role in crate::registry::ROLES {
+        active_roles.insert(
+            role.to_string(),
+            serde_json::json!(registry.has_active(role)),
+        );
+    }
+    json_response(
+        serde_json::json!({
+            "roles": crate::registry::ROLES,
+            "active_roles": active_roles,
+            "strategy": registry.strategy(),
+            "nodes": registry.nodes().iter().map(|n| node_view(n)).collect::<Vec<_>>(),
+            "defaults": {
+                "main": state.config.large_text_url,
+                "auxiliary": state.config.small_mllm_url,
+                "ocr": state.config.ocr_server_url,
+                "image": state.config.image_generation_url,
+                "video": state.config.video_generation_url,
+            },
+            "health": {
+                "interval_secs": state.config.health_interval_secs,
+                "failure_threshold": state.config.health_failure_threshold,
+                "timeout_secs": state.config.health_timeout_secs,
+            }
+        }),
+        StatusCode::OK,
+    )
+}
+
+/// Triggers an immediate health sweep over all registered nodes.
+pub async fn probe_upstreams(
+    State(state): State<Arc<GatewayState>>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    if !admin_authorized(&state, &headers) {
+        return json_response(serde_json::json!({"error": "forbidden"}), StatusCode::FORBIDDEN);
+    }
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(state.config.health_timeout_secs))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
+    crate::registry::run_health_sweep(&state, &client).await;
+    let registry = state.registry.read().await;
+    json_response(
+        serde_json::json!({
+            "status": "ok",
+            "nodes": registry.nodes().iter().map(|n| node_view(n)).collect::<Vec<_>>(),
+        }),
+        StatusCode::OK,
+    )
+}
+
+// ---------------------------------------------------------------------------
+// RAG worker endpoint (heavy graph-extraction jobs)
+// ---------------------------------------------------------------------------
+
+pub async fn rag_extract(State(state): State<Arc<GatewayState>>, req: Request<Body>) -> Response {
+    let content_type = req
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .map(String::from);
+    let body_bytes = match req.into_body().collect().await {
+        Ok(b) => b.to_bytes(),
+        Err(_) => {
+            return json_response(
+                serde_json::json!({
+                    "error": { "message": "Invalid request body", "type": "proxy_error", "code": 400 }
+                }),
+                StatusCode::BAD_REQUEST,
+            );
+        }
+    };
+
+    match state.route_rag_extract(content_type.as_deref(), body_bytes).await {
+        Ok((hdrs, body, _node_id)) => {
+            let mut response = Response::new(body);
+            *response.headers_mut() = hdrs;
+            response
+        }
+        Err(e) => {
+            let status = StatusCode::from_u16(e.status).unwrap_or(StatusCode::BAD_GATEWAY);
+            json_response(
+                serde_json::json!({
+                    "error": {
+                        "message": e.context,
+                        "type": if e.unreachable { "rag_worker_unavailable" } else { "rag_worker_error" },
+                        "backend": e.backend,
+                        "param": serde_json::Value::Null,
+                        "code": status.as_u16()
+                    }
+                }),
+                status,
+            )
+        }
+    }
 }
 
 pub async fn register_extraction_backend_handler(
