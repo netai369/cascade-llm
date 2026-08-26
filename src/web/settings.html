@@ -18,6 +18,10 @@
       padding: 0.3rem 0.8rem; border-radius: 6px; transition: all 0.15s;
     }
     nav a:hover, nav a.active { color: var(--accent); background: var(--accent-soft-bg); }
+    .cog {
+      font-size: 1.1rem; text-decoration: none; color: var(--accent);
+      margin-left: 0.6rem; flex-shrink: 0;
+    }
     main { max-width: 900px; margin: 0 auto; padding: 1.5rem 1rem; }
     .section {
       background: var(--card);
@@ -69,13 +73,14 @@
     <div class="bar">
     <div class="brand">
       <a href="/menu/" title="Main menu">NetAI</a>
-      <a href="/cascade/settings.html" title="Cascade LLM"><strong>Cascade LLM</strong></a>
+      <a href="./" title="Cascade LLM"><strong>Cascade LLM</strong></a>
     </div>
+    <a class="cog active" href="" title="Settings">&#9881;</a>
     <button data-theme-toggle class="netai-theme-toggle" aria-label="Switch theme"></button>
     </div>
     <nav>
-      <a href="../">Dashboard</a>
-      <a href="./" class="active">Settings</a>
+      <a href="./">Dashboard</a>
+      <a href="" class="active">&#9881; Settings</a>
       <a href="metrics" target="_blank">Metrics</a>
     </nav>
   </header>

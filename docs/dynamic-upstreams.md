@@ -34,7 +34,8 @@ x-cascade-admin-key: <ADMIN_KEY>
   "label": "Vast.ai RTX 4070",
   "provider": "vast.ai",            // cloud badge in UI
   "cost_per_hour": 0.076,
-  "health_url": "http://10.0.0.45:8080/health"   // optional override
+  "health_url": "http://10.0.0.45:8080/health",   // optional override
+  "model": "openai"                 // optional: force model name upstream
 }
 ```
 
@@ -86,11 +87,61 @@ GET  /web/api/upstreams                # legacy-compatible list view
 ## Health checks
 
 A background prober hits `<origin>/health` on every registered node every
-`HEALTH_CHECK_INTERVAL_SECS` (default 30). After
+`HEALTH_CHECK_INTERVAL_SECS` (default 30). Any HTTP response below 500 counts
+as alive (minimal workers without a `/health` route — 404/405 — stay in the
+pool); 5xx and connection failures count as failed. After
 `HEALTH_CHECK_FAILURE_THRESHOLD` consecutive failures (default 2) a node is
 demoted (unhealthy) and stops receiving traffic; a later successful probe
-promotes it again automatically. Latency of successful probes and of real
-requests (EMA) is tracked per node.
+promotes it again automatically. Latency-to-first-byte of successful probes
+and of real proxied requests (EMA) is tracked per node.
+
+## Routing strategies
+
+* `round_robin` (default): weighted fair distribution.
+* `least_latency`: lowest request-latency EMA wins. Freshly registered nodes
+  have no EMA yet — they are served first via round-robin until measured,
+  so they can never starve behind an established node.
+
+## Hosted APIs: Pollinations.ai
+
+Register `provider: "pollinations"` nodes for zero-cost cloud inference:
+
+```bash
+# Image generation (free, anonymous tier):
+curl -X PUT localhost:3000/web/api/upstreams/image -H "x-cascade-admin-key: …" \
+  -d '{"endpoint_url":"https://image.pollinations.ai","provider":"pollinations",
+       "model":"flux","label":"Pollinations flux"}'
+
+# Text chat (anonymous tier rate-limited; token recommended):
+curl -X PUT localhost:3000/web/api/upstreams/auxiliary -H "x-cascade-admin-key: …" \
+  -d '{"endpoint_url":"https://text.pollinations.ai/openai","provider":"pollinations",
+       "model":"openai","bearer_token":"<POLLINATIONS_TOKEN>"}'
+```
+
+Adapter behaviour:
+
+* **Image**: `POST /v1/images/generations` bodies are translated to the
+  Pollinations GET API (`/prompt/{prompt}?width=&height=&model=&seed=`,
+  `nologo=true`) and returned as OpenAI-shaped JSON (`b64_json`, or
+  `response_format:"url"`). Client `size` maps to width/height (clamped to
+  64–2048). The node's `model` (default `flux`) applies unless overridden
+  per request.
+* **Text**: requests are forwarded to the OpenAI-compatible endpoint as-is;
+  the client's `model` field is replaced by the node's registered `model`
+  (`openai`, `mistral`, …) since Pollinations rejects unknown ids. The
+  bearer token is used as the Pollinations auth-tier token.
+
+The NetAI GPU provisioner manages both node types via
+`POST /api/v1/inference-nodes/pollinions` on its own API and re-registers
+them automatically after gateway restarts (reconcile self-heal).
+
+## Web UI
+
+The dashboard (served at `/`, `/web/`, and via Caddy at `/cascade/`) has a
+Node Control Center with active toggles, probe-now, register form and
+cost/provider badges. All admin endpoints are mirrored under both
+`/api/v1/…` and `/web/api/v1/…`; `/settings` redirects to `/web/settings`
+so relative links work from every mount point.
 
 ## Declarative seed file (LiteLLM-inspired)
 

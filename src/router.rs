@@ -79,6 +79,22 @@ pub fn build_router(state: Arc<GatewayState>) -> Router {
             "/api/upstreams/:role",
             put(handlers::put_upstream).delete(handlers::delete_upstream),
         )
+        // v1 admin aliases under /web — the dashboard is served at both "/"
+        // and "/web/" (Caddy rewrites /cascade/* to /web*), so relative
+        // fetch('api/v1/...') must resolve on both mounts.
+        .route(
+            "/web/api/v1/inference-nodes/:id/activate",
+            post(handlers::activate_node),
+        )
+        .route(
+            "/web/api/v1/inference-nodes/:id/deactivate",
+            post(handlers::deactivate_node),
+        )
+        .route("/web/api/v1/admin/upstreams", get(handlers::admin_upstreams))
+        .route(
+            "/web/api/v1/admin/upstreams/probe",
+            post(handlers::probe_upstreams),
+        )
         .route(
             "/api/v1/inference-nodes/:id/activate",
             post(handlers::activate_node),
@@ -92,6 +108,7 @@ pub fn build_router(state: Arc<GatewayState>) -> Router {
             "/api/v1/admin/upstreams/probe",
             post(handlers::probe_upstreams),
         )
+        .route("/settings", get(handlers::settings_redirect))
         .with_state(state)
         .layer(DefaultBodyLimit::disable())
 }

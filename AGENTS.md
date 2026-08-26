@@ -44,9 +44,15 @@ Full API reference: docs/dynamic-upstreams.md. Short form:
 - Routing picks registry nodes first; static URLs are fallback → hot swaps
   without dropping sessions. Responses tagged with `x-cascade-route` +
   `x-cascade-node`.
-- LiteLLM-inspired: least_latency strategy, declarative cascade_config.yaml,
-  probe endpoint. Deliberately NOT embedding LiteLLM (Python sidecar would
-  duplicate the gateway).
+- LiteLLM-inspired: least_latency strategy (with unmeasured-node warm-up),
+  declarative cascade_config.yaml, probe endpoint. Deliberately NOT embedding
+  LiteLLM (Python sidecar would duplicate the gateway).
+- Hosted APIs: `provider: pollinations` nodes get an image adapter
+  (OpenAI images → Pollinations GET) and model normalization for text;
+  optional per-node `model` field forces the upstream model id.
+- Health prober treats any HTTP <500 as alive (404-only workers stay in pool).
+- Web UI: nav strip + settings cog on dashboard/settings; admin API mirrored
+  under /api/v1 and /web/api/v1 (dashboard is mounted at /, /web/, /cascade/).
 
 ## Conventions
 

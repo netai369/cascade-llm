@@ -78,6 +78,10 @@ pub struct RegisterUpstreamRequest {
     /// Optional explicit health probe URL; defaults to `<origin>/health`.
     #[serde(default)]
     pub health_url: Option<String>,
+    /// Model name forced onto requests routed to this node (used by hosted
+    /// APIs like Pollinations where client model ids don't exist upstream).
+    #[serde(default)]
+    pub model: Option<String>,
 }
 
 /// One `upstreams:` entry from an optional cascade_config.yaml seed file.
@@ -120,6 +124,9 @@ pub struct UpstreamNode {
     pub cost_per_hour: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub health_url: Option<String>,
+    /// Model name forced onto requests routed to this node (hosted APIs).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     pub registered_at: String,
 }
 
@@ -169,11 +176,28 @@ fn generated_id(role: &str, url: &str) -> String {
 /// Thread-safe pool of upstream nodes keyed by role (`Arc<RwLock<..>>` lives in
 /// [`crate::state::GatewayState`]). Selection is weighted round-robin over all
 /// active + healthy nodes of a role, giving fair distribution under load.
-#[derive(Debug, Default)]
+/// Round-robin counters are atomics so `pick` only needs a read lock —
+/// concurrent request routing never serializes on the registry writer.
+#[derive(Debug)]
 pub struct UpstreamRegistry {
     roles: HashMap<String, Vec<UpstreamNode>>,
-    counters: HashMap<String, u64>,
+    counters: HashMap<String, std::sync::atomic::AtomicU64>,
     strategy: RoutingStrategy,
+}
+
+impl Default for UpstreamRegistry {
+    fn default() -> Self {
+        // Round-robin counters are pre-seeded per canonical role so `pick`
+        // never needs mutable access to the map.
+        Self {
+            roles: HashMap::new(),
+            counters: ROLES
+                .iter()
+                .map(|r| (r.to_string(), std::sync::atomic::AtomicU64::new(0)))
+                .collect(),
+            strategy: RoutingStrategy::default(),
+        }
+    }
 }
 
 pub struct UpsertResult {
@@ -234,6 +258,9 @@ impl UpstreamRegistry {
                 if req.health_url.is_some() {
                     node.health_url = req.health_url;
                 }
+                if req.model.is_some() {
+                    node.model = req.model;
+                }
                 info!("UPSTREAM_UPDATED: role={} id={} url={}", role, node.id, url);
                 UpsertResult { node: node.clone(), created: false }
             }
@@ -255,6 +282,7 @@ impl UpstreamRegistry {
                     provider: req.provider,
                     cost_per_hour: req.cost_per_hour,
                     health_url: req.health_url,
+                    model: req.model,
                     registered_at: now_ts(),
                 };
                 info!("UPSTREAM_REGISTERED: role={} id={} url={}", role, node.id, url);
@@ -317,7 +345,11 @@ impl UpstreamRegistry {
     /// Picks a node among active + healthy nodes of a role according to the
     /// configured [`RoutingStrategy`]. Candidate order is deterministic
     /// (sorted by id) to keep distribution stable.
-    pub fn pick(&mut self, role: &str) -> Option<UpstreamNode> {
+    ///
+    /// LeastLatency starvation guard: candidates without a latency EMA yet
+    /// (freshly registered) are served first via weighted round-robin until
+    /// they build measurements — otherwise they would never receive traffic.
+    pub fn pick(&self, role: &str) -> Option<UpstreamNode> {
         let mut candidates: Vec<UpstreamNode> = self
             .roles
             .get(role)
@@ -335,22 +367,32 @@ impl UpstreamRegistry {
 
         match self.strategy {
             RoutingStrategy::LeastLatency => {
-                // Lowest EMA wins; unmeasured nodes sort last so fresh nodes
-                // are still reachable (and start building measurements).
-                candidates.sort_by_key(|n| n.latency_ema_ms.unwrap_or(u64::MAX));
-                candidates.into_iter().next()
-            }
-            RoutingStrategy::RoundRobin => {
-                let expanded: Vec<&UpstreamNode> = candidates
+                let unmeasured: Vec<UpstreamNode> = candidates
                     .iter()
-                    .flat_map(|n| std::iter::repeat_n(n, n.weight as usize))
+                    .filter(|n| n.latency_ema_ms.is_none())
+                    .cloned()
                     .collect();
-                let counter = self.counters.entry(role.to_string()).or_default();
-                let picked = expanded[(*counter as usize) % expanded.len()].clone();
-                *counter += 1;
-                Some(picked)
+                if !unmeasured.is_empty() {
+                    self.weighted_round_robin(role, &unmeasured)
+                } else {
+                    candidates.sort_by_key(|n| n.latency_ema_ms.unwrap_or(u64::MAX));
+                    candidates.into_iter().next()
+                }
             }
+            RoutingStrategy::RoundRobin => self.weighted_round_robin(role, &candidates),
         }
+    }
+
+    fn weighted_round_robin(&self, role: &str, candidates: &[UpstreamNode]) -> Option<UpstreamNode> {
+        let expanded: Vec<&UpstreamNode> = candidates
+            .iter()
+            .flat_map(|n| std::iter::repeat_n(n, n.weight as usize))
+            .collect();
+        let idx = match self.counters.get(role) {
+            Some(counter) => counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            None => 0,
+        };
+        Some(expanded[(idx as usize) % expanded.len()].clone())
     }
 
     /// Records the latency of a successful proxied request into the node's
@@ -449,7 +491,12 @@ pub async fn run_health_sweep(
     let results = futures_util::stream::iter(targets)
         .map(|(id, url)| async move {
             let start = Instant::now();
-            let ok = client.get(&url).send().await.map(|r| r.status().is_success()).unwrap_or(false);
+            // Any HTTP response below 500 proves the node is up — minimal
+            // workers without a /health route (404/405) stay in the pool.
+            let ok = client.get(&url).send().await.map(|r| {
+                let s = r.status();
+                s.is_success() || s.is_redirection() || s.as_u16() == 404 || s.as_u16() == 405
+            }).unwrap_or(false);
             (id, ok, start.elapsed().as_millis() as u64)
         })
         .buffer_unordered(16)
@@ -488,6 +535,7 @@ mod tests {
             provider: None,
             cost_per_hour: None,
             health_url: None,
+            model: None,
         }
     }
 
@@ -566,6 +614,27 @@ mod tests {
         let m = reg.upsert("image", req("http://i:1234/v1/images/generations")).node;
         assert!(reg.remove_id(&m.id).is_some());
         assert!(reg.remove_id(&m.id).is_none());
+    }
+
+    #[test]
+    fn least_latency_serves_unmeasured_nodes_first() {
+        let mut reg = UpstreamRegistry::default();
+        reg.set_strategy(RoutingStrategy::LeastLatency);
+        let mut fast = req("http://fast:8080/v1/chat/completions");
+        fast.weight = Some(1);
+        let fast_node = reg.upsert("main", fast).node;
+        reg.record_request_latency(&fast_node.id, 10);
+
+        // A fresh node must receive traffic under least_latency (warm-up),
+        // not starve forever behind the measured one.
+        reg.upsert("main", req("http://new:8080/v1/chat/completions"));
+        let picked = reg.pick("main").unwrap();
+        assert_eq!(picked.endpoint_url, "http://new:8080/v1/chat/completions");
+
+        // Once measured, the faster node wins again.
+        reg.record_request_latency(&picked.id, 500);
+        let picked = reg.pick("main").unwrap();
+        assert_eq!(picked.endpoint_url, "http://fast:8080/v1/chat/completions");
     }
 
     #[test]

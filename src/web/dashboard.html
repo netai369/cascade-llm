@@ -19,6 +19,11 @@
       padding: 0.3rem 0.8rem; border-radius: 6px; transition: all 0.15s;
     }
     nav a:hover, nav a.active { color: var(--accent); background: var(--accent-soft-bg); }
+    .cog {
+      font-size: 1.1rem; text-decoration: none; color: var(--text-muted);
+      margin-left: 0.6rem; flex-shrink: 0; transition: color 0.15s;
+    }
+    .cog:hover { color: var(--accent); }
     main { max-width: 1200px; margin: 0 auto; padding: 1.5rem 1rem; }
     .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 1rem; margin-bottom: 1.5rem; }
     .card {
@@ -124,11 +129,18 @@
     <div class="bar">
     <div class="brand">
       <a href="/menu/" title="Main menu">NetAI</a>
-      <a href="/cascade/" title="Cascade LLM"><strong>Cascade LLM</strong></a>
+      <a href="./" title="Cascade LLM"><strong>Cascade LLM</strong></a>
     </div>
+    <a class="cog" href="settings" title="Settings">&#9881;</a>
     <button data-theme-toggle class="netai-theme-toggle" aria-label="Switch theme"></button>
     </div>
   </header>
+  <nav>
+    <a href="./" class="active">Dashboard</a>
+    <a href="settings">&#9881; Settings</a>
+    <a href="#nodes">Nodes</a>
+    <a href="metrics" target="_blank">Metrics</a>
+  </nav>
   <main>
     <div class="cards">
       <div class="card"><div class="label">Total Requests</div><div class="value cyan" id="requests-total">—</div></div>
@@ -148,7 +160,7 @@
         <canvas id="distChart"></canvas>
       </div>
     </div>
-    <div class="provider-section">
+    <div class="provider-section" id="nodes">
       <h3>Inference Nodes <span style="font-weight:400;font-size:0.75rem" id="node-strategy"></span></h3>
       <div class="key-row">
         <input type="password" id="admin-key" placeholder="Admin key (x-cascade-admin-key)" autocomplete="off">

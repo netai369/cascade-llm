@@ -603,6 +603,7 @@ impl GatewayState {
         RouteDecision::Inference
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn proxy_to_backend(
         &self,
         payload: &ChatCompletionRequest,
@@ -610,6 +611,7 @@ impl GatewayState {
         bearer: Option<&str>,
         is_streaming: bool,
         _origin: &str,
+        header_latency_ms: &mut Option<u64>,
     ) -> Result<(HeaderMap, Body), ProxyError> {
         // Strip router-internal fields so they are never forwarded to the backend.
         let mut clean = payload.clone();
@@ -620,11 +622,15 @@ impl GatewayState {
         if let Some(token) = bearer {
             request = request.bearer_auth(token);
         }
+        let sent_at = Instant::now();
         let backend_response = request.send()
             .await
             .map_err(|e| {
                 ProxyError::unreachable(StatusCode::SERVICE_UNAVAILABLE, url, format!("backend unreachable: {}", e))
             })?;
+        // Latency-to-first-byte (response headers), not full stream duration —
+        // keeps the routing EMA comparable between streaming and batch calls.
+        *header_latency_ms = Some(sent_at.elapsed().as_millis() as u64);
 
         let status = backend_response.status();
         if !status.is_success() {
@@ -957,8 +963,8 @@ impl GatewayState {
             ));
         }
 
-        let start = Instant::now();
-        match self.proxy_to_backend(payload, url, bearer, is_streaming, origin).await {
+        let mut header_latency = None;
+        match self.proxy_to_backend(payload, url, bearer, is_streaming, origin, &mut header_latency).await {
             Ok(mut parts) => {
                 if let Ok(v) = HeaderValue::from_str(backend_name) {
                     parts.0.insert("x-cascade-route", v);
@@ -967,7 +973,9 @@ impl GatewayState {
                     if let Ok(v) = HeaderValue::from_str(id) {
                         parts.0.insert("x-cascade-node", v);
                     }
-                    self.registry.write().await.record_request_latency(id, start.elapsed().as_millis() as u64);
+                    if let Some(ms) = header_latency {
+                        self.registry.write().await.record_request_latency(id, ms);
+                    }
                 }
                 self.circuit_breaker.record_success(url).await;
                 self.metrics.record_request(metric_name);
@@ -999,7 +1007,8 @@ impl GatewayState {
     /// URL is the fallback when no node is registered.
     /// Returns (url, bearer, node_id).
     async fn resolve_upstream(&self, role: &str, default_url: &str) -> (String, Option<String>, Option<String>) {
-        let mut registry = self.registry.write().await;
+        // Read-only: pick() advances an atomic counter, no writer needed.
+        let registry = self.registry.read().await;
         if let Some(node) = registry.pick(role) {
             info!("UPSTREAM_NODE: {} -> {} ({})", role, node.endpoint_url, node.id);
             return (node.endpoint_url.clone(), node.bearer_token.clone(), Some(node.id));
@@ -1010,12 +1019,25 @@ impl GatewayState {
     /// Picks a node from the registry without falling back to static config.
     /// Used by media/RAG handlers that need to know whether a node exists.
     pub async fn pick_node(&self, role: &str) -> Option<crate::registry::UpstreamNode> {
-        self.registry.write().await.pick(role)
+        self.registry.read().await.pick(role)
     }
 
     /// True when at least one active + healthy node is registered for the role.
     pub async fn has_active_role(&self, role: &str) -> bool {
         self.registry.read().await.has_active(role)
+    }
+
+    /// Hosted APIs (Pollinations etc.) don't know client model ids — when the
+    /// target node declares a `model`, force it onto the outgoing payload.
+    async fn apply_node_model(&self, payload: &mut ChatCompletionRequest, node_id: &Option<String>) {
+        let Some(id) = node_id else { return };
+        let model = self.registry.read().await.get(id).and_then(|n| n.model.clone());
+        if let Some(m) = model {
+            if !m.is_empty() && payload.model != m {
+                info!("NODE_MODEL_OVERRIDE: {} -> {}", payload.model, m);
+                payload.model = m;
+            }
+        }
     }
 
     /// Condition A — dedicated vision / document parsing (OCR) endpoint.
@@ -1028,6 +1050,7 @@ impl GatewayState {
         let mut payload = payload.clone();
         self.inline_all_images(&mut payload).await;
         let (url, bearer, node) = self.resolve_upstream("ocr", &self.config.ocr_server_url).await;
+        self.apply_node_model(&mut payload, &node).await;
         info!(
             "ROUTE_A: OCR -> {} ({} messages)",
             url,
@@ -1048,6 +1071,7 @@ impl GatewayState {
         // If a remote image slipped in, inline it before forwarding.
         self.inline_all_images(&mut payload).await;
         let (url, bearer, node) = self.resolve_upstream("auxiliary", &self.config.small_mllm_url).await;
+        self.apply_node_model(&mut payload, &node).await;
         info!(
             "ROUTE_B: Auxiliary(compression) -> {} ({} messages)",
             url,
@@ -1076,6 +1100,7 @@ impl GatewayState {
         let lang = language::detect_language(&payload.messages);
         payload = language::inject_language_prompt(lang, payload);
         let (url, bearer, node) = self.resolve_upstream("main", &self.config.large_text_url).await;
+        self.apply_node_model(&mut payload, &node).await;
         info!(
             "ROUTE_C: Inference(default) -> {} ({} messages, lang={})",
             url,
@@ -1176,7 +1201,7 @@ impl GatewayState {
 
         if let Some(target) = target_override {
             info!("SESSION AFFINITY ROUTE: target={}", target);
-            let mut result = self.proxy_to_backend(&injected_payload, &target, None, is_streaming, origin).await;
+            let mut result = self.proxy_to_backend(&injected_payload, &target, None, is_streaming, origin, &mut None).await;
             if let Ok(parts) = result.as_mut() {
                 if let Ok(v) = HeaderValue::from_str("session-affinity") {
                     parts.0.insert("x-cascade-route", v);
@@ -1199,7 +1224,7 @@ impl GatewayState {
         info!("AUTO SELECTED_URL: {}", target_url);
 
         if !use_small {
-            let mut result = self.proxy_to_backend(&injected_payload, &target_url, None, is_streaming, origin).await;
+            let mut result = self.proxy_to_backend(&injected_payload, &target_url, None, is_streaming, origin, &mut None).await;
             if let Ok(parts) = result.as_mut() {
                 if let Ok(v) = HeaderValue::from_str(if use_small {"auto-small"} else {"auto-large"}) {
                     parts.0.insert("x-cascade-route", v);
@@ -1227,7 +1252,7 @@ impl GatewayState {
         }
 
         if is_streaming {
-            let mut result = self.proxy_to_backend(&small_payload, &target_url, None, true, origin).await;
+            let mut result = self.proxy_to_backend(&small_payload, &target_url, None, true, origin, &mut None).await;
             if let Ok(parts) = result.as_mut() {
                 if let Ok(v) = HeaderValue::from_str("auto-small") {
                     parts.0.insert("x-cascade-route", v);
@@ -1272,7 +1297,7 @@ impl GatewayState {
             info!("Small model returned HTTP {}, rerouting original request to large model", status);
             self.circuit_breaker.record_failure(&target_url).await;
             self.metrics.record_fallback("primary_failed");
-            let mut result = self.proxy_to_backend(&injected_payload, &large_url, None, false, origin).await;
+            let mut result = self.proxy_to_backend(&injected_payload, &large_url, None, false, origin, &mut None).await;
         if let Ok(parts) = result.as_mut() {
             if let Ok(v) = HeaderValue::from_str("auto-large") {
                 parts.0.insert("x-cascade-route", v);
@@ -1324,7 +1349,7 @@ impl GatewayState {
 
         info!("Rerouting original request to large text model");
         self.metrics.record_fallback("quality_low");
-        let mut result = self.proxy_to_backend(&injected_payload, &large_url, None, false, origin).await;
+        let mut result = self.proxy_to_backend(&injected_payload, &large_url, None, false, origin, &mut None).await;
         if let Ok(parts) = result.as_mut() {
             if let Ok(v) = HeaderValue::from_str("auto-large") {
                 parts.0.insert("x-cascade-route", v);

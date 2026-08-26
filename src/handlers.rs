@@ -92,7 +92,7 @@ pub async fn chat_completions(
         .get("x-request-origin")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("unknown");
-    state.metrics.record_request_origin(&origin);
+    state.metrics.record_request_origin(origin);
     let body_bytes = match req.into_body().collect().await {
         Ok(b) => b.to_bytes(),
         Err(_) => {
@@ -289,7 +289,7 @@ pub async fn health_check(State(state): State<Arc<GatewayState>>) -> Response {
             "auxiliary_server_url": state.config.small_mllm_url,
             "inference_server_url": state.config.large_text_url,
             "extract_fallback_url": state.config.extract_fallback_url,
-            "session_cache_entries": state.session_cache.entry_count() as u64,
+            "session_cache_entries": state.session_cache.entry_count(),
             "uptime_seconds": state.start_time.elapsed().as_secs(),
             "providers": state.config.providers.len(),
             "extraction_backends": extract_summary,
@@ -338,9 +338,19 @@ pub async fn settings_page(_state: State<Arc<GatewayState>>) -> Response {
         .unwrap()
 }
 
+/// Canonical settings mount is /web/settings; redirect keeps relative links
+/// working when the dashboard is served from "/".
+pub async fn settings_redirect(_state: State<Arc<GatewayState>>) -> Response {
+    Response::builder()
+        .status(StatusCode::TEMPORARY_REDIRECT)
+        .header("location", "/web/settings")
+        .body(Body::empty())
+        .unwrap()
+}
+
 pub async fn dashboard_api(State(state): State<Arc<GatewayState>>) -> Response {
     let uptime = state.start_time.elapsed().as_secs();
-    let cache_entries = state.session_cache.entry_count() as u64;
+    let cache_entries = state.session_cache.entry_count();
 
     let known_backends = ["small", "large", "large_multimodal", "session_affinity", "stt_proxy", "ocr", "auxiliary", "inference"];
     let mut requests_by_backend = std::collections::HashMap::new();

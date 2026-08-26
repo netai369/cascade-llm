@@ -2,7 +2,8 @@
 //! PUT/DELETE /web/api/upstreams/{role}, activate/deactivate,
 //! GET /api/v1/admin/upstreams and POST /v1/rag/extract fallbacks.
 
-use axum::routing::post;
+use axum::extract::Path;
+use axum::routing::{get, post};
 use axum::Router;
 use cascade_llm::cascade_features::MetricsRegistry;
 use cascade_llm::config::AppConfig;
@@ -228,4 +229,67 @@ async fn rag_extract_forwards_to_registered_worker() {
     assert!(res.headers().get("x-cascade-node").is_some());
     let body: serde_json::Value = res.json().await.unwrap();
     assert_eq!(body["status"], "queued");
+}
+
+#[tokio::test]
+async fn image_generation_via_pollinations_adapter() {
+    use std::sync::Mutex;
+
+    // Stub mimicking Pollinations' GET /prompt/{prompt} API.
+    let seen_uri: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
+    let seen = seen_uri.clone();
+    async fn png_bytes() -> impl axum::response::IntoResponse {
+        (
+            [(axum::http::header::CONTENT_TYPE, "image/png")],
+            vec![1u8, 2, 3, 4],
+        )
+    }
+    let capture = Router::new().route(
+        "/prompt/:name",
+        get(|Path(name): Path<String>, uri: axum::http::Uri| async move {
+            let _ = &name; *seen.lock().unwrap() = uri.to_string();
+            png_bytes().await
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let pollinations_base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, capture).await.unwrap(); });
+
+    let base = spawn_gateway().await;
+    let client = reqwest::Client::new();
+
+    client
+        .put(format!("{}/api/upstreams/image", base))
+        .headers(admin_headers())
+        .json(&serde_json::json!({
+            "endpoint_url": pollinations_base,
+            "provider": "pollinations",
+            "label": "Pollinations free tier"
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    let res = client
+        .post(format!("{}/v1/images/generations", base))
+        .json(&serde_json::json!({"prompt": "a cat", "size": "512x768", "model": "turbo", "seed": 7}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), reqwest::StatusCode::OK);
+
+    // OpenAI-shaped response carrying the base64 image.
+    let body: serde_json::Value = res.json().await.unwrap();
+    use base64::Engine as _;
+    assert_eq!(
+        body["data"][0]["b64_json"].as_str().unwrap(),
+        base64::engine::general_purpose::STANDARD.encode(vec![1u8, 2, 3, 4])
+    );
+
+    // The OpenAI request was translated into a Pollinations GET URL.
+    let uri = seen_uri.lock().unwrap().clone();
+    assert_eq!(
+        uri,
+        "/prompt/a%20cat?width=512&height=768&model=turbo&seed=7&nologo=true"
+    );
 }
