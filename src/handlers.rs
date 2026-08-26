@@ -861,6 +861,52 @@ pub async fn probe_upstreams(
 }
 
 // ---------------------------------------------------------------------------
+// Raw text completions (OpenAI /v1/completions -> main role)
+// ---------------------------------------------------------------------------
+
+pub async fn completions(State(state): State<Arc<GatewayState>>, req: Request<Body>) -> Response {
+    let content_type = req
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .map(String::from);
+    let body_bytes = match req.into_body().collect().await {
+        Ok(b) => b.to_bytes(),
+        Err(_) => {
+            return json_response(
+                serde_json::json!({
+                    "error": { "message": "Invalid request body", "type": "proxy_error", "code": 400 }
+                }),
+                StatusCode::BAD_REQUEST,
+            );
+        }
+    };
+
+    match state.route_completions_raw(content_type.as_deref(), body_bytes).await {
+        Ok((hdrs, body)) => {
+            let mut response = Response::new(body);
+            *response.headers_mut() = hdrs;
+            response
+        }
+        Err(e) => {
+            let status = StatusCode::from_u16(e.status).unwrap_or(StatusCode::BAD_GATEWAY);
+            json_response(
+                serde_json::json!({
+                    "error": {
+                        "message": e.context,
+                        "type": if e.unreachable { "cascade_backend_unavailable" } else { "cascade_backend_error" },
+                        "backend": e.backend,
+                        "param": serde_json::Value::Null,
+                        "code": status.as_u16()
+                    }
+                }),
+                status,
+            )
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // RAG worker endpoint (heavy graph-extraction jobs)
 // ---------------------------------------------------------------------------
 

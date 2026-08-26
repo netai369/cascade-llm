@@ -13,6 +13,7 @@ pub fn build_router(state: Arc<GatewayState>) -> Router {
         .merge(cascade_features::build_router::<Arc<GatewayState>>())
         // OpenAI-compatible chat + model discovery
         .route("/v1/chat/completions", post(handlers::chat_completions))
+        .route("/v1/completions", post(handlers::completions))
         .route("/v1/models", get(handlers::list_models))
         .route("/models", get(handlers::list_models))
         .route("/model", get(handlers::get_model))

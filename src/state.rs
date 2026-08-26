@@ -1596,4 +1596,83 @@ impl GatewayState {
             .map(|item| item.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)));
         Ok((headers, Body::from_stream(stream), node.id))
     }
+
+    // =========================================================================
+    // RAW TEXT COMPLETIONS  (POST /v1/completions -> main)
+    // =========================================================================
+
+    /// Pass-through for OpenAI text-completions (`/v1/completions`) to the
+    /// active `main` node or its static fallback. Bodies are forwarded
+    /// untouched; responses streamed back.
+    pub async fn route_completions_raw(
+        &self,
+        content_type: Option<&str>,
+        body: axum::body::Bytes,
+    ) -> Result<(HeaderMap, Body), ProxyError> {
+        let (url, bearer, node_id) =
+            self.resolve_upstream("main", &self.config.large_text_url).await;
+        let metric_name = if node_id.is_some() { "main" } else { "large_text" };
+
+        if self.circuit_breaker.is_open(&url).await {
+            self.metrics.record_fallback("backend_unavailable");
+            return Err(ProxyError::unreachable(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "main",
+                "main backend circuit breaker open",
+            ));
+        }
+
+        let mut request = self.http_client.post(&url).body(body);
+        if let Some(token) = bearer {
+            request = request.bearer_auth(token);
+        }
+        request = request.header("content-type", content_type.unwrap_or("application/json"));
+
+        let backend_response = match request.send().await {
+            Ok(resp) => resp,
+            Err(e) => {
+                self.circuit_breaker.record_failure(&url).await;
+                return Err(ProxyError::unreachable(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "main",
+                    format!("main backend unreachable: {}", e),
+                ));
+            }
+        };
+
+        let status = backend_response.status();
+        if !status.is_success() {
+            self.circuit_breaker.record_failure(&url).await;
+            let err_body = backend_response.text().await.unwrap_or_default();
+            return Err(ProxyError::new(
+                StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY).as_u16(),
+                "main",
+                format!("main returned HTTP {}: {}", status, err_body.chars().take(300).collect::<String>()),
+            ));
+        }
+
+        self.circuit_breaker.record_success(&url).await;
+        self.metrics.record_request(metric_name);
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "content-type",
+            HeaderValue::from_str(
+                backend_response
+                    .headers()
+                    .get("content-type")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("application/json"),
+            )
+            .unwrap_or(HeaderValue::from_static("application/json")),
+        );
+        if let Ok(v) = HeaderValue::from_str("completions-raw") {
+            headers.insert("x-cascade-route", v);
+        }
+
+        let stream = backend_response
+            .bytes_stream()
+            .map(|item| item.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)));
+        Ok((headers, Body::from_stream(stream)))
+    }
 }
