@@ -162,6 +162,7 @@
     </div>
     <div class="provider-section" id="nodes">
       <h3>Inference Nodes <span style="font-weight:400;font-size:0.75rem" id="node-strategy"></span></h3>
+      <div id="dup-banner" style="display:none;margin:0.5rem 0;padding:0.6rem 0.8rem;background:var(--accent-soft-bg);border:1px solid var(--accent);border-radius:8px;font-size:0.8rem;color:var(--text)"></div>
       <div class="key-row">
         <input type="password" id="admin-key" placeholder="Admin key (x-cascade-admin-key)" autocomplete="off">
         <button class="btn-sm" onclick="saveKey()">Save</button>
@@ -188,6 +189,19 @@
           <button class="btn-sm" onclick="submitNode()">PUT upstream</button>
         </div>
       </details>
+    </div>
+    <div class="provider-section" id="image-test">
+      <h3>Image Generation — quick test <span style="font-weight:400;font-size:0.75rem" id="image-active-node">no active image node</span></h3>
+      <div class="form-row">
+        <input id="img-prompt" placeholder="prompt (e.g. a small red apple on a white background)" style="flex:2;min-width:300px">
+        <input id="img-size" placeholder="512x512" value="512x512" style="width:110px">
+        <input id="img-model" placeholder="model (e.g. flux)" value="flux" style="width:110px">
+        <button class="btn-sm" onclick="generateImage()">Generate</button>
+      </div>
+      <div id="img-result" style="margin-top:0.6rem;display:none">
+        <img id="img-out" style="max-width:512px;max-height:512px;border-radius:8px;border:1px solid var(--card-border)">
+        <div id="img-meta" style="font-size:0.75rem;color:var(--text-faint);margin-top:0.3rem"></div>
+      </div>
     </div>
     <div class="provider-section">
       <h3>Configured Providers</h3>
@@ -385,6 +399,26 @@
         `strategy: ${String(d.strategy).replace('_','-')}`;
       const grid = document.getElementById('node-grid');
       const nodes = d.nodes || [];
+
+      // Duplicate-role warning: 2+ active nodes with same (role, model).
+      const dupKeys = {};
+      nodes.filter(n => n.active).forEach(n => {
+        const k = `${n.role}::${(n.model || n.id).toLowerCase()}`;
+        (dupKeys[k] = dupKeys[k] || []).push(n);
+      });
+      const dups = Object.entries(dupKeys).filter(([_, ns]) => ns.length > 1);
+      const dupBanner = document.getElementById('dup-banner');
+      if (dups.length) {
+        dupBanner.style.display = 'block';
+        dupBanner.innerHTML = '<strong>Duplicate roles detected.</strong> '
+          + 'Multiple active nodes serve the same (role, model); traffic is round-robin across them. '
+          + 'This is intentional for horizontal scaling, but consider keeping only one unless you '
+          + 'specifically need more capacity. Duplicates: '
+          + dups.map(([k, ns]) => `<code>${esc(k)}</code> ×${ns.length}`).join(', ');
+      } else {
+        dupBanner.style.display = 'none';
+      }
+
       if (nodes.length === 0) {
         grid.innerHTML = '<div style="color:var(--text-faint);font-size:0.8rem">No dynamic nodes registered — static config URLs are in use. Register cloud GPUs or specialized workers below.</div>';
         return;
@@ -422,6 +456,66 @@
     }
     refreshNodes();
     setInterval(refreshNodes, 10000);
+
+    // =====================================================================
+    // Image generation quick-test — calls the active `image` node via
+    // /v1/images/generations. Same surface LibreChat's ImageGen endpoint uses.
+    // =====================================================================
+    function updateImageStatus() {
+      fetch('api/v1/admin/upstreams', { headers: authHeaders() })
+        .then(r => r.ok ? r.json() : null)
+        .then(d => {
+          const active = (d?.nodes || []).find(n => n.role === 'image' && n.active);
+          const el = document.getElementById('image-active-node');
+          if (active) {
+            el.textContent = `via ${active.label || active.id} (${active.endpoint_url})`;
+          } else {
+            el.textContent = 'no active image node — register one above';
+          }
+        }).catch(() => {});
+    }
+    updateImageStatus();
+    setInterval(updateImageStatus, 10000);
+
+    async function generateImage() {
+      const prompt = document.getElementById('img-prompt').value.trim();
+      if (!prompt) { alert('prompt required'); return; }
+      const size = document.getElementById('img-size').value.trim() || '512x512';
+      const model = document.getElementById('img-model').value.trim() || 'flux';
+      const meta = document.getElementById('img-meta');
+      const out = document.getElementById('img-out');
+      const result = document.getElementById('img-result');
+      meta.textContent = 'generating…';
+      result.style.display = 'block';
+      out.src = '';
+      const t0 = Date.now();
+      try {
+        const r = await fetch('v1/images/generations', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', ...authHeaders() },
+          body: JSON.stringify({ prompt, n: 1, size, model, response_format: 'b64_json' }),
+        });
+        if (!r.ok) {
+          meta.textContent = `HTTP ${r.status}: ${(await r.text()).slice(0,200)}`;
+          return;
+        }
+        const j = await r.json();
+        const dt = Date.now() - t0;
+        const b64 = j?.data?.[0]?.b64_json;
+        const url = j?.data?.[0]?.url;
+        if (b64) {
+          out.src = `data:image/png;base64,${b64}`;
+          meta.textContent = `model=${model} size=${size} ${dt}ms (base64, ${Math.round(b64.length*0.75/1024)} KB)`;
+        } else if (url) {
+          out.src = url;
+          meta.textContent = `model=${model} size=${size} ${dt}ms (url: ${url.slice(0,80)}…)`;
+        } else {
+          meta.textContent = `unexpected response: ${JSON.stringify(j).slice(0,200)}`;
+        }
+      } catch(e) {
+        meta.textContent = `error: ${e}`;
+      }
+    }
   </script>
 </body>
 </html>
