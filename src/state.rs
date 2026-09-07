@@ -1005,6 +1005,8 @@ impl GatewayState {
     /// Resolve the effective upstream for a role. The dynamic registry wins
     /// (weighted round-robin over active + healthy nodes); the static config
     /// URL is the fallback when no node is registered.
+    /// Static fallbacks carry LLAMA_API_KEY as bearer when set (None = no
+    /// header, today's behavior).
     /// Returns (url, bearer, node_id).
     async fn resolve_upstream(&self, role: &str, default_url: &str) -> (String, Option<String>, Option<String>) {
         // Read-only: pick() advances an atomic counter, no writer needed.
@@ -1013,7 +1015,7 @@ impl GatewayState {
             info!("UPSTREAM_NODE: {} -> {} ({})", role, node.endpoint_url, node.id);
             return (node.endpoint_url.clone(), node.bearer_token.clone(), Some(node.id));
         }
-        (default_url.to_string(), None, None)
+        (default_url.to_string(), self.config.llama_api_key.clone(), None)
     }
 
     /// Picks a node from the registry without falling back to static config.

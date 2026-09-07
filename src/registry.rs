@@ -475,13 +475,13 @@ pub async fn run_health_sweep(
     state: &std::sync::Arc<crate::state::GatewayState>,
     client: &reqwest::Client,
 ) {
-    let targets: Vec<(String, String)> = state
+    let targets: Vec<(String, String, Option<String>)> = state
         .registry
         .read()
         .await
         .nodes()
         .iter()
-        .map(|n| (n.id.clone(), n.probe_url()))
+        .map(|n| (n.id.clone(), n.probe_url(), n.bearer_token.clone()))
         .collect();
     if targets.is_empty() {
         return;
@@ -489,11 +489,19 @@ pub async fn run_health_sweep(
 
     let threshold = state.config.health_failure_threshold;
     let results = futures_util::stream::iter(targets)
-        .map(|(id, url)| async move {
+        .map(|(id, url, bearer)| async move {
             let start = Instant::now();
             // Any HTTP response below 500 proves the node is up — minimal
             // workers without a /health route (404/405) stay in the pool.
-            let ok = client.get(&url).send().await.map(|r| {
+            // Nodes behind an armed LLAMA_API_KEY answer 401 without the
+            // bearer, so attach the registered token when present.
+            let mut req = client.get(&url);
+            if let Some(token) = bearer {
+                if !token.is_empty() {
+                    req = req.bearer_auth(token);
+                }
+            }
+            let ok = req.send().await.map(|r| {
                 let s = r.status();
                 s.is_success() || s.is_redirection() || s.as_u16() == 404 || s.as_u16() == 405
             }).unwrap_or(false);

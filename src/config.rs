@@ -29,6 +29,9 @@ pub struct AppConfig {
     pub extract_fallback_url: String,
     /// Shared secret guarding the upstream-override admin API (CASCADE_ADMIN_KEY).
     pub admin_key: Option<String>,
+    /// Bearer token sent to local static llama upstreams (LLAMA_API_KEY).
+    /// Read once at startup; empty/unset means no header (today's behavior).
+    pub llama_api_key: Option<String>,
     /// Deterministic routing mode: none|inference|auxiliary|ocr (CASCADE_DEFAULT_ROUTE).
     pub default_route: Option<String>,
     /// Marker matching mode for doc/compression detection: substring|prefix.
@@ -186,6 +189,7 @@ impl AppConfig {
             extract_fallback_url: std::env::var("EXTRACT_FALLBACK_URL")
                 .unwrap_or_else(|_| "http://auxiliary-server:8080".to_string()),
             admin_key: std::env::var("CASCADE_ADMIN_KEY").ok().filter(|s| !s.is_empty()),
+            llama_api_key: std::env::var("LLAMA_API_KEY").ok().filter(|s| !s.is_empty()),
             default_route: std::env::var("CASCADE_DEFAULT_ROUTE").ok().filter(|s| !s.is_empty()),
             marker_mode: std::env::var("MARKER_MODE").unwrap_or_else(|_| "substring".to_string()),
 
@@ -250,7 +254,7 @@ impl AppConfig {
             name: "Local auxiliary server".to_string(),
             url: self.extract_fallback_url.clone(),
             model: Some(self.small_model_name.clone()),
-            api_key: None,
+            api_key: self.llama_api_key.clone(),
             enabled: true,
             priority: 99,
             max_cost_per_hour: None,
