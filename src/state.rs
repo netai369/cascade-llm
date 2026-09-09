@@ -1,5 +1,6 @@
 use crate::config::AppConfig;
 use crate::db::Db;
+use crate::intent_routing;
 use crate::language;
 use crate::types::*;
 
@@ -652,59 +653,12 @@ impl GatewayState {
         } else {
             headers.insert("content-type", HeaderValue::from_static("application/json"));
         }
-
-        fn normalize_event_json(raw: &str) -> Option<String> {
-            let trimmed = raw.trim();
-            if trimmed.is_empty() || trimmed == "[DONE]" {
-                return None;
-            }
-            let trimmed = trimmed.strip_prefix("data: ").unwrap_or(trimmed);
-            let trimmed = trimmed.strip_prefix("data:").unwrap_or(trimmed).trim();
-            if trimmed.is_empty() || trimmed == "[DONE]" {
-                return None;
-            }
-
-            let mut event: serde_json::Value = serde_json::from_str(trimmed).ok()?;
-            let delta = match event.get_mut("delta") {
-                Some(delta) => delta,
-                None => {
-                    return Some(format!("data: {}", trimmed));
-                }
-            };
-
-            info!(target: "cascade_llm::state", "NORMALIZE delta={}", serde_json::to_string(delta).unwrap_or_default());
-
-            if delta.get("tool_calls").is_some() || delta.get("function_call").is_some() {
-                return Some(format!("data: {}", trimmed));
-            }
-
-            if delta.get("role").is_none() {
-                delta["role"] = serde_json::Value::String("assistant".to_string());
-            }
-
-            let mut normalized = false;
-            if let Some(reasoning) = delta.get("reasoning_content").and_then(|v| v.as_str()) {
-                if !reasoning.is_empty() {
-                    delta["content"] = serde_json::Value::String(reasoning.to_string());
-                    delta.as_object_mut()?.remove("reasoning_content");
-                    normalized = true;
-                }
-            } else if let Some(reasoning) = delta.get("reasoning").and_then(|v| v.as_str()) {
-                if !reasoning.is_empty() {
-                    delta["content"] = serde_json::Value::String(reasoning.to_string());
-                    delta.as_object_mut()?.remove("reasoning");
-                    normalized = true;
-                }
-            }
-
-            if normalized {
-                Some(format!("data: {}", serde_json::to_string(&event).unwrap_or_default()))
-            } else {
-                Some(format!("data: {}", trimmed))
-            }
+        // Unified model identity header on every proxied response.
+        if let Ok(hv) = HeaderValue::from_str(&self.config.cascade_model_name) {
+            headers.insert("x-model-name", hv);
         }
 
-        fn emit_complete_sse_events(buffer: &mut Vec<u8>) -> Vec<u8> {
+        fn emit_complete_sse_events(buffer: &mut Vec<u8>, model_name: &str) -> Vec<u8> {
             info!(target: "cascade_llm::state", "EMIT: buffer_len={} first_bytes={:?}", buffer.len(), std::str::from_utf8(&buffer[..buffer.len().min(100)]).unwrap_or_default());
             let mut out = Vec::new();
             while let Some(idx) = buffer.windows(2).position(|w| w == b"\n\n") {
@@ -720,7 +674,7 @@ impl GatewayState {
                     out.extend_from_slice(b"data: [DONE]\n\n");
                     continue;
                 }
-                if let Some(normalized) = normalize_event_json(text) {
+                if let Some(normalized) = normalize_event_json(text, model_name) {
                     out.extend_from_slice(normalized.as_bytes());
                     out.extend_from_slice(b"\n\n");
                 }
@@ -735,7 +689,7 @@ impl GatewayState {
                 if text.is_empty() || text == "[DONE]" {
                     continue;
                 }
-                if let Some(normalized) = normalize_event_json(text) {
+                if let Some(normalized) = normalize_event_json(text, model_name) {
                     out.extend_from_slice(normalized.as_bytes());
                     out.extend_from_slice(b"\n\n");
                 }
@@ -743,17 +697,45 @@ impl GatewayState {
             out
         }
 
+        let cascade_model_name = self.config.cascade_model_name.clone();
         if is_streaming {
             let pending = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+            let model_name = cascade_model_name.clone();
+            let lp_monitor = std::sync::Arc::new(std::sync::Mutex::new(
+                crate::intent_routing::LogprobMonitor::new(),
+            ));
             let stream = backend_response.bytes_stream().map(move |item| {
-                let mut chunk = match item {
+                let chunk = match item {
                     Ok(c) => c,
                     Err(e) => return Err(std::io::Error::new(std::io::ErrorKind::Other, e)),
                 };
 
                 let mut local = pending.lock().unwrap();
                 local.extend_from_slice(&chunk);
-                let ready = emit_complete_sse_events(&mut local);
+
+                // Cascade fallback: suppress the <.CASCADE_FALLBACK>. tag, and
+                // monitor token logprobs (MA5 < -1.8) as a second uncertainty
+                // signal.  If either fires we log and drop the offending chunk —
+                // rerouting a stream that is already in-flight is not possible,
+                // so the intent-based pre-bypass is the primary mechanism.
+                if let Ok(text) = std::str::from_utf8(&local) {
+                    let tag_hit = text.contains(crate::intent_routing::FALLBACK_TAG);
+                    let lp_hit = {
+                        let mut m = lp_monitor.lock().unwrap();
+                        crate::intent_routing::check_chunk_logprobs(text, &mut m)
+                    };
+                    if tag_hit || lp_hit {
+                        tracing::warn!(
+                            "CASCADE_FALLBACK: tag={} logprob_low={} — suppressing chunk",
+                            tag_hit,
+                            lp_hit
+                        );
+                        local.clear();
+                        return Ok(axum::body::Bytes::new());
+                    }
+                }
+
+                let ready = emit_complete_sse_events(&mut local, &model_name);
                 drop(local);
 
                 if ready.is_empty() {
@@ -772,6 +754,12 @@ impl GatewayState {
             .map_err(|_| ProxyError::unreachable(StatusCode::SERVICE_UNAVAILABLE, url, "failed to read backend response"))?;
 
         if let Ok(mut event) = serde_json::from_slice::<serde_json::Value>(&body_bytes) {
+            // Unified model identity: rewrite backend model id.
+            if let Some(model) = event.get_mut("model") {
+                if model.as_str() != Some(cascade_model_name.as_str()) {
+                    *model = serde_json::Value::String(cascade_model_name.clone());
+                }
+            }
             if let Some(choices) = event.get_mut("choices").and_then(|c| c.as_array_mut()) {
                 if let Some(choice) = choices.get_mut(0) {
                     if let Some(delta) = choice.get_mut("delta") {
@@ -893,6 +881,16 @@ impl GatewayState {
         origin: &str,
     ) -> Result<(HeaderMap, Body), ProxyError> {
         let mut decision = self.inspect_route(&payload, headers).await;
+        // Intent-based routing: planning/design/security/meta → force large model.
+        let intent = intent_routing::inspect_intent(&payload);
+        if intent.direct_to_large && matches!(decision, RouteDecision::Auxiliary | RouteDecision::Auto) {
+            info!(
+                "INTENT_ROUTING: intent={} → forcing Inference (was {:?})",
+                intent.intent.label(),
+                decision,
+            );
+            decision = RouteDecision::Inference;
+        }
         // Settings: tools-bearing requests go to the large model (deterministic).
         let has_tools = payload.tools.is_some() || payload.functions.is_some();
         if has_tools && self.runtime.read().await.route_tools_to_large {
@@ -1124,6 +1122,21 @@ impl GatewayState {
         headers: &HeaderMap,
         origin: &str,
     ) -> Result<(HeaderMap, Body), ProxyError> {
+        // Intent-based bypass: planning/design/security/meta → skip small model entirely.
+        let intent = intent_routing::inspect_intent(&payload);
+        if intent.direct_to_large {
+            let language = language::detect_language(&payload.messages);
+            info!(
+                "AUTO_INTENT: intent={} → routing directly to large model (skipping small)",
+                intent.intent.label(),
+            );
+            let mut payload = payload.clone();
+            self.inline_all_images(&mut payload).await;
+            payload = language::inject_language_prompt(language, payload);
+            let (url, bearer, node) = self.resolve_upstream("main", &self.config.large_text_url).await;
+            self.apply_node_model(&mut payload, &node).await;
+            return self.private_proxy_with_bearer(&payload, &url, bearer.as_deref(), RouteBackend::InferenceServer, is_streaming, origin, node.as_deref()).await;
+        }
         let has_image = self.has_image(&payload);
         let has_tools = payload.tools.is_some() || payload.functions.is_some();
         let complexity_score = self.evaluate_complexity(&payload.messages);
@@ -1252,6 +1265,9 @@ impl GatewayState {
         if small_payload.max_tokens.is_none() {
             small_payload.max_tokens = Some(4096);
         }
+        // Small model gets the cascade fallback instruction: emit
+        // <CASCADE_FALLBACK> when out of its depth (stream parser reroutes).
+        language::append_fallback_instruction(&mut small_payload);
 
         if is_streaming {
             let mut result = self.proxy_to_backend(&small_payload, &target_url, None, true, origin, &mut None).await;
@@ -1701,5 +1717,122 @@ impl GatewayState {
             .bytes_stream()
             .map(|item| item.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)));
         Ok((headers, Body::from_stream(stream)))
+    }
+}
+
+/// Normalize a single SSE chunk forwarded to the client:
+/// - rewrite the backend model id to the unified `cascade_model_name`
+/// - move `reasoning_content`/`reasoning` deltas into `content`
+/// Returns `None` for non-chunk frames (keepalives, `[DONE]`).
+fn normalize_event_json(raw: &str, model_name: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed == "[DONE]" {
+        return None;
+    }
+    let trimmed = trimmed.strip_prefix("data: ").unwrap_or(trimmed);
+    let trimmed = trimmed.strip_prefix("data:").unwrap_or(trimmed).trim();
+    if trimmed.is_empty() || trimmed == "[DONE]" {
+        return None;
+    }
+
+    let Ok(mut event) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+        return Some(format!("data: {}", trimmed));
+    };
+
+    // Unified model identity: rewrite backend model id in every chunk.
+    if let Some(model) = event.get_mut("model") {
+        if model.as_str() != Some(model_name) {
+            *model = serde_json::Value::String(model_name.to_string());
+        }
+    }
+
+    // Delta lives under choices[0].delta in the OpenAI SSE shape.
+    let Some(delta) = event
+        .get_mut("choices")
+        .and_then(|c| c.as_array_mut())
+        .and_then(|c| c.get_mut(0))
+        .and_then(|c| c.get_mut("delta"))
+    else {
+        return Some(format!("data: {}", serde_json::to_string(&event).unwrap_or_default()));
+    };
+
+    info!(target: "cascade_llm::state", "NORMALIZE delta={}", serde_json::to_string(delta).unwrap_or_default());
+
+    if delta.get("tool_calls").is_some() || delta.get("function_call").is_some() {
+        return Some(format!("data: {}", serde_json::to_string(&event).unwrap_or_default()));
+    }
+
+    if delta.get("role").is_none() {
+        delta["role"] = serde_json::Value::String("assistant".to_string());
+    }
+
+    if let Some(reasoning) = delta.get("reasoning_content").and_then(|v| v.as_str()) {
+        if !reasoning.is_empty() {
+            delta["content"] = serde_json::Value::String(reasoning.to_string());
+            if let Some(obj) = delta.as_object_mut() {
+                obj.remove("reasoning_content");
+            }
+        }
+    } else if let Some(reasoning) = delta.get("reasoning").and_then(|v| v.as_str()) {
+        if !reasoning.is_empty() {
+            delta["content"] = serde_json::Value::String(reasoning.to_string());
+            if let Some(obj) = delta.as_object_mut() {
+                obj.remove("reasoning");
+            }
+        }
+    }
+
+    Some(format!("data: {}", serde_json::to_string(&event).unwrap_or_default()))
+}
+
+#[cfg(test)]
+mod normalize_tests {
+    use super::normalize_event_json;
+
+    #[test]
+    fn rewrites_model_and_moves_reasoning_content() {
+        let chunk = r#"data: {"choices":[{"finish_reason":null,"index":0,"delta":{"reasoning_content":"\nThe"}}],"created":1788978989,"id":"chatcmpl-x","model":"/models/gguf.backend.gguf","object":"chat.completion.chunk"}"#;
+        let out = normalize_event_json(chunk, "cascade-hybrid-v1").unwrap();
+        assert!(out.contains("\"model\":\"cascade-hybrid-v1\""), "model rewritten: {out}");
+        assert!(out.contains("\"content\":\"\\nThe\""), "reasoning moved to content: {out}");
+        assert!(!out.contains("reasoning_content"), "reasoning_content removed: {out}");
+    }
+
+    #[test]
+    fn rewrites_model_on_plain_content_chunk() {
+        let chunk = r#"data: {"choices":[{"finish_reason":null,"index":0,"delta":{"role":"assistant","content":null}}],"created":1,"id":"chatcmpl-x","model":"/models/raw.gguf","object":"chat.completion.chunk"}"#;
+        let out = normalize_event_json(chunk, "cascade-hybrid-v1").unwrap();
+        assert!(out.contains("\"model\":\"cascade-hybrid-v1\""));
+        assert!(!out.contains("/models/raw.gguf"));
+    }
+
+    #[test]
+    fn rewrites_model_on_tool_call_chunk() {
+        let chunk = r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"x\":1}"}}]},"finish_reason":null,"index":0}],"id":"chatcmpl-x","model":"/models/raw.gguf","object":"chat.completion.chunk"}"#;
+        let out = normalize_event_json(chunk, "cascade-hybrid-v1").unwrap();
+        assert!(out.contains("\"model\":\"cascade-hybrid-v1\""));
+        assert!(out.contains("tool_calls"));
+    }
+
+    #[test]
+    fn passthrough_invalid_json() {
+        let out = normalize_event_json("data: not json at all", "cascade-hybrid-v1").unwrap();
+        assert_eq!(out, "data: not json at all");
+    }
+
+    #[test]
+    fn drops_done_frame() {
+        assert!(normalize_event_json("data: [DONE]", "cascade-hybrid-v1").is_none());
+        assert!(normalize_event_json("", "cascade-hybrid-v1").is_none());
+    }
+
+    #[test]
+    fn preserves_reasoning_model_rewrite_when_no_reasoning_key() {
+        // Backend /v1/completions chunks (non-chat) have no delta at all —
+        // model rewrite must still be applied and serialized.
+        let chunk = r#"data: {"choices":[{"text":"Hello","finish_reason":"length","index":0}],"model":"/models/base.bin","object":"text_completion","id":"cmpl"}"#;
+        let out = normalize_event_json(chunk, "cascade-hybrid-v1").unwrap();
+        assert!(out.contains("\"model\":\"cascade-hybrid-v1\""));
+        assert!(out.contains("\"text\":\"Hello\""));
     }
 }

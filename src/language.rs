@@ -83,6 +83,11 @@ pub fn extract_text(messages: &[ChatMessage]) -> String {
     text
 }
 
+/// Fallback instruction appended to the small model's system prompt.
+/// If the small model emits this tag in its response, the stream parser
+/// detects it and reroutes to the large model.
+pub const FALLBACK_INSTRUCTION: &str = "\n\n[CASCADE ROUTING] If the task is complex, planning, architecture, design, security-sensitive, or meta-analytical and you cannot handle it with confidence, output the tag <CASCADE_FALLBACK> on its own line at the start of your response. This signals the gateway to route to the larger model. Do NOT invent content for tasks beyond your capability — emit the tag instead.";
+
 pub fn get_system_prompt(language: &str) -> &'static str {
     match language {
         "de" => "Antworte immer auf Deutsch. Sei hilfreich und präzise.",
@@ -94,6 +99,34 @@ pub fn get_system_prompt(language: &str) -> &'static str {
         "sl" => "Vedno odgovarjaj v slovenščini. Bodi koristen in jedrnat.",
         "hr" => "Uvijek odgovaraj na hrvatskom. Bud koristan i sažet.",
         _ => "Always respond in English. Be helpful and concise.",
+    }
+}
+
+/// Returns the system prompt for the small model, including the cascade
+/// fallback instruction. Used by the Auto routing path when sending to
+/// the auxiliary backend.
+pub fn get_small_model_system_prompt(language: &str) -> String {
+    let base = get_system_prompt(language);
+    format!("{}{}", base, FALLBACK_INSTRUCTION)
+}
+
+/// Append the cascade fallback instruction to the active system message.
+/// The instruction tells the small model to emit `<CASCADE_FALLBACK>` when
+/// the task exceeds its capability, which the stream parser then reroutes.
+pub fn append_fallback_instruction(payload: &mut ChatCompletionRequest) {
+    if let Some(sys_msg) = payload.messages.iter_mut().find(|m| m.role == "system") {
+        let suffix = FALLBACK_INSTRUCTION.to_string();
+        match &mut sys_msg.content {
+            Some(MessageContent::Text(text)) => {
+                *text = format!("{}{}", text, suffix);
+            }
+            Some(MessageContent::Parts(parts)) => {
+                parts.push(MessageContentPart::Text { text: suffix });
+            }
+            None => {
+                sys_msg.content = Some(MessageContent::Text(suffix));
+            }
+        }
     }
 }
 

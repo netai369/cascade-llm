@@ -250,6 +250,11 @@ pub async fn list_models(State(state): State<Arc<GatewayState>>) -> Response {
         ocr_models
     });
 
+    // Unified model identity: prepend the cascade-hybrid model so
+    // clients (LibreChat, Hermes, etc.) see one stable model name.
+    let hybrid = build_model_info(&state.config.cascade_model_name);
+    all_models.insert(0, serde_json::to_value(hybrid).unwrap_or_default());
+
     json_response(
         serde_json::json!({
             "data": all_models,
@@ -260,7 +265,7 @@ pub async fn list_models(State(state): State<Arc<GatewayState>>) -> Response {
 }
 
 pub async fn get_model(State(state): State<Arc<GatewayState>>) -> Response {
-    let model = build_model_info(&state.config.main_model_name);
+    let model = build_model_info(&state.config.cascade_model_name);
     json_response(serde_json::to_value(model).unwrap(), StatusCode::OK)
 }
 

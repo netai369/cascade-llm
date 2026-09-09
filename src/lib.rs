@@ -8,6 +8,7 @@ pub mod cascade_features;
 pub mod config;
 pub mod db;
 pub mod handlers;
+pub mod intent_routing;
 pub mod language;
 pub mod media;
 pub mod providers;

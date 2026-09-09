@@ -9,6 +9,9 @@ pub struct AppConfig {
     pub main_model_name: String,
     pub small_model_name: String,
     pub ocr_model_name: String,
+    /// Unified model identity advertised in /v1/models, /model, x-model-name
+    /// header, and streaming chunks. Default: "cascade-hybrid-v1".
+    pub cascade_model_name: String,
     pub router_threshold: f64,
     pub confidence_threshold: f64,
     pub large_model_multimodal: bool,
@@ -149,6 +152,8 @@ impl AppConfig {
                 .unwrap_or_else(|_| "LFM2.5-2.6B".to_string()),
             ocr_model_name: std::env::var("OCR_MODEL_NAME")
                 .unwrap_or_else(|_| "PaddleOCR-VL-1.6".to_string()),
+            cascade_model_name: std::env::var("CASCADE_MODEL_NAME")
+                .unwrap_or_else(|_| "cascade-hybrid-v1".to_string()),
             router_threshold: std::env::var("ROUTER_THRESHOLD")
                 .unwrap_or_else(|_| "0.5".to_string())
                 .parse::<f64>()
