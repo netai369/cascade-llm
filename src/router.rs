@@ -31,6 +31,7 @@ pub fn build_router(state: Arc<GatewayState>) -> Router {
         .route("/", get(handlers::dashboard))
         .route("/web/", get(handlers::dashboard))
         .route("/web/settings", get(handlers::settings_page))
+        .route("/web/docs/:name", get(handlers::docs_page))
         .route("/web/api/dashboard", get(handlers::dashboard_api))
         .route(
             "/web/api/settings",

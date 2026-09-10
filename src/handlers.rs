@@ -343,6 +343,36 @@ pub async fn settings_page(_state: State<Arc<GatewayState>>) -> Response {
         .unwrap()
 }
 
+const DOCS: &[(&str, &str)] = &[
+    (
+        "routing-settings.md",
+        include_str!("../docs/routing-settings.md"),
+    ),
+    (
+        "dynamic-upstreams.md",
+        include_str!("../docs/dynamic-upstreams.md"),
+    ),
+];
+
+/// Serves the built-in markdown docs (settings reference / dynamic upstreams),
+/// so the settings-page links resolve on the offline stack.
+pub async fn docs_page(axum::extract::Path(name): axum::extract::Path<String>) -> Response {
+    for (doc, body) in DOCS {
+        if *doc == name {
+            return Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "text/markdown; charset=utf-8")
+                .body(Body::from(*body))
+                .unwrap();
+        }
+    }
+    Response::builder()
+        .status(StatusCode::NOT_FOUND)
+        .header("content-type", "application/json")
+        .body(Body::from(r#"{"error":"doc not found"}"#))
+        .unwrap()
+}
+
 /// Canonical settings mount is /web/settings; redirect keeps relative links
 /// working when the dashboard is served from "/".
 pub async fn settings_redirect(_state: State<Arc<GatewayState>>) -> Response {
