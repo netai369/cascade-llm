@@ -1786,7 +1786,11 @@ fn normalize_event_json(raw: &str, model_name: &str) -> Option<String> {
     }
 
     let Ok(mut event) = serde_json::from_str::<serde_json::Value>(trimmed) else {
-        return Some(format!("data: {}", trimmed));
+        // Not a JSON chat chunk. OpenAI-compatible clients JSON.parse every
+        // `data:` event, so forwarding raw non-JSON (llama.cpp SSE keep-alive
+        // comments like a bare `:`) made LibreChat agents fatal:
+        // "Unexpected token ':' is not valid JSON". Drop instead of wrapping.
+        return None;
     };
 
     // Unified model identity: rewrite backend model id in every chunk.
@@ -1873,9 +1877,11 @@ mod normalize_tests {
     }
 
     #[test]
-    fn passthrough_invalid_json() {
-        let out = normalize_event_json("data: not json at all", "cascade-hybrid-v1").unwrap();
-        assert_eq!(out, "data: not json at all");
+    fn drops_non_json_frames() {
+        assert!(normalize_event_json("data: not json at all", "cascade-hybrid-v1").is_none());
+        assert!(normalize_event_json(":", "cascade-hybrid-v1").is_none());
+        assert!(normalize_event_json(": keepalive", "cascade-hybrid-v1").is_none());
+        assert!(normalize_event_json("data: :", "cascade-hybrid-v1").is_none());
     }
 
     #[test]
