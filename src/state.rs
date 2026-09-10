@@ -711,28 +711,49 @@ impl GatewayState {
                 };
 
                 let mut local = pending.lock().unwrap();
+                let chunk_start = local.len();
                 local.extend_from_slice(&chunk);
 
-                // Cascade fallback: suppress the <.CASCADE_FALLBACK>. tag, and
+                // Cascade fallback: strip <.CASCADE_FALLBACK>. markers and
                 // monitor token logprobs (MA5 < -1.8) as a second uncertainty
-                // signal.  If either fires we log and drop the offending chunk —
-                // rerouting a stream that is already in-flight is not possible,
-                // so the intent-based pre-bypass is the primary mechanism.
-                if let Ok(text) = std::str::from_utf8(&local) {
-                    let tag_hit = text.contains(crate::intent_routing::FALLBACK_TAG);
-                    let lp_hit = {
-                        let mut m = lp_monitor.lock().unwrap();
-                        crate::intent_routing::check_chunk_logprobs(text, &mut m)
+                // signal.  Rerouting a stream that is already in-flight is not
+                // possible — the intent-based pre-bypass (and the non-streaming
+                // FALLBACK_TAG reroute) are the primary mechanisms, this only
+                // keeps the marker out of the client's text.
+                let (tag_hit, lp_hit) = {
+                    let text = std::str::from_utf8(&local[..]).unwrap_or_default();
+                    (
+                        text.contains(crate::intent_routing::FALLBACK_TAG),
+                        {
+                            let mut m = lp_monitor.lock().unwrap();
+                            crate::intent_routing::check_chunk_logprobs(text, &mut m)
+                        },
+                    )
+                };
+                if tag_hit {
+                    tracing::warn!("CASCADE_FALLBACK: small-model marker detected — stripping from stream");
+                    let cleaned: Vec<u8> = {
+                        let text = &local[..];
+                        let tag: &[u8] = crate::intent_routing::FALLBACK_TAG.as_bytes();
+                        let mut out = Vec::with_capacity(text.len());
+                        let mut i = 0;
+                        while i < text.len() {
+                            if text[i..].starts_with(tag) {
+                                i += tag.len();
+                            } else {
+                                out.push(text[i]);
+                                i += 1;
+                            }
+                        }
+                        out
                     };
-                    if tag_hit || lp_hit {
-                        tracing::warn!(
-                            "CASCADE_FALLBACK: tag={} logprob_low={} — suppressing chunk",
-                            tag_hit,
-                            lp_hit
-                        );
-                        local.clear();
-                        return Ok(axum::body::Bytes::new());
-                    }
+                    local.clear();
+                    local.extend_from_slice(&cleaned);
+                } else if lp_hit {
+                    // The chunk pushed average logprobs below threshold —
+                    // drop just this Network chunk, keep prior buffered text.
+                    tracing::warn!("CASCADE_FALLBACK: low-logprob content dropped");
+                    local.truncate(chunk_start);
                 }
 
                 let ready = emit_complete_sse_events(&mut local, &model_name);
@@ -762,20 +783,21 @@ impl GatewayState {
             }
             if let Some(choices) = event.get_mut("choices").and_then(|c| c.as_array_mut()) {
                 if let Some(choice) = choices.get_mut(0) {
-                    if let Some(delta) = choice.get_mut("delta") {
+                    // Tool-call payloads are forwarded verbatim (model rewrite
+                    // skipped) so client tool orchestration sees ids/functions
+                    // exactly as the backend produced them.
+                    if let Some(delta) = choice.get("delta") {
                         if delta.get("tool_calls").is_some() || delta.get("function_call").is_some() {
                             return Ok((headers, Body::from(body_bytes)));
                         }
-                        if let Some(reasoning) = delta.get("reasoning_content").and_then(|v| v.as_str()) {
-                            if !reasoning.is_empty() {
-                                delta["content"] = serde_json::Value::String(reasoning.to_string());
-                                delta.as_object_mut().unwrap().remove("reasoning_content");
-                            }
-                        } else if let Some(reasoning) = delta.get("reasoning").and_then(|v| v.as_str()) {
-                            if !reasoning.is_empty() {
-                                delta["content"] = serde_json::Value::String(reasoning.to_string());
-                                delta.as_object_mut().unwrap().remove("reasoning");
-                            }
+                    }
+                    // Reasoning (reasoning_content/reasoning/… ) is intentionally
+                    // passed through UNMERGED — it lives in its own field so
+                    // consumers that hide reasoning (Hermes show_reasoning:false,
+                    // LibreChat) can do so. Never fold it into `content`.
+                    if let Some(msg) = choice.get("message") {
+                        if msg.get("tool_calls").is_some() || msg.get("function_call").is_some() {
+                            return Ok((headers, Body::from(body_bytes)));
                         }
                     }
                 }
@@ -1189,20 +1211,31 @@ impl GatewayState {
             .is_backend_available(&self.config.large_text_url, &self.config.large_mllm_url)
             .await;
 
-        let mut target_override = if let Some(url) = cached_route {
-            info!("SESSION AFFINITY: candidate from cache target_url={}", url);
-            Some(url)
-        } else if history_has_tools {
-            info!("SESSION AFFINITY: History has tools but no cached route. Forcing large model target_url={}", large_url);
+        let route_tools_to_large = self.runtime.read().await.route_tools_to_large;
+        let mut target_override = if history_has_tools {
+            // Tool-carrying conversations ALWAYS go to the large model — the
+            // small aux backend struggles with multi-step tool orchestration.
+            // This takes precedence over any cached small-model affinity.
+            info!("SESSION AFFINITY: History has tools -> forcing large model target_url={}", large_url);
             if let Some(ref key) = session_key {
                 self.session_cache
                     .insert(key.clone(), large_url.clone())
                     .await;
             }
             Some(large_url.clone())
+        } else if let Some(url) = cached_route {
+            info!("SESSION AFFINITY: candidate from cache target_url={}", url);
+            Some(url)
         } else {
             None
         };
+
+        // ROUTE_TOOLS_TO_LARGE (settings page): keep tool *selection* on the
+        // big model even when the fresh payload (not the history) declares tools.
+        if has_tools && route_tools_to_large && target_override.is_none() {
+            info!("ROUTE_TOOLS_TO_LARGE: payload has tools, routing to large directly");
+            target_override = Some(large_url.clone());
+        }
 
         if let Some(ref _url) = target_override {
             if has_image && !self.config.large_model_multimodal {
@@ -1333,6 +1366,37 @@ impl GatewayState {
 
         self.circuit_breaker.record_success(&target_url).await;
 
+        // Shared reroute helper: re-sends the ORIGINAL (language-injected,
+        // pre-small) payload to the large model and tags the response.
+        let reroute_to_large = async {
+            self.metrics.record_fallback("quality_low");
+            let mut result = self
+                .proxy_to_backend(&injected_payload, &large_url, None, false, origin, &mut None)
+                .await;
+            if let Ok(parts) = result.as_mut() {
+                if let Ok(v) = HeaderValue::from_str("auto-large") {
+                    parts.0.insert("x-cascade-route", v);
+                }
+            }
+            if result.is_ok() {
+                self.circuit_breaker.record_success(&large_url).await;
+                if let Some(ref key) = session_key {
+                    self.session_cache.insert(key.clone(), large_url.clone()).await;
+                }
+            }
+            self.metrics.record_request("large");
+            result
+        };
+
+        // The small model may have declared the task beyond its capability
+        // (<CASCADE_FALLBACK> tag from get_small_model_system_prompt) — in
+        // that case reroute the ORIGINAL request to the large model.
+        let body_text = std::str::from_utf8(&body_bytes).unwrap_or_default();
+        if body_text.contains(crate::intent_routing::FALLBACK_TAG) {
+            info!("SMALL MODEL fallback tag detected, rerouting original request to large model");
+            return reroute_to_large.await;
+        }
+
         let confidence = self.extract_confidence(&body_bytes);
         let keep_small = match confidence {
             Some(c) if c >= self.runtime.read().await.confidence_threshold => {
@@ -1366,21 +1430,7 @@ impl GatewayState {
         }
 
         info!("Rerouting original request to large text model");
-        self.metrics.record_fallback("quality_low");
-        let mut result = self.proxy_to_backend(&injected_payload, &large_url, None, false, origin, &mut None).await;
-        if let Ok(parts) = result.as_mut() {
-            if let Ok(v) = HeaderValue::from_str("auto-large") {
-                parts.0.insert("x-cascade-route", v);
-            }
-        }
-        if result.is_ok() {
-            self.circuit_breaker.record_success(&large_url).await;
-            if let Some(ref key) = session_key {
-                self.session_cache.insert(key.clone(), large_url.clone()).await;
-            }
-        }
-        self.metrics.record_request("large");
-        result
+        reroute_to_large.await
     }
 
     fn extract_confidence(&self, body: &[u8]) -> Option<f64> {
@@ -1756,7 +1806,11 @@ fn normalize_event_json(raw: &str, model_name: &str) -> Option<String> {
         return Some(format!("data: {}", serde_json::to_string(&event).unwrap_or_default()));
     };
 
-    info!(target: "cascade_llm::state", "NORMALIZE delta={}", serde_json::to_string(delta).unwrap_or_default());
+    // Keep the NORMALIZE trace log minimal: log shapes, never reasoning
+    // content (chain-of-thought must not land in gateway logs).
+    if delta.get("reasoning_content").is_some() || delta.get("reasoning").is_some() {
+        info!(target: "cascade_llm::state", "NORMALIZE chunk with reasoning delta (passthrough)");
+    }
 
     if delta.get("tool_calls").is_some() || delta.get("function_call").is_some() {
         return Some(format!("data: {}", serde_json::to_string(&event).unwrap_or_default()));
@@ -1766,22 +1820,12 @@ fn normalize_event_json(raw: &str, model_name: &str) -> Option<String> {
         delta["role"] = serde_json::Value::String("assistant".to_string());
     }
 
-    if let Some(reasoning) = delta.get("reasoning_content").and_then(|v| v.as_str()) {
-        if !reasoning.is_empty() {
-            delta["content"] = serde_json::Value::String(reasoning.to_string());
-            if let Some(obj) = delta.as_object_mut() {
-                obj.remove("reasoning_content");
-            }
-        }
-    } else if let Some(reasoning) = delta.get("reasoning").and_then(|v| v.as_str()) {
-        if !reasoning.is_empty() {
-            delta["content"] = serde_json::Value::String(reasoning.to_string());
-            if let Some(obj) = delta.as_object_mut() {
-                obj.remove("reasoning");
-            }
-        }
-    }
-
+    // Reasoning/thinking is deliberately NOT merged into `content`.  The small
+    // and large backends surface chain-of-thought via `reasoning_content`
+    // (llama.cpp Qwen/Gemma-style); OpenAI-compatible clients like Hermes
+    // render only `content` and optionally expose reasoning separately
+    // (show_reasoning).  Merging here leaks the whole CoT into the visible
+    // answer (regression 2026-09-10: Hermes "Opencode ssh" session).
     Some(format!("data: {}", serde_json::to_string(&event).unwrap_or_default()))
 }
 
@@ -1790,12 +1834,26 @@ mod normalize_tests {
     use super::normalize_event_json;
 
     #[test]
-    fn rewrites_model_and_moves_reasoning_content() {
+    fn rewrites_model_and_preserves_reasoning_content() {
         let chunk = r#"data: {"choices":[{"finish_reason":null,"index":0,"delta":{"reasoning_content":"\nThe"}}],"created":1788978989,"id":"chatcmpl-x","model":"/models/gguf.backend.gguf","object":"chat.completion.chunk"}"#;
         let out = normalize_event_json(chunk, "cascade-hybrid-v1").unwrap();
         assert!(out.contains("\"model\":\"cascade-hybrid-v1\""), "model rewritten: {out}");
-        assert!(out.contains("\"content\":\"\\nThe\""), "reasoning moved to content: {out}");
-        assert!(!out.contains("reasoning_content"), "reasoning_content removed: {out}");
+        assert!(
+            out.contains("reasoning_content"),
+            "reasoning must stay separate (NOT merged into content): {out}"
+        );
+        assert!(
+            !out.contains("\"content\":\"\\nThe\""),
+            "CoT must not leak into content: {out}"
+        );
+    }
+
+    #[test]
+    fn preserves_other_reasoning_field_names() {
+        let chunk = r#"data: {"choices":[{"delta":{"reasoning":"<thinking>plan</thinking>"}}],"id":"chatcmpl-x","model":"/models/raw.gguf","object":"chat.completion.chunk"}"#;
+        let out = normalize_event_json(chunk, "cascade-hybrid-v1").unwrap();
+        assert!(out.contains("\"reasoning\":\"<thinking>"));
+        assert!(!out.contains("\"content\":\"<thinking>"));
     }
 
     #[test]
