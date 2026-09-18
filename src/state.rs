@@ -398,14 +398,27 @@ impl GatewayState {
     }
 
     /// Maps a hint string to a concrete route decision.
-    fn hint_to_decision(&self, hint: &str) -> RouteDecision {
+    ///
+    /// Accepts both the short aliases and the canonical resource names the
+    /// settings page documents as `x-cascade-route` values
+    /// (`inference-server`, `auxiliary-server`, `auto-small`, `auto-large`,
+    /// `session-affinity`). Without the canonical names, `auxiliary-server`
+    /// silently fell through to `Inference` — the opposite of what the docs
+    /// promise (regression caught wiring voice-chat-v2's realtime path).
+    fn hint_to_decision(hint: &str) -> RouteDecision {
         match hint {
             "ocr" | "vision" | "document" | "doc" | "docparse" | "vlm" | "image" | "images" => {
                 RouteDecision::Ocr
             }
-            "aux" | "auxiliary" | "compression" | "compress" | "compaction" | "summary"
-            | "summarize" | "subagent" | "agent" => RouteDecision::Auxiliary,
-            "auto" | "adaptive" | "complexity" | "legacy" => RouteDecision::Auto,
+            "aux" | "auxiliary" | "auxiliary-server" | "small" | "small-server"
+            | "compression" | "compress" | "compaction" | "summary" | "summarize"
+            | "subagent" | "agent" => RouteDecision::Auxiliary,
+            "auto" | "adaptive" | "complexity" | "legacy"
+            | "auto-small" | "auto-large" | "session-affinity" => RouteDecision::Auto,
+            "inference" | "inference-server" | "main" | "large" | "large-server" => {
+                RouteDecision::Inference
+            }
+            // Unknown hints keep the historical behavior: treat as main.
             _ => RouteDecision::Inference,
         }
     }
@@ -546,7 +559,7 @@ impl GatewayState {
         }
         // Explicit header hint wins for OCR / aux / auto.
         if let Some(hint) = self.header_route_hint(headers) {
-            let decision = self.hint_to_decision(&hint);
+            let decision = Self::hint_to_decision(&hint);
             if decision == RouteDecision::Ocr {
                 // Dynamic OCR route: honoured whenever an active `ocr` node is
                 // registered; otherwise content detection decides (the static
@@ -573,7 +586,7 @@ impl GatewayState {
 
         // Metadata / top-level body hint.
         if let Some(hint) = self.payload_route_hint(payload) {
-            let decision = self.hint_to_decision(&hint);
+            let decision = Self::hint_to_decision(&hint);
             if decision == RouteDecision::Auxiliary && !self.has_image(payload) {
                 info!("ROUTE_BODY_HINT: '{hint}' -> auxiliary");
                 return decision;
@@ -1419,6 +1432,10 @@ impl GatewayState {
             }
             let mut hdrs = HeaderMap::new();
             hdrs.insert("content-type", HeaderValue::from_static("application/json"));
+            // Documented response header (docs/routing-settings.md): the
+            // small-success path used to return no x-cascade-route at all,
+            // making adaptive routing invisible to callers.
+            hdrs.insert("x-cascade-route", HeaderValue::from_static("auto-small"));
             if let Some(c) = confidence {
                 let val = format!("{:.4}", c);
                 if let Ok(hv) = HeaderValue::from_str(&val) {
@@ -1898,5 +1915,49 @@ mod normalize_tests {
         let out = normalize_event_json(chunk, "cascade-hybrid-v1").unwrap();
         assert!(out.contains("\"model\":\"cascade-hybrid-v1\""));
         assert!(out.contains("\"text\":\"Hello\""));
+    }
+}
+
+#[cfg(test)]
+mod route_hint_tests {
+    use super::{GatewayState, RouteDecision};
+
+    // GatewayState::hint_to_decision is the single mapping used by both header and
+    // body route hints. The canonical values documented in the settings page
+    // and docs/routing-settings.md must resolve to their real backends.
+    #[test]
+    fn canonical_resource_names_map_to_expected_decisions() {
+        use RouteDecision::*;
+        for (hint, want) in [
+            ("inference-server", Inference),
+            ("main", Inference),
+            ("large", Inference),
+            ("auxiliary-server", Auxiliary),
+            ("small", Auxiliary),
+            ("auxiliary", Auxiliary),
+            ("compression", Auxiliary),
+            ("auto-small", Auto),
+            ("auto-large", Auto),
+            ("session-affinity", Auto),
+            ("auto", Auto),
+            ("ocr", Ocr),
+            ("vision", Ocr),
+            ("rag-worker", Inference),
+        ] {
+            assert_eq!(
+                GatewayState::hint_to_decision(hint),
+                want,
+                "hint {hint:?} mapped incorrectly"
+            );
+        }
+    }
+
+    #[test]
+    fn is_case_sensitive_after_lowercasing_callers() {
+        // header_route_hint lowercases before calling; document that contract.
+        assert_eq!(
+            GatewayState::hint_to_decision("auxiliary-server"),
+            RouteDecision::Auxiliary
+        );
     }
 }
