@@ -231,6 +231,7 @@ pub struct ModelInfo {
     pub permission: Vec<ModelPermission>,
     pub root: String,
     pub parent: Option<String>,
+    pub description: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -261,6 +262,11 @@ pub fn build_model_info(id: &str) -> ModelInfo {
         }],
         root: id.to_string(),
         parent: None,
+        description: match id {
+            "cascade-hybrid-v1" => "Unified Cascade model identity. Requests are classified and routed to the configured main or auxiliary inference node; this is not a separate model file.".to_string(),
+            "docling-serve" => "Document processing/OCR service advertised by the configured extraction backend. It is used for document ingestion, not ordinary chat completion.".to_string(),
+            _ => "Model advertised by the Cascade gateway.".to_string(),
+        },
     }
 }
 
@@ -280,6 +286,8 @@ pub struct ProviderConfig {
     pub priority: u32,
     #[serde(default)]
     pub capabilities: ProviderCapabilities,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub use_as: Option<String>,
 }
 
 fn default_true() -> bool { true }

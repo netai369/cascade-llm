@@ -22,7 +22,7 @@
       font-size: 1.1rem; text-decoration: none; color: var(--accent);
       margin-left: 0.6rem; flex-shrink: 0;
     }
-    main { max-width: 900px; margin: 0 auto; padding: 1.5rem 1rem; }
+    main { max-width: 980px; margin: 0 auto; padding: 1.5rem 1rem; }
     .section {
       background: var(--card);
       border: 1px solid var(--card-border); border-radius: 12px;
@@ -53,6 +53,8 @@
       padding: 0.8rem; border-radius: 8px; margin-bottom: 0.5rem;
       background: var(--input-bg); border: 1px solid var(--card-border);
     }
+    .provider-item .role { color: var(--accent); font-size: 0.75rem; text-transform: uppercase; letter-spacing: .04em; }
+    .hint { font-size: .78rem; color: var(--text-faint); line-height: 1.45; margin-top: .35rem; }
     .provider-item .info { flex: 1; }
     .provider-item .info .name { font-weight: 600; }
     .provider-item .info .meta { font-size: 0.8rem; color: var(--text-faint); margin-top: 0.2rem; }
@@ -90,7 +92,7 @@
       <div class="field-row">
         <div class="field">
           <label>Active Model (CASCADE_MODEL_NAME)</label>
-          <input type="text" id="live-model" disabled value="loading...">
+          <input type="text" id="live-model" disabled value="Loading...">
         </div>
         <div class="field">
           <label>x-cascade-route values</label>
@@ -214,6 +216,14 @@
       <div class="field">
         <label>Models (comma-separated)</label>
         <input type="text" id="provider-models" placeholder="gpt-4o, gpt-4o-mini">
+        <p class="hint">Cascade will send a small test prompt before saving. The first model is used for the test and for the registered upstream.</p>
+      </div>
+      <div class="field">
+        <label>Use as</label>
+        <select id="provider-use-as">
+          <option value="main">Main model: complex/default chat</option>
+          <option value="auxiliary">Auxiliary model: compression/fast tasks</option>
+        </select>
       </div>
       <div class="btn-row">
         <button class="btn btn-primary" onclick="addProvider()">Add Provider</button>
@@ -250,10 +260,10 @@
     }
     async function loadModelName() {
       try {
-        const r = await fetch('model');
+        const r = await fetch('/model');
         const j = await r.json();
         const el = document.getElementById('live-model');
-        if (el) el.value = j && (j.id || j.model || j.name) ? String(j.id || j.model || j.name) : 'cascade-hybrid-v1';
+        if (el) el.value = j?.id ? `${j.id} - ${j.description || 'Gateway model'}` : 'Unavailable';
       } catch(e) { console.error(e); }
     }
     let currentProviders = [];
@@ -270,7 +280,7 @@
         el.innerHTML = providers.map(p => `
           <div class="provider-item">
             <div class="info">
-              <div class="name">${p.name} <span class="badge badge-active">${p.provider_type.type || p.provider_type}</span></div>
+              <div class="name">${p.name} <span class="badge badge-active">${p.provider_type.type || p.provider_type}</span> <span class="role">${p.use_as || 'not routed'}</span></div>
               <div class="meta">${p.base_url} — ${p.models.join(', ')}</div>
             </div>
             <button class="btn btn-danger" style="padding:0.3rem 0.8rem;font-size:0.75rem" onclick="deleteProvider('${p.id}')">Remove</button>
@@ -310,17 +320,19 @@
       const provider = {
         id: 'p_' + Date.now(), name, provider_type: {type}, base_url: url,
         api_key: key || null, models, enabled: true, priority: 10,
-        capabilities: { chat: true, streaming: true }
+        capabilities: { chat: true, streaming: true }, use_as: document.getElementById('provider-use-as').value
       };
       try {
-        await fetch('api/providers', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(provider) });
+        const response = await fetch('api/providers', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(provider) });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.error || 'Provider test failed');
         document.getElementById('provider-name').value = '';
         document.getElementById('provider-url').value = '';
         document.getElementById('provider-key').value = '';
         document.getElementById('provider-models').value = '';
         loadProviders();
-        showToast('Provider added');
-      } catch(e) { showToast('Error adding provider'); }
+        showToast('Test passed; provider registered');
+      } catch(e) { showToast(e.message || 'Provider test failed'); }
     }
     async function deleteProvider(id) {
       try {

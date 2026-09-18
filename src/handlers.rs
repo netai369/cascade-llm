@@ -22,6 +22,11 @@ fn json_response(body: serde_json::Value, status: StatusCode) -> Response {
     resp
 }
 
+fn redact_provider(mut provider: ProviderConfig) -> ProviderConfig {
+    provider.api_key = None;
+    provider
+}
+
 fn extract_audio_from_messages(messages: &[ChatMessage]) -> Option<(String, String)> {
     for msg in messages {
         if let Some(MessageContent::Parts(parts)) = &msg.content {
@@ -437,7 +442,7 @@ pub async fn get_settings(State(state): State<Arc<GatewayState>>) -> Response {
     s.audio.tts_url = Some(rt.tts_url.clone());
     s.audio.stt_url = Some(rt.stt_url.clone());
     if !rt.providers.is_empty() {
-        s.providers = rt.providers.clone();
+        s.providers = rt.providers.iter().cloned().map(redact_provider).collect();
     }
     json_response(serde_json::to_value(s).unwrap(), StatusCode::OK)
 }
@@ -471,9 +476,8 @@ pub async fn update_settings(
         if let Some(u) = &settings.audio.stt_url {
             rt.stt_url = u.clone();
         }
-        if !settings.providers.is_empty() {
-            rt.providers = settings.providers.clone();
-        }
+        // Providers are managed through the tested provider endpoint. Do not
+        // replace stored credentials with the redacted settings-page copy.
     }
     // …chat URLs additionally flow into the dynamic registry as manual nodes
     // so the routing layer actually uses them.
@@ -509,7 +513,8 @@ pub async fn update_settings(
 pub async fn list_providers(State(state): State<Arc<GatewayState>>) -> Response {
     let rt = state.runtime.read().await;
     json_response(
-        serde_json::to_value(&rt.providers).unwrap_or(serde_json::Value::Array(vec![])),
+        serde_json::to_value(rt.providers.iter().cloned().map(redact_provider).collect::<Vec<_>>())
+            .unwrap_or(serde_json::Value::Array(vec![])),
         StatusCode::OK,
     )
 }
@@ -518,6 +523,44 @@ pub async fn add_provider(
     State(state): State<Arc<GatewayState>>,
     Json(provider): Json<ProviderConfig>,
 ) -> Response {
+    let role = match provider.use_as.as_deref() {
+        Some("main") | Some("auxiliary") => provider.use_as.clone().unwrap(),
+        Some(_) => return json_response(serde_json::json!({"error": "use_as must be main or auxiliary"}), StatusCode::BAD_REQUEST),
+        None => return json_response(serde_json::json!({"error": "Choose whether this provider is used as main or auxiliary"}), StatusCode::BAD_REQUEST),
+    };
+    let model = provider.models.first().cloned().unwrap_or_default();
+    if model.is_empty() {
+        return json_response(serde_json::json!({"error": "At least one model is required"}), StatusCode::BAD_REQUEST);
+    }
+    let endpoint = format!("{}/chat/completions", provider.base_url.trim_end_matches('/'));
+    let mut request = state.http_client.post(&endpoint).json(&serde_json::json!({
+        "model": model,
+        "messages": [{"role": "user", "content": "Hello, are you there? respond with yes"}],
+        "max_tokens": 16,
+        "temperature": 0
+    }));
+    if let Some(key) = &provider.api_key {
+        request = request.bearer_auth(key);
+    }
+    let response = match request.send().await {
+        Ok(response) => response,
+        Err(error) => return json_response(serde_json::json!({"error": format!("Provider is unreachable: {}", error)}), StatusCode::BAD_GATEWAY),
+    };
+    let status = response.status();
+    let body = response.json::<serde_json::Value>().await.unwrap_or_default();
+    let answer = body.pointer("/choices/0/message/content").and_then(|v| v.as_str()).unwrap_or("").trim();
+    if !status.is_success() || answer.is_empty() {
+        return json_response(serde_json::json!({"error": "Provider did not return a valid chat response", "upstream_status": status.as_u16()}), StatusCode::BAD_GATEWAY);
+    }
+    let register = RegisterUpstreamRequest {
+        endpoint_url: Some(endpoint),
+        bearer_token: provider.api_key.clone(),
+        id: Some(format!("provider-{}", provider.id)),
+        label: Some(provider.name.clone()),
+        model: Some(model),
+        ..Default::default()
+    };
+    state.registry.write().await.upsert(&role, register);
     if let Err(e) = state.db.save_provider(&provider) {
         return json_response(
             serde_json::json!({"error": format!("Failed to save: {}", e)}),
@@ -530,7 +573,7 @@ pub async fn add_provider(
         rt.providers.push(provider.clone());
     }
     json_response(
-        serde_json::json!({"status": "created", "id": provider.id}),
+        serde_json::json!({"status": "created", "id": provider.id, "tested": true, "answer": answer}),
         StatusCode::CREATED,
     )
 }
@@ -540,7 +583,7 @@ pub async fn get_provider(
     Path(id): Path<String>,
 ) -> Response {
     match state.runtime.read().await.providers.iter().find(|p| p.id == id) {
-        Some(p) => json_response(serde_json::to_value(p).unwrap(), StatusCode::OK),
+        Some(p) => json_response(serde_json::to_value(redact_provider(p.clone())).unwrap(), StatusCode::OK),
         None => json_response(
             serde_json::json!({"error": "Provider not found"}),
             StatusCode::NOT_FOUND,

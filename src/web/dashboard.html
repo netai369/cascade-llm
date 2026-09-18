@@ -211,9 +211,9 @@
       </table>
     </div>
     <div class="provider-section" id="local-models-section" style="display:none;">
-      <h3>Local Models</h3>
+      <h3>Local Models <span style="font-weight:400;font-size:0.75rem;color:var(--text-faint)">Gateway identities and models discovered from active local services</span></h3>
       <table>
-        <thead><tr><th>Name</th><th>Type</th><th>URL</th><th>Models</th><th>Status</th></tr></thead>
+        <thead><tr><th>Name</th><th>Role</th><th>Source</th><th>Description</th><th>Status</th></tr></thead>
         <tbody id="local-models-table"><tr><td colspan="5" style="color:var(--text-faint)">No local models configured</td></tr></tbody>
       </table>
     </div>
@@ -311,7 +311,7 @@
         if (localModels.length === 0) {
           tbody.innerHTML = '<tr><td colspan="5" style="color:var(--text-faint)">No local models configured</td></tr>';
         } else {
-          tbody.innerHTML = localModels.map(m => `<tr><td>${m.id}</td><td>${m.model_type || 'Unknown'}</td><td>${m.owned_by}</td><td>${m.id}</td><td><span class="badge badge-active">Active</span></td></tr>`).join('');
+          tbody.innerHTML = localModels.map(m => `<tr><td>${m.id}</td><td>${m.model_type || 'Gateway'}</td><td>${m.owned_by}</td><td>${m.description || (m.id === 'cascade-hybrid-v1' ? 'Unified routing identity; selects main or auxiliary backend.' : m.id === 'docling-serve' ? 'Document/OCR service for ingestion, not normal chat.' : 'Model discovered from a local OpenAI-compatible service.')}</td><td><span class="badge badge-active">Active</span></td></tr>`).join('');
         }
         document.getElementById('local-models-section').style.display = 'block';
       } catch(e) { console.error('Local models fetch error:', e); }
