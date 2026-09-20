@@ -74,7 +74,7 @@ async fn main() {
                 app_config.route_tools_to_large = saved.routing.route_tools_to_large;
                 app_config.default_route = saved.routing.default_route.clone();
                 app_config.marker_mode = saved.routing.marker_mode.clone();
-                if let Some(u) = &saved.audio.tts_url { app_config.tts_url = u.clone(); }
+                if let Some(u) = &saved.audio.tts_url { app_config.tts_url = migrate_tts_url(u); }
                 if let Some(u) = &saved.audio.stt_url { app_config.stt_url = u.clone(); }
             }
             Err(e) => warn!("Persisted settings unreadable: {}", e),
@@ -98,7 +98,27 @@ async fn main() {
     // Providers saved earlier re-enter the runtime registry here.
     match db.load_providers() {
         Ok(list) if !list.is_empty() => {
-            state.runtime.write().await.providers = list;
+            state.runtime.write().await.providers = list.clone();
+            for provider in list {
+                if let Some(role) = provider.use_as.as_deref().and_then(registry::canonical_role) {
+                    if let Some(model) = provider.models.first().cloned() {
+                        state.registry.write().await.upsert(
+                            role,
+                            registry::RegisterUpstreamRequest {
+                                endpoint_url: Some(format!(
+                                    "{}/chat/completions",
+                                    provider.base_url.trim_end_matches('/')
+                                )),
+                                bearer_token: provider.api_key.clone(),
+                                id: Some(format!("provider-{}", provider.id)),
+                                label: Some(provider.name.clone()),
+                                model: Some(model),
+                                ..Default::default()
+                            },
+                        );
+                    }
+                }
+            }
             info!("Restored persisted providers");
         }
         _ => {}
@@ -118,4 +138,8 @@ async fn main() {
     );
     let listener = TcpListener::bind(addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
+}
+
+fn migrate_tts_url(url: &str) -> String {
+    url.replace("http://supertonic-tts:8800", "http://speech-tts:8800")
 }

@@ -1,4 +1,4 @@
-use crate::registry::RegisterUpstreamRequest;
+use crate::registry::{RegisterUpstreamRequest, UpstreamNode};
 use crate::state::GatewayState;
 use crate::types::*;
 use axum::{
@@ -274,6 +274,113 @@ pub async fn get_model(State(state): State<Arc<GatewayState>>) -> Response {
     json_response(serde_json::to_value(model).unwrap(), StatusCode::OK)
 }
 
+pub async fn active_models(State(state): State<Arc<GatewayState>>) -> Response {
+    let nodes: Vec<UpstreamNode> = {
+        let registry = state.registry.read().await;
+        registry.nodes().into_iter().cloned().collect()
+    };
+    let providers = state.runtime.read().await.providers.clone();
+    let main = role_active_status(
+        &state.http_client,
+        &nodes,
+        &providers,
+        "main",
+        &state.config.large_text_url,
+        &state.config.main_model_name,
+    )
+    .await;
+    let auxiliary = role_active_status(
+        &state.http_client,
+        &nodes,
+        &providers,
+        "auxiliary",
+        &state.config.small_mllm_url,
+        &state.config.small_model_name,
+    )
+    .await;
+    json_response(
+        serde_json::json!({
+            "cascade_model": state.config.cascade_model_name,
+            "main": main,
+            "auxiliary": auxiliary,
+        }),
+        StatusCode::OK,
+    )
+}
+
+fn pretty_model_name(id: &str) -> String {
+    let id = id.rsplit('/').next().unwrap_or(id);
+    id.strip_suffix(".gguf").unwrap_or(id).to_string()
+}
+
+async fn fetch_reported_model(client: &reqwest::Client, endpoint: &str) -> Option<String> {
+    let origin = crate::registry::origin_of(endpoint);
+    for path in ["/v1/models", "/models"] {
+        let url = format!("{}{}", origin, path);
+        let Ok(resp) = client.get(&url).send().await else {
+            continue;
+        };
+        if !resp.status().is_success() {
+            continue;
+        }
+        let Ok(val) = resp.json::<serde_json::Value>().await else {
+            continue;
+        };
+        if let Some(id) = val
+            .get("data")
+            .and_then(|d| d.as_array())
+            .and_then(|a| a.first())
+            .and_then(|m| m.get("id"))
+            .and_then(|i| i.as_str())
+        {
+            return Some(pretty_model_name(id));
+        }
+        if let Some(id) = val
+            .get("models")
+            .and_then(|m| m.as_array())
+            .and_then(|a| a.first())
+            .and_then(|m| m.get("model"))
+            .and_then(|i| i.as_str())
+        {
+            return Some(pretty_model_name(id));
+        }
+    }
+    None
+}
+
+async fn role_active_status(
+    client: &reqwest::Client,
+    nodes: &[UpstreamNode],
+    providers: &[ProviderConfig],
+    role: &str,
+    fallback_endpoint: &str,
+    fallback_model: &str,
+) -> serde_json::Value {
+    let node = nodes
+        .iter()
+        .find(|n| n.role == role && n.active && n.healthy);
+    let endpoint = node
+        .map(|n| n.endpoint_url.clone())
+        .unwrap_or_else(|| fallback_endpoint.to_string());
+    let provider = node.and_then(|node| {
+        providers.iter().find(|p| {
+            p.use_as.as_deref() == Some(role) && node.label.as_deref() == Some(p.name.as_str())
+        })
+    });
+    let reported = fetch_reported_model(client, &endpoint).await;
+    serde_json::json!({
+        "role": role,
+        "model": reported.clone().unwrap_or_else(|| fallback_model.to_string()),
+        "source": provider
+            .map(|p| p.name.clone())
+            .or_else(|| node.and_then(|n| n.label.clone()))
+            .unwrap_or_else(|| "local".to_string()),
+        "endpoint": endpoint,
+        "active": reported.is_some(),
+        "provider": provider.is_some(),
+    })
+}
+
 pub async fn health_check(State(state): State<Arc<GatewayState>>) -> Response {
     let extract_backends = state.extraction_backends.read().await;
     let extract_summary: Vec<serde_json::Value> = extract_backends
@@ -314,6 +421,14 @@ pub async fn tts(State(state): State<Arc<GatewayState>>, req: Request<Body>) -> 
 
 pub async fn stt(State(state): State<Arc<GatewayState>>, req: Request<Body>) -> Response {
     crate::audio::stt_handler(State(state), req).await
+}
+
+pub async fn embeddings(State(state): State<Arc<GatewayState>>, req: Request<Body>) -> Response {
+    crate::embeddings::embeddings_handler(State(state), req).await
+}
+
+pub async fn rerank(State(state): State<Arc<GatewayState>>, req: Request<Body>) -> Response {
+    crate::embeddings::rerank_handler(State(state), req).await
 }
 
 pub async fn image_generation(

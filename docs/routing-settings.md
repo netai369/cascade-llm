@@ -79,6 +79,8 @@ it cleanly. `tool_calls`/`function_call` deltas are forwarded verbatim
 | Inference URL | `LARGE_TEXT_URL` / `LARGE_MLLM_URL` | main backend override (e.g. rented GPU) |
 | Auxiliary URL | `SMALL_MLLM_URL` | compression/fast backend override |
 | TTS / STT URL | `TTS_URL` / `STT_URL` | realtime audio passthroughs |
+| Embeddings URL | `EMBEDDINGS_URL` | OpenAI-compatible `/v1/embeddings` passthrough |
+| Rerank URL | `RERANK_URL` | `/v1/rerank` passthrough |
 
 All settings apply live and persist via the settings file DB; env vars provide
 the boot-time defaults.

@@ -17,10 +17,13 @@ pub fn build_router(state: Arc<GatewayState>) -> Router {
         .route("/v1/models", get(handlers::list_models))
         .route("/models", get(handlers::list_models))
         .route("/model", get(handlers::get_model))
+        .route("/web/api/active-models", get(handlers::active_models))
         .route("/health", get(handlers::health_check))
         // Audio / media proxies
         .route("/v1/audio/speech", post(handlers::tts))
         .route("/v1/audio/transcriptions", post(handlers::stt))
+        .route("/v1/embeddings", post(handlers::embeddings))
+        .route("/v1/rerank", post(handlers::rerank))
         .route("/v1/images/generations", post(handlers::image_generation))
         .route("/v1/video/generations", post(handlers::video_generation))
         // Heavy RAG extraction jobs -> rag_worker pool
@@ -47,6 +50,7 @@ pub fn build_router(state: Arc<GatewayState>) -> Router {
         )
         // Aliases without the /web prefix (programmatic access)
         .route("/api/dashboard", get(handlers::dashboard_api))
+        .route("/api/active-models", get(handlers::active_models))
         .route(
             "/api/providers",
             get(handlers::list_providers).post(handlers::add_provider),

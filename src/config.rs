@@ -24,6 +24,8 @@ pub struct AppConfig {
     pub providers: Vec<ProviderConfig>,
     pub tts_url: String,
     pub stt_url: String,
+    pub embeddings_url: String,
+    pub rerank_url: String,
 
     // Extraction endpoint
     pub extract_cloud_url: Option<String>,
@@ -187,6 +189,10 @@ impl AppConfig {
                 .unwrap_or_else(|_| "http://speech-tts:8800/v1/audio".to_string()),
             stt_url: std::env::var("STT_URL")
                 .unwrap_or_else(|_| "http://speech-stt:5092/v1/audio".to_string()),
+            embeddings_url: std::env::var("EMBEDDINGS_URL")
+                .unwrap_or_else(|_| "http://embeddings:8801".to_string()),
+            rerank_url: std::env::var("RERANK_URL")
+                .unwrap_or_else(|_| "http://embeddings:8801".to_string()),
 
             extract_cloud_url: std::env::var("EXTRACT_CLOUD_URL").ok().filter(|s| !s.is_empty()),
             extract_cloud_model: std::env::var("EXTRACT_CLOUD_MODEL").ok().filter(|s| !s.is_empty()),

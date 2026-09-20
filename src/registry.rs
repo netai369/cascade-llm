@@ -141,7 +141,7 @@ impl UpstreamNode {
 }
 
 /// Strips any known API path suffix, leaving `scheme://host[:port]`.
-fn origin_of(url: &str) -> String {
+pub(crate) fn origin_of(url: &str) -> String {
     const SUFFIXES: &[&str] = &[
         "/v1/chat/completions",
         "/v1/completions",

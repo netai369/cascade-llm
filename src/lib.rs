@@ -7,6 +7,7 @@ pub mod audio;
 pub mod cascade_features;
 pub mod config;
 pub mod db;
+pub mod embeddings;
 pub mod handlers;
 pub mod intent_routing;
 pub mod language;

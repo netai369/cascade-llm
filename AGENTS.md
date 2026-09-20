@@ -16,7 +16,9 @@ client ──► /v1/chat/completions ──► inspect_route (3-condition dispa
             /v1/images/generations ──► image role (fallback IMAGE_GENERATION_URL)
             /v1/rag/extract        ──► rag_worker pool (503 if none)
             /extraction/v1/*       ──► extraction backend registry
-            /v1/audio/*, /v1/video  ──► pass-through proxies
+            /v1/embeddings         ──► EMBEDDINGS_URL passthrough (:8801)
+            /v1/rerank             ──► RERANK_URL passthrough (:8801)
+            /v1/audio/*, /v1/video  ─► pass-through proxies
 ```
 
 Modules (`src/lib.rs` exposes all; binary is a thin bootstrap in `main.rs`,
@@ -29,6 +31,8 @@ router assembly in `router.rs`):
   SSE normalization, complexity routing ("auto" mode).
 - `handlers.rs` — HTTP handlers incl. admin API (`x-cascade-admin-key`).
 - `config.rs` — env config (+ optional CASCADE_CONFIG_FILE yaml seeds).
+- `embeddings.rs` — pass-through proxies for `/v1/embeddings` + `/v1/rerank`
+  (OpenAI-compatible embeddings/rerank backends, `EMBEDDINGS_URL`/`RERANK_URL`).
 - `media.rs`, `audio.rs` — media/audio proxies; `db.rs` — SQLite persistence;
   `cascade_features.rs` — Prometheus metrics; `web/` — embedded dashboard UI.
 
@@ -56,6 +60,16 @@ Full API reference: docs/dynamic-upstreams.md. Short form:
 
 ## Conventions
 
+- **★ After ANY source change, rebuild the deployed image — the running
+  container does NOT pick up code by itself.** The stack builds this repo
+  locally (`build.context: /home/edgar/Dev/cascade-llm`, image
+  `ghcr.io/netai369/cascade-llm:main`) and runs that binary; editing `src/`
+  leaves the live gateway on the old code until you rebuild + recreate:
+  `scripts/compose-up.sh build llm-gateway && scripts/compose-up.sh up -d
+  --no-deps llm-gateway` (from NetAI-Stack-SE). Symptom of forgetting: new
+  routes silently `404` (e.g. `/v1/embeddings`, `/v1/rerank` were WIP in git
+  but absent live because the image predated them) or old routing behaviour.
+  Always curl the endpoint after deploying.
 - No comments unless non-obvious; clean, readable code.
 - Tests: unit tests live next to code (`registry.rs`); black-box API tests in
   `tests/upstream_registry.rs` boot the real router on an ephemeral port.

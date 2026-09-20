@@ -36,7 +36,12 @@
       border: 1px solid var(--card-border); background: var(--input-bg);
       color: var(--text); font-size: 0.9rem; outline: none; transition: border-color 0.15s;
     }
-    .field input:focus, .field select:focus { border-color: var(--accent); }
+     .field input:focus, .field select:focus { border-color: var(--accent); }
+     .active-models { display: grid; grid-template-columns: 1fr 1fr; gap: .8rem; }
+     .active-model { border: 1px solid var(--card-border); background: var(--input-bg); border-radius: 8px; padding: .75rem; }
+     .active-model .role { color: var(--accent); font-size: .72rem; text-transform: uppercase; letter-spacing: .05em; }
+     .active-model .name { font-weight: 650; margin-top: .25rem; overflow-wrap: anywhere; }
+     .active-model .meta { color: var(--text-faint); font-size: .75rem; margin-top: .3rem; overflow-wrap: anywhere; }
     .field-row { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
     .btn {
       padding: 0.6rem 1.5rem; border-radius: 8px; border: none; cursor: pointer;
@@ -91,8 +96,11 @@
       <h2>Live Status</h2>
       <div class="field-row">
         <div class="field">
-          <label>Active Model (CASCADE_MODEL_NAME)</label>
-          <input type="text" id="live-model" disabled value="Loading...">
+          <label>Active Models</label>
+          <div class="active-models" id="live-model">
+            <div class="active-model"><div class="role">Main</div><div class="name">Checking...</div></div>
+            <div class="active-model"><div class="role">Auxiliary</div><div class="name">Checking...</div></div>
+          </div>
         </div>
         <div class="field">
           <label>x-cascade-route values</label>
@@ -258,13 +266,23 @@
         document.getElementById('stt-url').value = s.audio?.stt_url ?? '';
       } catch(e) { console.error(e); }
     }
-    async function loadModelName() {
-      try {
-        const r = await fetch('/model');
-        const j = await r.json();
-        const el = document.getElementById('live-model');
-        if (el) el.value = j?.id ? `${j.id} - ${j.description || 'Gateway model'}` : 'Unavailable';
-      } catch(e) { console.error(e); }
+     async function loadActiveModels() {
+       try {
+        const r = await fetch('api/active-models');
+         const j = await r.json();
+         const el = document.getElementById('live-model');
+        if (!el || !r.ok) throw new Error('active model status unavailable');
+        el.innerHTML = ['Main', 'Auxiliary'].map(role => {
+          const model = j[role.toLowerCase()] || {};
+          const state = model.active ? 'Active' : 'Unavailable';
+          const source = model.provider ? `Provider: ${model.source}` : `Source: ${model.source || 'local'}`;
+          return `<div class="active-model"><div class="role">${role}</div><div class="name">${model.model || 'Not configured'}</div><div class="meta">${state} · ${source}</div></div>`;
+        }).join('');
+       } catch(e) {
+         const el = document.getElementById('live-model');
+         if (el) el.innerHTML = '<div class="active-model"><div class="name">Status unavailable</div><div class="meta">Could not read active routing roles</div></div>';
+         console.error(e);
+       }
     }
     let currentProviders = [];
     async function loadProviders() {
@@ -342,7 +360,7 @@
       } catch(e) { showToast('Error removing provider'); }
     }
     loadSettings();
-    loadModelName();
+     loadActiveModels();
     loadProviders();
   </script>
 </body>
