@@ -56,6 +56,10 @@ pub struct AppConfig {
     /// Node selection across a role's pool: round_robin|least_latency
     /// (CASCADE_ROUTING_STRATEGY).
     pub routing_strategy: crate::registry::RoutingStrategy,
+    /// Selection across `/v1/extraction` backends: priority|round_robin
+    /// (CASCADE_EXTRACTION_STRATEGY). Round-robin uses the local auxiliary
+    /// server and GPU-provisioned nodes in parallel.
+    pub extraction_strategy: ExtractionStrategy,
     /// Upstream pool seeds from an optional cascade_config.yaml.
     pub upstream_seeds: Vec<crate::registry::UpstreamSeed>,
 }
@@ -228,6 +232,10 @@ impl AppConfig {
                 .ok()
                 .and_then(|v| crate::registry::RoutingStrategy::parse(&v))
                 .unwrap_or_default(),
+            extraction_strategy: std::env::var("CASCADE_EXTRACTION_STRATEGY")
+                .ok()
+                .and_then(|v| ExtractionStrategy::parse(&v))
+                .unwrap_or_default(),
             upstream_seeds: Vec::new(),
         }
     }
@@ -253,6 +261,7 @@ impl AppConfig {
                 api_key: self.extract_cloud_api_key.clone(),
                 enabled: true,
                 priority: 10,
+                weight: 1,
                 max_cost_per_hour: None,
                 last_validated: None,
                 healthy: true,
@@ -268,6 +277,7 @@ impl AppConfig {
             api_key: self.llama_api_key.clone(),
             enabled: true,
             priority: 99,
+            weight: 1,
             max_cost_per_hour: None,
             last_validated: None,
             healthy: true,

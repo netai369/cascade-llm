@@ -17,8 +17,31 @@ pub enum ExtractionBackendType {
     Local,
 }
 
+/// How `/v1/extraction` selects among healthy backends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ExtractionStrategy {
+    /// Strict priority order (lower `priority` wins); the local auxiliary
+    /// server is a last resort. Preserves the historic behaviour.
+    #[default]
+    Priority,
+    /// Weighted round-robin across ALL healthy backends, so a local auxiliary
+    /// server and a GPU-provisioned node are used in parallel.
+    RoundRobin,
+}
+
+impl ExtractionStrategy {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_lowercase().as_str() {
+            "priority" | "strict" => Some(Self::Priority),
+            "round_robin" | "roundrobin" | "weighted" | "rr" => Some(Self::RoundRobin),
+            _ => None,
+        }
+    }
+}
+
 /// An extraction backend registered with cascade-LLM.
-/// Backends are selected by (enabled, priority) — lower priority wins.
+/// Selection depends on [`ExtractionStrategy`]: strict priority (lower wins)
+/// or weighted round-robin across all healthy backends.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExtractionBackendEntry {
     pub id: String,
@@ -32,9 +55,14 @@ pub struct ExtractionBackendEntry {
     pub api_key: Option<String>,
     #[serde(default = "default_true")]
     pub enabled: bool,
-    /// Selection priority — lower wins. CloudGpu=10, CloudLlm=20, Local=99.
+    /// Selection priority — lower wins in `priority` mode.
+    /// CloudGpu=10, CloudLlm=20, Local=99.
     #[serde(default = "default_priority")]
     pub priority: u32,
+    /// Relative share of traffic in `round_robin` mode (default 1). A node
+    /// with weight 2 is picked twice as often as one with weight 1.
+    #[serde(default = "default_weight")]
+    pub weight: u32,
     /// Max cost per hour in USD (cloud backends only; None = unlimited).
     #[serde(default)]
     pub max_cost_per_hour: Option<f64>,
@@ -292,6 +320,7 @@ pub struct ProviderConfig {
 
 fn default_true() -> bool { true }
 fn default_priority() -> u32 { 10 }
+fn default_weight() -> u32 { 1 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]

@@ -129,6 +129,8 @@ pub struct GatewayState {
     pub start_time: Instant,
     /// Registry of extraction backends for `/v1/extraction`.
     pub extraction_backends: Arc<tokio::sync::RwLock<Vec<ExtractionBackendEntry>>>,
+    /// Round-robin cursor for `/v1/extraction` backend selection.
+    extraction_counter: AtomicU64,
     /// Dynamic upstream registry (role -> weighted node pool), managed via the
     /// admin API and probed by the background health checker.
     pub registry: Arc<tokio::sync::RwLock<crate::registry::UpstreamRegistry>>,
@@ -172,6 +174,7 @@ impl GatewayState {
             extraction_backends: Arc::new(tokio::sync::RwLock::new(
                 config.build_extraction_backends(),
             )),
+            extraction_counter: AtomicU64::new(0),
             registry: Arc::new(tokio::sync::RwLock::new(
                 crate::registry::UpstreamRegistry::default(),
             )),
@@ -1473,26 +1476,55 @@ impl GatewayState {
     /// Selects the best available extraction backend: lowest enabled priority
     /// whose circuit breaker is closed, sorted by `max_cost_per_hour` when
     /// tied.
-    async fn select_extraction_backend(&self) -> Option<ExtractionBackendEntry> {
-        let backends = self.extraction_backends.read().await;
-        let mut candidates: Vec<&ExtractionBackendEntry> = backends
-            .iter()
-            .filter(|b| b.enabled && b.healthy)
-            .collect();
-        candidates.sort_by_key(|b| b.priority);
+    pub(crate) async fn select_extraction_backend(&self) -> Option<ExtractionBackendEntry> {
+        let enabled: Vec<ExtractionBackendEntry> = {
+            let backends = self.extraction_backends.read().await;
+            backends
+                .iter()
+                .filter(|b| b.enabled && b.healthy)
+                .cloned()
+                .collect()
+        };
 
-        for candidate in candidates {
-            if !self.circuit_breaker.is_open(&candidate.url).await {
-                return Some(candidate.clone());
+        // Drop circuit-open backends before selection.
+        let mut candidates: Vec<ExtractionBackendEntry> = Vec::with_capacity(enabled.len());
+        for backend in enabled {
+            if self.circuit_breaker.is_open(&backend.url).await {
+                info!(
+                    "EXTRACT_SKIP: backend '{}' (priority {}) circuit breaker open",
+                    backend.id, backend.priority
+                );
+                continue;
             }
-            info!(
-                "EXTRACT_SKIP: backend '{}' (priority {}) circuit breaker open",
-                candidate.id, candidate.priority
-            );
+            candidates.push(backend);
         }
 
-        warn!("EXTRACT: no healthy extraction backend available");
-        None
+        if candidates.is_empty() {
+            warn!("EXTRACT: no healthy extraction backend available");
+            return None;
+        }
+
+        match self.config.extraction_strategy {
+            ExtractionStrategy::Priority => {
+                candidates.sort_by_key(|b| b.priority);
+                candidates.into_iter().next()
+            }
+            ExtractionStrategy::RoundRobin => {
+                // Deterministic pool order so the cursor maps to a stable node.
+                candidates.sort_by(|a, b| a.id.cmp(&b.id));
+                let expanded: Vec<&ExtractionBackendEntry> = candidates
+                    .iter()
+                    .flat_map(|b| std::iter::repeat_n(b, b.weight.max(1) as usize))
+                    .collect();
+                let idx = self.extraction_counter.fetch_add(1, Ordering::Relaxed);
+                let picked = expanded[(idx as usize) % expanded.len()].clone();
+                info!(
+                    "EXTRACT_RR: cycle={} picked='{}' (priority {})",
+                    idx, picked.id, picked.priority
+                );
+                Some(picked)
+            }
+        }
     }
 
     /// Registers or updates an extraction backend.
@@ -1959,5 +1991,91 @@ mod route_hint_tests {
             GatewayState::hint_to_decision("auxiliary-server"),
             RouteDecision::Auxiliary
         );
+    }
+}
+
+#[cfg(test)]
+mod extraction_routing_tests {
+    use super::*;
+    use crate::cascade_features::MetricsRegistry;
+    use crate::db::Db;
+
+    fn backend(id: &str, priority: u32, weight: u32) -> ExtractionBackendEntry {
+        ExtractionBackendEntry {
+            id: id.to_string(),
+            backend_type: ExtractionBackendType::Local,
+            name: id.to_string(),
+            url: format!("http://{id}.test:8080"),
+            model: None,
+            api_key: None,
+            enabled: true,
+            priority,
+            weight,
+            max_cost_per_hour: None,
+            last_validated: None,
+            healthy: true,
+        }
+    }
+
+    fn state_with(strategy: ExtractionStrategy) -> GatewayState {
+        let mut cfg = AppConfig::from_env();
+        cfg.extraction_strategy = strategy;
+        GatewayState::new(
+            cfg,
+            Arc::new(MetricsRegistry::init()),
+            Arc::new(Db::new_in_memory().unwrap()),
+        )
+    }
+
+    async fn picks(state: &GatewayState, n: usize) -> Vec<String> {
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..n {
+            out.push(state.select_extraction_backend().await.unwrap().id);
+        }
+        out
+    }
+
+    #[test]
+    fn strategy_parses_aliases() {
+        assert_eq!(ExtractionStrategy::parse("round_robin"), Some(ExtractionStrategy::RoundRobin));
+        assert_eq!(ExtractionStrategy::parse("priority"), Some(ExtractionStrategy::Priority));
+        assert_eq!(ExtractionStrategy::parse("bogus"), None);
+        assert_eq!(ExtractionStrategy::default(), ExtractionStrategy::Priority);
+    }
+
+    #[tokio::test]
+    async fn priority_mode_always_prefers_lower_priority() {
+        let state = state_with(ExtractionStrategy::Priority);
+        state.register_extraction_backend(backend("gpu", 10, 1)).await;
+        state.register_extraction_backend(backend("local", 99, 1)).await;
+        assert_eq!(picks(&state, 4).await, vec!["gpu", "gpu", "gpu", "gpu"]);
+    }
+
+    #[tokio::test]
+    async fn round_robin_alternates_local_and_gpu() {
+        let state = state_with(ExtractionStrategy::RoundRobin);
+        state.register_extraction_backend(backend("gpu", 10, 1)).await;
+        state.register_extraction_backend(backend("local", 99, 1)).await;
+        assert_eq!(picks(&state, 4).await, vec!["gpu", "local", "gpu", "local"]);
+    }
+
+    #[tokio::test]
+    async fn round_robin_honours_weight() {
+        let state = state_with(ExtractionStrategy::RoundRobin);
+        state.register_extraction_backend(backend("gpu", 10, 2)).await;
+        state.register_extraction_backend(backend("local", 99, 1)).await;
+        let got = picks(&state, 6).await;
+        assert_eq!(got.iter().filter(|p| *p == "gpu").count(), 4);
+        assert_eq!(got.iter().filter(|p| *p == "local").count(), 2);
+    }
+
+    #[tokio::test]
+    async fn round_robin_skips_unhealthy_backend() {
+        let state = state_with(ExtractionStrategy::RoundRobin);
+        state.register_extraction_backend(backend("gpu", 10, 1)).await;
+        let mut local = backend("local", 99, 1);
+        local.healthy = false;
+        state.register_extraction_backend(local).await;
+        assert_eq!(picks(&state, 3).await, vec!["gpu", "gpu", "gpu"]);
     }
 }
