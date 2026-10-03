@@ -73,6 +73,10 @@ async fn main() {
                 app_config.confidence_threshold = saved.routing.confidence_threshold;
                 app_config.route_tools_to_large = saved.routing.route_tools_to_large;
                 app_config.default_route = saved.routing.default_route.clone();
+                // Only override the env default when the field was actually
+                // persisted — see the `Option` note on RoutingSettings::hybrid_auto.
+                if let Some(v) = saved.routing.hybrid_auto { app_config.hybrid_auto = v; }
+                if let Some(n) = saved.routing.hybrid_aux_max_chars { app_config.hybrid_aux_max_chars = n; }
                 app_config.marker_mode = saved.routing.marker_mode.clone();
                 if let Some(u) = &saved.audio.tts_url { app_config.tts_url = migrate_tts_url(u); }
                 if let Some(u) = &saved.audio.stt_url { app_config.stt_url = u.clone(); }

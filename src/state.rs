@@ -16,6 +16,13 @@ use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
 use tracing::{info, warn};
 
+/// Highest keyword score (see `keyword_score`) that still counts as a "simple"
+/// prompt. Any complexity marker at all pushes the request to the main model:
+/// one code fence is 0.25, one list item 0.1, one keyword 0.2. Keeping this at
+/// 0.0 makes the rule "no marker means simple", which is the conservative
+/// direction for a router whose whole job is to avoid downgrading real work.
+const HYBRID_MAX_KEYWORD_SCORE: f64 = 0.0;
+
 pub async fn fetch_large_model_multimodal_async(capability_url: &str) -> bool {
     let url = capability_url.trim_end_matches('/');
     match reqwest::Client::new().get(url).send().await {
@@ -155,10 +162,15 @@ impl GatewayState {
     ) -> Self {
         let http_client = Arc::new(
             reqwest::Client::builder()
-                .pool_max_idle_per_host(0)
+                // Keep-alive across requests: pool_max_idle_per_host(0)
+                // disabled reuse and forced a new TCP+TLS handshake per call.
+                .pool_max_idle_per_host(32)
                 .pool_idle_timeout(Duration::from_secs(90))
                 .connect_timeout(Duration::from_secs(5))
-                .timeout(Duration::from_secs(600))
+                // Total ceiling for batch calls; long SSE streams are bounded
+                // by the idle read_timeout below rather than an absolute cap.
+                .timeout(Duration::from_secs(1800))
+                .read_timeout(Duration::from_secs(180))
                 .build()
                 .expect("Failed to build reqwest client"),
         );
@@ -183,6 +195,8 @@ impl GatewayState {
                 confidence_threshold: config.confidence_threshold,
                 route_tools_to_large: config.route_tools_to_large,
                 default_route: config.default_route.clone(),
+                hybrid_auto: config.hybrid_auto,
+                hybrid_aux_max_chars: config.hybrid_aux_max_chars,
                 marker_mode: config.marker_mode.clone(),
                 tts_url: config.tts_url.clone(),
                 stt_url: config.stt_url.clone(),
@@ -616,8 +630,186 @@ impl GatewayState {
         if self.has_active_role("ocr").await && self.is_ocr_payload(payload, &marker_mode) {
             return RouteDecision::Ocr;
         }
+        // Condition C: hybrid — when the effective default route is "auto",
+        // the complexity router picks the backend: simple text goes to the
+        // fast auxiliary model, everything else to the main model.
+        // Disabled by default (CASCADE_HYBRID_AUTO=false) so the vllm fold
+        // (aux == main) and the llamacpp rollback keep the old hard default.
+        if self.hybrid_enabled().await && self.hybrid_pick_aux(payload).await {
+            return RouteDecision::Auxiliary;
+        }
         // Condition C: default — main inference / RAG / reasoning.
         RouteDecision::Inference
+    }
+
+    /// True when the hybrid complexity router is allowed to override the
+    /// hard "everything goes to main" default. Requires BOTH:
+    ///   * `hybrid_auto` (env `CASCADE_HYBRID_AUTO` / settings checkbox), and
+    ///   * a default route that is unset or "auto" — an explicit
+    ///     `inference`/`auxiliary` pin from the settings page wins outright.
+    async fn hybrid_enabled(&self) -> bool {
+        let rt = self.runtime.read().await;
+        if !rt.hybrid_auto {
+            return false;
+        }
+        match rt.default_route.as_deref().map(|s| s.to_lowercase()) {
+            None => true,
+            Some(ref r) if r == "auto" || r.is_empty() => true,
+            Some(_) => false,
+        }
+    }
+
+    /// Complexity gate for the hybrid router: "is this a short, plain,
+    /// text-only prompt that the small model can answer on its own?".
+    ///
+    /// Reuses `evaluate_complexity` (the same score `route_auto` /
+    /// `pick_model` compare against `router_threshold`) but deliberately on the
+    /// **last user message only** — the full transcript includes system prompts,
+    /// tool schemas and chat history, which would push every real conversation
+    /// over the threshold through the `total_chars` term alone.
+    ///
+    /// Everything that must reach the main model is rejected up front:
+    /// images, audio, files, tools (declared or present in the history),
+    /// reasoning/code markers, long prompts and multi-turn conversations.
+    async fn hybrid_pick_aux(&self, payload: &ChatCompletionRequest) -> bool {
+        let (threshold, max_chars) = {
+            let rt = self.runtime.read().await;
+            (rt.router_threshold, rt.hybrid_aux_max_chars)
+        };
+
+        // Images/audio/files are the multimodal/aux-VLM path, not the fast path.
+        if self.has_image(payload) {
+            return false;
+        }
+        if payload.messages.iter().any(|m| {
+            m.role == "tool"
+                || m.tool_calls.is_some()
+                || matches!(&m.content, Some(MessageContent::Parts(parts)) if parts.iter().any(|p| !matches!(p, MessageContentPart::Text { .. })))
+        }) {
+            return false;
+        }
+        // A declared tool list is a hard "main" signal (see also ROUTE_TOOLS_TO_LARGE).
+        if payload.tools.is_some() || payload.functions.is_some() {
+            return false;
+        }
+
+        let Some(last_user) = payload.messages.iter().rev().find(|m| m.role == "user") else {
+            return false;
+        };
+        let Some(MessageContent::Text(text)) = &last_user.content else {
+            return false;
+        };
+        let text = text.trim();
+        if text.is_empty() {
+            return false;
+        }
+        // Length gate: `evaluate_complexity` caps its char term at 1.0 and
+        // halves it, so on its own a long keyword-free prompt can never cross
+        // the threshold — a 5 kB paste would still read as "simple".
+        if text.chars().count() > max_chars {
+            info!(
+                "HYBRID: prompt of {} chars exceeds the simple-prompt budget ({}) -> main",
+                text.chars().count(),
+                max_chars
+            );
+            return false;
+        }
+        // Only the newest turn counts as "simple" — a follow-up question needs
+        // the history and therefore the main model's context handling.
+        let user_turns = payload.messages.iter().filter(|m| m.role == "user").count();
+        if user_turns > 1 {
+            return false;
+        }
+
+        // Reuse the existing scorer, but `evaluate_complexity` halves BOTH
+        // components (`0.5*char + 0.5*keyword`), so on a single short message
+        // the char term is near zero and the score can only approach the 0.5
+        // default threshold by accumulating keywords — which makes a
+        // threshold comparison useless exactly where the hybrid router
+        // operates. "```python" scored 0.13 and "analyze deeply …" 0.19,
+        // i.e. a code block and a reasoning prompt both read as simple.
+        //
+        // So compare the KEYWORD component on its own here (0 = no
+        // complexity marker of any kind, whatever the message length) and keep
+        // the combined score as a second, looser condition. The length budget
+        // above already covers "long but plain".
+        let complexity = self.evaluate_complexity(std::slice::from_ref(last_user));
+        let keyword_score = self.keyword_score(std::slice::from_ref(last_user));
+        let use_aux = complexity <= threshold && keyword_score <= HYBRID_MAX_KEYWORD_SCORE;
+        info!(
+            "HYBRID: last user message ({} chars): complexity={:.2} (threshold {:.2}), keywords={:.2} (limit {:.2}) -> {}",
+            text.chars().count(),
+            complexity,
+            threshold,
+            keyword_score,
+            HYBRID_MAX_KEYWORD_SCORE,
+            if use_aux { "auxiliary" } else { "main" }
+        );
+        use_aux
+    }
+
+    /// The keyword half of `evaluate_complexity`, on its own. Returned
+    /// separately because the combined score mixes it with a length term that
+    /// is ~0 for the single short prompt the hybrid router looks at.
+    fn keyword_score(&self, messages: &[ChatMessage]) -> f64 {
+        let detected_lang = language::detect_language(messages);
+        let mut keyword_score = 0.0;
+
+        let keywords: Vec<&str> = match detected_lang {
+            "de" => vec!["analysiere", "schreibe", "experte", "logik", "komplex"],
+            "fr" => vec!["analyser", "écrire", "expert", "logique", "complexe"],
+            "es" => vec!["analizar", "escribir", "experto", "lógica", "complejo"],
+            "it" => vec!["analizza", "scrivi", "esperto", "logica", "complesso"],
+            "pl" => vec!["analizuj", "napisz", "ekspert", "logika", "skomplikowany"],
+            "hu" => vec!["elemezd", "írj", "szakértő", "logika", "komplex"],
+            _ => vec!["analyze deeply", "write code", "expert", "reasoning", "logic", "complex"],
+        };
+        let complex_indicators: Vec<&str> = match detected_lang {
+            "de" => vec![
+                "analysiere tief", "schreibe code", "experte", "logik", "komplex",
+                "schritt 1", "schritt 2", "erstens", "zweitens", "dritten",
+                "architektur", "infrastruktur", "debuggen", "optimieren", "refaktorisieren",
+                "theorem", "beweis", "berechnen", "gleichung", "ableitung",
+            ],
+            _ => vec![
+                "analyze deeply", "write code", "expert", "reasoning", "logic", "complex",
+                "step 1", "step 2", "first,", "second,", "third,", "four", "five",
+                "architecture", "infrastructure", "debug", "optimize", "refactor",
+                "theorem", "proof", "calculate", "compute", "equation", "derivative",
+            ],
+        };
+
+        for msg in messages {
+            let Some(ref content) = msg.content else { continue };
+            let texts: Vec<&str> = match content {
+                MessageContent::Text(text) => vec![text.as_str()],
+                MessageContent::Parts(parts) => parts
+                    .iter()
+                    .filter_map(|p| match p {
+                        MessageContentPart::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect(),
+            };
+            for text in texts {
+                let lower = text.to_lowercase();
+                for keyword in &keywords {
+                    if lower.contains(keyword) {
+                        keyword_score += 0.2;
+                    }
+                }
+                for indicator in &complex_indicators {
+                    if lower.contains(indicator) {
+                        keyword_score += 0.15;
+                    }
+                }
+                keyword_score += (text.matches("```").count() / 2) as f64 * 0.25;
+                let list_patterns = ["\n1.", "\n2.", "\n3.", "\n1)", "\na)", "\na."];
+                let list_count = list_patterns.iter().map(|p| text.matches(p).count()).sum::<usize>();
+                keyword_score += list_count as f64 * 0.1;
+            }
+        }
+        keyword_score
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1019,8 +1211,12 @@ impl GatewayState {
                 Ok(parts)
             }
             Err(e) => {
-                self.circuit_breaker.record_failure(url).await;
-                self.metrics.record_fallback("backend_unavailable");
+                // Only transport failures and 5xx indicate a sick backend; a
+                // 4xx is a client error and must not open the breaker.
+                if e.unreachable || e.status >= 500 {
+                    self.circuit_breaker.record_failure(url).await;
+                    self.metrics.record_fallback("backend_unavailable");
+                }
                 if e.unreachable {
                     Err(ProxyError::unreachable(
                         StatusCode::SERVICE_UNAVAILABLE,
@@ -1054,6 +1250,24 @@ impl GatewayState {
         (default_url.to_string(), self.config.llama_api_key.clone(), None)
     }
 
+    /// Bearer + node id for an already-resolved endpoint URL. Used by the
+    /// session-affinity path, which carries a URL (not a role) forward. Falls
+    /// back to the static LLAMA_API_KEY for the configured backends.
+    async fn resolve_target(&self, url: &str) -> (Option<String>, Option<String>) {
+        {
+            let registry = self.registry.read().await;
+            for node in registry.nodes() {
+                if node.endpoint_url == url {
+                    return (node.bearer_token.clone(), Some(node.id.clone()));
+                }
+            }
+        }
+        if url == self.config.large_text_url || url == self.config.small_mllm_url {
+            return (self.config.llama_api_key.clone(), None);
+        }
+        (None, None)
+    }
+
     /// Picks a node from the registry without falling back to static config.
     /// Used by media/RAG handlers that need to know whether a node exists.
     pub async fn pick_node(&self, role: &str) -> Option<crate::registry::UpstreamNode> {
@@ -1076,6 +1290,33 @@ impl GatewayState {
                 payload.model = m;
             }
         }
+    }
+
+    /// The hybrid router picked the auxiliary role on its own, so the outgoing
+    /// `model` must follow — otherwise the "auxiliary" request is just another
+    /// main-model call (under OVMS both models live behind one URL and are
+    /// selected purely by name, so a forwarded `netai-hybrid` would silently
+    /// ignore the whole decision).
+    ///
+    /// Narrow on purpose: it only fires when the caller asked for the
+    /// **configured main model** and `SMALL_MODEL_NAME` names a *different*
+    /// one. An explicit `x-cascade-route: auxiliary-server` from a consumer that
+    /// already sends the aux name is left alone, and any other name is still
+    /// forwarded verbatim — the static-upstream pass-through that
+    /// `test_static_upstream_forwards_a_foreign_model_name` pins. It is also a
+    /// no-op whenever aux and main are the same model (the vLLM fold) or the
+    /// engine ignores the field (llama.cpp rollback).
+    async fn retarget_aux_model(&self, payload: &mut ChatCompletionRequest) {
+        if !self.hybrid_enabled().await {
+            return;
+        }
+        let main = self.config.main_model_name.trim();
+        let aux = self.config.small_model_name.trim();
+        if main.is_empty() || aux.is_empty() || aux == main || payload.model != main {
+            return;
+        }
+        info!("AUX_MODEL_RETARGET: {} -> {} (hybrid routing)", payload.model, aux);
+        payload.model = aux.to_string();
     }
 
     /// Condition A — dedicated vision / document parsing (OCR) endpoint.
@@ -1110,6 +1351,7 @@ impl GatewayState {
         self.inline_all_images(&mut payload).await;
         let (url, bearer, node) = self.resolve_upstream("auxiliary", &self.config.small_mllm_url).await;
         self.apply_node_model(&mut payload, &node).await;
+        self.retarget_aux_model(&mut payload).await;
         info!(
             "ROUTE_B: Auxiliary(compression) -> {} ({} messages)",
             url,
@@ -1265,52 +1507,67 @@ impl GatewayState {
 
         if let Some(target) = target_override {
             info!("SESSION AFFINITY ROUTE: target={}", target);
-            let mut result = self.proxy_to_backend(&injected_payload, &target, None, is_streaming, origin, &mut None).await;
+            let (bearer, node) = self.resolve_target(&target).await;
+            let backend = if target == self.config.small_mllm_url {
+                RouteBackend::AuxiliaryServer
+            } else {
+                RouteBackend::InferenceServer
+            };
+            let mut payload = injected_payload.clone();
+            self.apply_node_model(&mut payload, &node).await;
+            let mut result = self
+                .private_proxy_with_bearer(
+                    &payload, &target, bearer.as_deref(), backend, is_streaming, origin,
+                    node.as_deref(),
+                )
+                .await;
             if let Ok(parts) = result.as_mut() {
                 if let Ok(v) = HeaderValue::from_str("session-affinity") {
                     parts.0.insert("x-cascade-route", v);
-                }
-            }
-            match &result {
-                Ok(_) => {
-                    self.circuit_breaker.record_success(&target).await;
-                }
-                Err(_) => {
-                    self.circuit_breaker.record_failure(&target).await;
                 }
             }
             self.metrics.record_request("session_affinity");
             return result;
         }
 
-        let (use_small, target_url) = self.pick_model(has_image, complexity_score, tier).await;
-        let target_url = target_url.to_owned();
-        info!("AUTO SELECTED_URL: {}", target_url);
+        let (use_small, static_target) = self.pick_model(has_image, complexity_score, tier).await;
+        // Resolve through the dynamic registry (weighted round-robin) and carry
+        // its bearer + circuit breaker. The static-config fallback uses
+        // LLAMA_API_KEY. Previously this path posted straight to the static
+        // URL with `bearer None`, bypassing auth and the breaker.
+        let target_role = if use_small { "auxiliary" } else { "main" };
+        let (target_url, target_bearer, target_node) =
+            self.resolve_upstream(target_role, &static_target).await;
+        let (large_url, large_bearer, large_node) =
+            self.resolve_upstream("main", &self.config.large_text_url).await;
+        info!("AUTO SELECTED_URL: {} (role={})", target_url, target_role);
 
         if !use_small {
-            let mut result = self.proxy_to_backend(&injected_payload, &target_url, None, is_streaming, origin, &mut None).await;
+            let mut payload = injected_payload.clone();
+            self.apply_node_model(&mut payload, &target_node).await;
+            let mut result = self
+                .private_proxy_with_bearer(
+                    &payload, &target_url, target_bearer.as_deref(),
+                    RouteBackend::InferenceServer, is_streaming, origin,
+                    target_node.as_deref(),
+                )
+                .await;
             if let Ok(parts) = result.as_mut() {
-                if let Ok(v) = HeaderValue::from_str(if use_small {"auto-small"} else {"auto-large"}) {
+                if let Ok(v) = HeaderValue::from_str("auto-large") {
                     parts.0.insert("x-cascade-route", v);
                 }
             }
-            match &result {
-                Ok(_) => {
-                    self.circuit_breaker.record_success(&target_url).await;
-                    if let Some(ref key) = session_key {
-                        self.session_cache.insert(key.clone(), target_url.clone()).await;
-                    }
-                }
-                Err(_) => {
-                    self.circuit_breaker.record_failure(&target_url).await;
+            if result.is_ok() {
+                if let Some(ref key) = session_key {
+                    self.session_cache.insert(key.clone(), target_url.clone()).await;
                 }
             }
-            self.metrics.record_request("large");
             return result;
         }
 
         info!("AUTO SMALL_MODEL_PATH: target_url={}", target_url);
         let mut small_payload = injected_payload.clone();
+        self.apply_node_model(&mut small_payload, &target_node).await;
         if small_payload.max_tokens.is_none() {
             small_payload.max_tokens = Some(4096);
         }
@@ -1319,24 +1576,22 @@ impl GatewayState {
         language::append_fallback_instruction(&mut small_payload);
 
         if is_streaming {
-            let mut result = self.proxy_to_backend(&small_payload, &target_url, None, true, origin, &mut None).await;
+            let mut result = self
+                .private_proxy_with_bearer(
+                    &small_payload, &target_url, target_bearer.as_deref(),
+                    RouteBackend::AuxiliaryServer, true, origin, target_node.as_deref(),
+                )
+                .await;
             if let Ok(parts) = result.as_mut() {
                 if let Ok(v) = HeaderValue::from_str("auto-small") {
                     parts.0.insert("x-cascade-route", v);
                 }
             }
-            match &result {
-                Ok(_) => {
-                    self.circuit_breaker.record_success(&target_url).await;
-                    if let Some(ref key) = session_key {
-                        self.session_cache.insert(key.clone(), target_url.clone()).await;
-                    }
-                }
-                Err(_) => {
-                    self.circuit_breaker.record_failure(&target_url).await;
+            if result.is_ok() {
+                if let Some(ref key) = session_key {
+                    self.session_cache.insert(key.clone(), target_url.clone()).await;
                 }
             }
-            self.metrics.record_request("small");
             return result;
         }
 
@@ -1346,10 +1601,11 @@ impl GatewayState {
             small_payload.max_tokens = Some(max_tokens);
         }
 
-        let backend_response = self
-            .http_client
-            .post(&target_url)
-            .json(&small_payload)
+        let mut small_request = self.http_client.post(&target_url).json(&small_payload);
+        if let Some(token) = target_bearer.as_deref() {
+            small_request = small_request.bearer_auth(token);
+        }
+        let backend_response = small_request
             .send()
             .await
             .map_err(|e| ProxyError::unreachable(StatusCode::BAD_GATEWAY, &target_url, format!("{}", e)))?;
@@ -1364,19 +1620,24 @@ impl GatewayState {
             info!("Small model returned HTTP {}, rerouting original request to large model", status);
             self.circuit_breaker.record_failure(&target_url).await;
             self.metrics.record_fallback("primary_failed");
-            let mut result = self.proxy_to_backend(&injected_payload, &large_url, None, false, origin, &mut None).await;
-        if let Ok(parts) = result.as_mut() {
-            if let Ok(v) = HeaderValue::from_str("auto-large") {
-                parts.0.insert("x-cascade-route", v);
+            let mut payload = injected_payload.clone();
+            self.apply_node_model(&mut payload, &large_node).await;
+            let mut result = self
+                .private_proxy_with_bearer(
+                    &payload, &large_url, large_bearer.as_deref(),
+                    RouteBackend::InferenceServer, false, origin, large_node.as_deref(),
+                )
+                .await;
+            if let Ok(parts) = result.as_mut() {
+                if let Ok(v) = HeaderValue::from_str("auto-large") {
+                    parts.0.insert("x-cascade-route", v);
+                }
             }
-        }
             if result.is_ok() {
-                self.circuit_breaker.record_success(&large_url).await;
                 if let Some(ref key) = session_key {
                     self.session_cache.insert(key.clone(), large_url.clone()).await;
                 }
             }
-            self.metrics.record_request("large");
             return result;
         }
 
@@ -1386,8 +1647,13 @@ impl GatewayState {
         // pre-small) payload to the large model and tags the response.
         let reroute_to_large = async {
             self.metrics.record_fallback("quality_low");
+            let mut payload = injected_payload.clone();
+            self.apply_node_model(&mut payload, &large_node).await;
             let mut result = self
-                .proxy_to_backend(&injected_payload, &large_url, None, false, origin, &mut None)
+                .private_proxy_with_bearer(
+                    &payload, &large_url, large_bearer.as_deref(),
+                    RouteBackend::InferenceServer, false, origin, large_node.as_deref(),
+                )
                 .await;
             if let Ok(parts) = result.as_mut() {
                 if let Ok(v) = HeaderValue::from_str("auto-large") {
@@ -1395,12 +1661,10 @@ impl GatewayState {
                 }
             }
             if result.is_ok() {
-                self.circuit_breaker.record_success(&large_url).await;
                 if let Some(ref key) = session_key {
                     self.session_cache.insert(key.clone(), large_url.clone()).await;
                 }
             }
-            self.metrics.record_request("large");
             result
         };
 

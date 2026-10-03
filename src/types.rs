@@ -379,6 +379,21 @@ pub struct RoutingSettings {
     /// Deterministic short-circuit applied before content detection.
     #[serde(default)]
     pub default_route: Option<String>,
+    /// Hybrid complexity router for the default ("auto") route: a short, plain,
+    /// text-only, tool-less FIRST turn goes to the auxiliary (fast) model
+    /// instead of always using main. Off by default.
+    ///
+    /// `Option` on purpose. The persisted settings blob is restored OVER the
+    /// env defaults at boot, so a plain `bool` with `#[serde(default)]` would
+    /// let a settings file written before this field existed silently reset
+    /// `CASCADE_HYBRID_AUTO` back to off — the env value would look like it
+    /// "does nothing". `None` = never persisted = keep whatever env said.
+    #[serde(default)]
+    pub hybrid_auto: Option<bool>,
+    /// Max length of the last user message that still counts as a "simple"
+    /// prompt. 0 disables the length gate. `None` = keep the env default.
+    #[serde(default)]
+    pub hybrid_aux_max_chars: Option<usize>,
     /// How DOC/COMPRESSION markers are matched in system messages:
     /// "substring" (legacy, compatible) or "prefix" (strict).
     #[serde(default = "default_marker_mode")]
@@ -396,6 +411,8 @@ pub struct RuntimeSettings {
     pub confidence_threshold: f64,
     pub route_tools_to_large: bool,
     pub default_route: Option<String>,
+    pub hybrid_auto: bool,
+    pub hybrid_aux_max_chars: usize,
     pub marker_mode: String,
     pub tts_url: String,
     pub stt_url: String,

@@ -6,6 +6,7 @@
   <title>Cascade LLM Settings - NetAI Stack SE</title>
   <link rel="stylesheet" href="/theme/netai-theme.css">
   <script src="/theme/netai-theme.js"></script>
+  <script src="/theme/netai-lang.js"></script>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body {
@@ -78,12 +79,13 @@
 <body>
   <header>
     <div class="bar">
-    <div class="brand">
-      <a href="/menu/" title="Main menu">NetAI</a>
-      <a href="./" title="Cascade LLM"><strong>Cascade LLM</strong></a>
-    </div>
+      <a class="netai-brandmark" href="/menu/" title="Main menu">
+        <img src="/theme/NETAI_LOGO_Gold_Black_big.png" alt="NetAI logo">
+        <span class="wordmark"><strong data-i18n="menu.cascade">Cascade LLM</strong><span data-i18n="menu.subtitle">On-premise AI for your business</span></span>
+      </a>
     <a class="cog active" href="" title="Settings">&#9881;</a>
     <button data-theme-toggle class="netai-theme-toggle" aria-label="Switch theme"></button>
+    <button data-lang-toggle class="netai-lang-toggle" aria-label="Language"></button>
     </div>
     <nav>
       <a href="./">Dashboard</a>
@@ -139,11 +141,34 @@
         <div class="field">
           <label>Default Route (deterministic override)</label>
           <select id="default-route">
-            <option value="">Auto (content detection)</option>
-            <option value="inference">Inference (main chat)</option>
-            <option value="auxiliary">Auxiliary (compression/fast)</option>
+            <option value="auto">Auto — content detection (see Hybrid Routing below)</option>
+            <option value="inference">Inference (main chat, always)</option>
+            <option value="auxiliary">Auxiliary (compression/fast, always)</option>
             <!-- Route A (OCR) retired: aux VLM reads scans natively -->
           </select>
+        </div>
+      </div>
+      <div class="field-row">
+        <div class="field">
+          <label>Hybrid Routing — simple prompts to the fast model</label>
+          <select id="hybrid-auto">
+            <option value="false">Off — every prompt goes to the main model</option>
+            <option value="true">On — short, plain, tool-less prompts use the auxiliary model</option>
+          </select>
+          <p style="font-size:0.78rem;color:var(--text-faint);margin-top:0.4rem">
+            Only active while Default Route is <strong>Auto</strong> — an explicit
+            Inference/Auxiliary pin overrides it. Anything with an image, a file,
+            audio, a tool (declared or in the history), several turns, a reasoning
+            or code prompt, or more than the length budget below stays on the main
+            model.</p>
+        </div>
+        <div class="field">
+          <label>Simple-prompt length budget (characters)</label>
+          <input type="number" id="hybrid-max-chars" min="0" max="100000" step="50">
+          <p style="font-size:0.78rem;color:var(--text-faint);margin-top:0.4rem">
+            Length of the <em>last user message</em> that still counts as simple.
+            0 disables the length check. Prompting history and system prompts are
+            not counted — only the newest turn.</p>
         </div>
       </div>
       <div class="field">
@@ -258,7 +283,9 @@
         document.getElementById('router-threshold').value = s.routing?.router_threshold ?? 0.5;
         document.getElementById('confidence-threshold').value = s.routing?.confidence_threshold ?? 0.7;
         document.getElementById('route-tools').value = s.routing?.route_tools_to_large ? 'true' : 'false';
-        document.getElementById('default-route').value = s.routing?.default_route || '';
+        document.getElementById('default-route').value = s.routing?.default_route || 'auto';
+        document.getElementById('hybrid-auto').value = s.routing?.hybrid_auto ? 'true' : 'false';
+        document.getElementById('hybrid-max-chars').value = s.routing?.hybrid_aux_max_chars ?? 600;
         document.getElementById('marker-mode').value = s.routing?.marker_mode || 'substring';
         document.getElementById('large-text-url').value = s.large_text_url ?? '';
         document.getElementById('small-mllm-url').value = s.small_mllm_url ?? '';
@@ -299,7 +326,7 @@
           <div class="provider-item">
             <div class="info">
               <div class="name">${p.name} <span class="badge badge-active">${p.provider_type.type || p.provider_type}</span> <span class="role">${p.use_as || 'not routed'}</span></div>
-              <div class="meta">${p.base_url} — ${p.models.join(', ')}</div>
+              <div class="meta">${p.base_url} — ${(p.models || []).join(', ')}</div>
             </div>
             <button class="btn btn-danger" style="padding:0.3rem 0.8rem;font-size:0.75rem" onclick="deleteProvider('${p.id}')">Remove</button>
           </div>
@@ -312,7 +339,9 @@
           router_threshold: parseFloat(document.getElementById('router-threshold').value),
           confidence_threshold: parseFloat(document.getElementById('confidence-threshold').value),
           route_tools_to_large: document.getElementById('route-tools').value === 'true',
-          default_route: document.getElementById('default-route').value || null,
+          default_route: document.getElementById('default-route').value || 'auto',
+          hybrid_auto: document.getElementById('hybrid-auto').value === 'true',
+          hybrid_aux_max_chars: parseInt(document.getElementById('hybrid-max-chars').value, 10) || 0,
           marker_mode: document.getElementById('marker-mode').value || 'substring'
         },
         audio: {
@@ -324,9 +353,18 @@
         providers: currentProviders
       };
       try {
-        await fetch('api/settings', { method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(settings) });
+        const r = await fetch('api/settings', { method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(settings) });
+        // fetch only rejects on a *network* failure — a 4xx/5xx resolves
+        // happily, so without this check a rejected save showed "Settings
+        // saved" (and the field silently kept its old value).
+        if (!r.ok) {
+          const body = await r.json().catch(() => ({}));
+          showToast('Save failed: ' + (body.error || ('HTTP ' + r.status)));
+          return;
+        }
         showToast('Settings saved');
-      } catch(e) { showToast('Error saving settings'); }
+        loadSettings();
+      } catch(e) { showToast('Error saving settings: ' + e.message); }
     }
     async function addProvider() {
       const name = document.getElementById('provider-name').value.trim();
@@ -354,10 +392,15 @@
     }
     async function deleteProvider(id) {
       try {
-        await fetch(`api/providers/${id}`, { method: 'DELETE' });
+        const r = await fetch(`api/providers/${id}`, { method: 'DELETE' });
+        if (!r.ok) {
+          const body = await r.json().catch(() => ({}));
+          showToast('Remove failed: ' + (body.error || ('HTTP ' + r.status)));
+          return;
+        }
         loadProviders();
         showToast('Provider removed');
-      } catch(e) { showToast('Error removing provider'); }
+      } catch(e) { showToast('Error removing provider: ' + e.message); }
     }
     loadSettings();
      loadActiveModels();

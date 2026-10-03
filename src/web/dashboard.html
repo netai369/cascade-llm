@@ -6,6 +6,7 @@
   <title>NetAI Cascade LLM - NetAI Stack SE</title>
   <link rel="stylesheet" href="/theme/netai-theme.css">
   <script src="/theme/netai-theme.js"></script>
+  <script src="/theme/netai-lang.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -127,12 +128,13 @@
 <body>
     <header>
     <div class="bar">
-    <div class="brand">
-      <a href="/menu/" title="Main menu">NetAI</a>
-      <a href="./" title="Cascade LLM"><strong>Cascade LLM</strong></a>
-    </div>
+      <a class="netai-brandmark" href="/menu/" title="Main menu">
+        <img src="/theme/NETAI_LOGO_Gold_Black_big.png" alt="NetAI logo">
+        <span class="wordmark"><strong data-i18n="menu.cascade">Cascade LLM</strong><span data-i18n="menu.subtitle">On-premise AI for your business</span></span>
+      </a>
     <a class="cog" href="settings" title="Settings">&#9881;</a>
     <button data-theme-toggle class="netai-theme-toggle" aria-label="Switch theme"></button>
+    <button data-lang-toggle class="netai-lang-toggle" aria-label="Language"></button>
     </div>
   </header>
   <nav>
@@ -167,6 +169,7 @@
         <input type="password" id="admin-key" placeholder="Admin key (x-cascade-admin-key)" autocomplete="off">
         <button class="btn-sm" onclick="saveKey()">Save</button>
         <button class="btn-sm" onclick="probeNodes()">Probe now</button>
+        <button class="btn-sm" onclick="refreshModels()">🔄 Refresh Models</button>
         <span id="key-status" style="font-size:0.75rem;color:var(--text-faint)"></span>
       </div>
       <div class="node-grid" id="node-grid"></div>
@@ -295,12 +298,12 @@
       try {
         const r = await fetch('api/providers');
         const providers = await r.json();
-        document.getElementById('providers-count').textContent = providers.length;
+        document.getElementById('providers-count').textContent = (providers || []).length;
         const tbody = document.getElementById('providers-table');
-        if (providers.length === 0) {
+        if (!providers || providers.length === 0) {
           tbody.innerHTML = '<tr><td colspan="4" style="color:var(--text-faint)">No external providers configured. Add one in <a href="settings" style="color:var(--accent)">Settings</a>.</td></tr>';
         } else {
-          tbody.innerHTML = providers.map(p => `<tr><td>${p.name}</td><td>${p.provider_type.type || p.provider_type}</td><td>${p.models.join(', ')}</td><td><span class="badge ${p.enabled ? 'badge-active' : 'badge-inactive'}">${p.enabled ? 'Active' : 'Disabled'}</span></td></tr>`).join('');
+          tbody.innerHTML = providers.map(p => `<tr><td>${esc(p.name)}</td><td>${esc(p.provider_type?.type || p.provider_type)}</td><td>${esc((p.models || []).join(', '))}</td><td><span class="badge ${p.enabled ? 'badge-active' : 'badge-inactive'}">${p.enabled ? 'Active' : 'Disabled'}</span></td></tr>`).join('');
         }
       } catch(e) {}
       try {
@@ -311,7 +314,7 @@
         if (localModels.length === 0) {
           tbody.innerHTML = '<tr><td colspan="5" style="color:var(--text-faint)">No local models configured</td></tr>';
         } else {
-          tbody.innerHTML = localModels.map(m => `<tr><td>${m.id}</td><td>${m.model_type || 'Gateway'}</td><td>${m.owned_by}</td><td>${m.description || (m.id === 'cascade-hybrid-v1' ? 'Unified routing identity; selects main or auxiliary backend.' : m.id === 'docling-serve' ? 'Document/OCR service for ingestion, not normal chat.' : 'Model discovered from a local OpenAI-compatible service.')}</td><td><span class="badge badge-active">Active</span></td></tr>`).join('');
+          tbody.innerHTML = localModels.map(m => `<tr><td>${m.id}</td><td>${m.model_type || 'Gateway'}</td><td>${m.owned_by}</td><td>${m.description || (m.id === 'cascade-hybrid-v1' ? 'Unified routing identity; selects main or auxiliary backend.' : m.id === 'docling-serve' ? 'Document/OCR service for ingestion, not normal chat.' : 'Model discovered from a local OpenAI-compatible service.')}</td><td><span class="badge">Advertised</span></td></tr>`).join('');
         }
         document.getElementById('local-models-section').style.display = 'block';
       } catch(e) { console.error('Local models fetch error:', e); }
@@ -335,21 +338,63 @@
       const k = getKey();
       return k ? { 'x-cascade-admin-key': k } : {};
     }
+    // These node actions used to ignore the status entirely, so a rejected
+    // write (most often a missing/wrong admin key -> 403) re-rendered the grid
+    // and looked exactly like a successful one — the activate/deactivate
+    // toggle even snapped back silently, with no message.
+    async function nodeError(r) {
+      const el = document.getElementById('key-status');
+      if (el) {
+        el.textContent = r.status === 403
+          ? 'admin key missing or wrong — set it above and press Save'
+          : `request failed (HTTP ${r.status})`;
+      }
+      refreshNodes();
+    }
     async function probeNodes() {
       try {
-        await fetch('api/v1/admin/upstreams/probe', { method: 'POST', headers: authHeaders() });
+        const r = await fetch('api/v1/admin/upstreams/probe', { method: 'POST', headers: authHeaders() });
+        if (!r.ok) { await nodeError(r); return; }
         refreshNodes();
       } catch(e) { console.error('Probe failed:', e); }
     }
+    async function refreshModels() {
+      try {
+        const btn = event.target;
+        btn.disabled = true;
+        btn.textContent = '⏳ Refreshing...';
+        const r = await fetch('api/v1/admin/upstreams/refresh-models', { method: 'POST', headers: authHeaders() });
+        const d = await r.json();
+        if (d.errors && d.errors.length) {
+          alert(`Updated ${d.updated} node(s). Errors: ${d.errors.join('; ')}`);
+        } else {
+          alert(`Updated ${d.updated} node(s).`);
+        }
+        refreshNodes();
+      } catch(e) {
+        console.error('Model refresh failed:', e);
+        alert('Model refresh failed: ' + e);
+      } finally {
+        const btn = event.target;
+        btn.disabled = false;
+        btn.textContent = '🔄 Refresh Models';
+      }
+    }
     async function toggleNode(id, active) {
-      await fetch(`api/v1/inference-nodes/${encodeURIComponent(id)}/${active ? 'activate' : 'deactivate'}`,
-        { method: 'POST', headers: authHeaders() });
-      refreshNodes();
+      try {
+        const r = await fetch(`api/v1/inference-nodes/${encodeURIComponent(id)}/${active ? 'activate' : 'deactivate'}`,
+          { method: 'POST', headers: authHeaders() });
+        if (!r.ok) { await nodeError(r); return; }
+        refreshNodes();
+      } catch(e) { console.error('Toggle failed:', e); }
     }
     async function deleteNode(role, id) {
       if (!confirm(`Remove node ${id}?`)) return;
-      await fetch(`api/upstreams/${role}?id=${encodeURIComponent(id)}`, { method: 'DELETE', headers: authHeaders() });
-      refreshNodes();
+      try {
+        const r = await fetch(`api/upstreams/${role}?id=${encodeURIComponent(id)}`, { method: 'DELETE', headers: authHeaders() });
+        if (!r.ok) { await nodeError(r); return; }
+        refreshNodes();
+      } catch(e) { console.error('Delete failed:', e); }
     }
     async function submitNode() {
       const role = document.getElementById('nf-role').value;

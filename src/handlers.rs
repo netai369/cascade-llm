@@ -11,6 +11,7 @@ use axum::{
 use http_body_util::BodyExt;
 use base64::Engine;
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::info;
 
 fn json_response(body: serde_json::Value, status: StatusCode) -> Response {
@@ -396,15 +397,47 @@ pub async fn health_check(State(state): State<Arc<GatewayState>>) -> Response {
         })
         .collect();
 
+    // Lightweight liveness probe so /health reflects a dead backend instead
+    // of always reporting "ok" (the compose healthcheck would otherwise never
+    // notice an outage). The configured URLs include the API path
+    // (/v1/chat/completions), so probe the origin's /health.
+    fn origin_of(url: &str) -> String {
+        let trimmed = url.trim_end_matches('/');
+        match trimmed.find("://") {
+            Some(i) => {
+                let rest = &trimmed[i + 3..];
+                match rest.find('/') {
+                    Some(j) => trimmed[..i + 3 + j].to_string(),
+                    None => trimmed.to_string(),
+                }
+            }
+            None => trimmed.to_string(),
+        }
+    }
+    async fn probe(client: &reqwest::Client, base: &str) -> bool {
+        let url = format!("{}/health", origin_of(base));
+        matches!(
+            tokio::time::timeout(Duration::from_secs(3), client.get(&url).send()).await,
+            Ok(Ok(r)) if r.status().is_success()
+        )
+    }
+    let (large_up, small_up) = tokio::join!(
+        probe(&state.http_client, &state.config.large_text_url),
+        probe(&state.http_client, &state.config.small_mllm_url),
+    );
+    let status = if large_up || small_up { "ok" } else { "degraded" };
+
     json_response(
         serde_json::json!({
-            "status": "ok",
+            "status": status,
             "large_model_multimodal": state.config.large_model_multimodal,
             "router_threshold": state.config.router_threshold,
             "confidence_threshold": state.config.confidence_threshold,
             "ocr_server_url": state.config.ocr_server_url,
             "auxiliary_server_url": state.config.small_mllm_url,
             "inference_server_url": state.config.large_text_url,
+            "inference_reachable": large_up,
+            "auxiliary_reachable": small_up,
             "extract_fallback_url": state.config.extract_fallback_url,
             "session_cache_entries": state.session_cache.entry_count(),
             "uptime_seconds": state.start_time.elapsed().as_secs(),
@@ -553,6 +586,8 @@ pub async fn get_settings(State(state): State<Arc<GatewayState>>) -> Response {
     s.routing.confidence_threshold = rt.confidence_threshold;
     s.routing.route_tools_to_large = rt.route_tools_to_large;
     s.routing.default_route = rt.default_route.clone();
+    s.routing.hybrid_auto = Some(rt.hybrid_auto);
+    s.routing.hybrid_aux_max_chars = Some(rt.hybrid_aux_max_chars);
     s.routing.marker_mode = rt.marker_mode.clone();
     s.audio.tts_url = Some(rt.tts_url.clone());
     s.audio.stt_url = Some(rt.stt_url.clone());
@@ -564,8 +599,12 @@ pub async fn get_settings(State(state): State<Arc<GatewayState>>) -> Response {
 
 pub async fn update_settings(
     State(state): State<Arc<GatewayState>>,
+    headers: axum::http::HeaderMap,
     Json(settings): Json<Settings>,
 ) -> Response {
+    if admin_forbidden(&state, &headers) {
+        return json_response(serde_json::json!({"error": "forbidden"}), StatusCode::FORBIDDEN);
+    }
     // Apply to the live runtime…
     {
         let mut rt = state.runtime.write().await;
@@ -580,6 +619,16 @@ pub async fn update_settings(
             .filter(|s| matches!(s.as_str(), "inference" | "auxiliary" | "auto" | ""));  // ocr retired
         if rt.default_route.as_deref() == Some("") {
             rt.default_route = None;
+        }
+        // `None` = field not submitted (e.g. an API caller that doesn't know about
+        // it): keep the current value instead of silently resetting it.
+        if let Some(v) = settings.routing.hybrid_auto {
+            rt.hybrid_auto = v;
+        }
+        // 0 means "no length gate"; anything else is clamped so a typo in the
+        // settings page cannot turn a 4 kB paste into a "simple" prompt.
+        if let Some(n) = settings.routing.hybrid_aux_max_chars {
+            rt.hybrid_aux_max_chars = n.min(100_000);
         }
         rt.marker_mode = match settings.routing.marker_mode.as_str() {
             "prefix" => "prefix".to_string(),
@@ -636,8 +685,12 @@ pub async fn list_providers(State(state): State<Arc<GatewayState>>) -> Response 
 
 pub async fn add_provider(
     State(state): State<Arc<GatewayState>>,
+    headers: axum::http::HeaderMap,
     Json(provider): Json<ProviderConfig>,
 ) -> Response {
+    if admin_forbidden(&state, &headers) {
+        return json_response(serde_json::json!({"error": "forbidden"}), StatusCode::FORBIDDEN);
+    }
     let role = match provider.use_as.as_deref() {
         Some("main") | Some("auxiliary") => provider.use_as.clone().unwrap(),
         Some(_) => return json_response(serde_json::json!({"error": "use_as must be main or auxiliary"}), StatusCode::BAD_REQUEST),
@@ -708,8 +761,12 @@ pub async fn get_provider(
 
 pub async fn delete_provider(
     State(state): State<Arc<GatewayState>>,
+    headers: axum::http::HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
+    if admin_forbidden(&state, &headers) {
+        return json_response(serde_json::json!({"error": "forbidden"}), StatusCode::FORBIDDEN);
+    }
     state.db.delete_provider(&id);
     state.runtime.write().await.providers.retain(|p| p.id != id);
     json_response(
@@ -813,6 +870,28 @@ fn admin_authorized(state: &GatewayState, headers: &axum::http::HeaderMap) -> bo
             .unwrap_or(false),
         None => false,
     }
+}
+
+/// True when a mutating route must be rejected: the admin key is configured
+/// but the request did not present it. When no key is configured the guard is
+/// treated as *not armed* (legacy installs stay usable) — `setup.sh` warns
+/// loudly about that state.
+fn admin_forbidden(state: &GatewayState, headers: &axum::http::HeaderMap) -> bool {
+    state.config.admin_key.is_some() && !admin_authorized(state, headers)
+}
+
+/// Route-level guard for the mutating dashboard/pipeline endpoints. Runs
+/// before body extraction, so an unauthenticated request is rejected with
+/// 403 even when its payload is malformed.
+pub async fn require_admin(
+    State(state): State<Arc<GatewayState>>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    if admin_forbidden(&state, req.headers()) {
+        return json_response(serde_json::json!({"error": "forbidden"}), StatusCode::FORBIDDEN);
+    }
+    next.run(req).await
 }
 
 fn mask_bearer(b: &Option<String>) -> Option<String> {
@@ -1063,6 +1142,82 @@ pub async fn probe_upstreams(
     )
 }
 
+/// Refreshes model names from all registered upstream nodes by calling
+/// `/v1/models` on each node's base URL and updating the registry.
+pub async fn refresh_models_upstreams(
+    State(state): State<Arc<GatewayState>>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    if !admin_authorized(&state, &headers) {
+        return json_response(serde_json::json!({"error": "forbidden"}), StatusCode::FORBIDDEN);
+    }
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(state.config.health_timeout_secs))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
+
+    // Collect all nodes first (registry read lock)
+    let nodes: Vec<UpstreamNode> = {
+        let registry = state.registry.read().await;
+        registry.nodes().into_iter().cloned().collect()
+    };
+
+    let mut updated = 0;
+    let mut errors = Vec::new();
+
+    for node in nodes {
+        let base_url = crate::registry::origin_of(&node.endpoint_url);
+        let models_url = format!("{}/v1/models", base_url);
+        let mut req = client.get(&models_url);
+        if let Some(token) = &node.bearer_token {
+            if !token.is_empty() {
+                req = req.bearer_auth(token);
+            }
+        }
+        match req.send().await {
+            Ok(resp) if resp.status().is_success() => {
+                match resp.json::<serde_json::Value>().await {
+                    Ok(val) => {
+                        if let Some(model_id) = val
+                            .get("data")
+                            .and_then(|d| d.as_array())
+                            .and_then(|a| a.first())
+                            .and_then(|m| m.get("id"))
+                            .and_then(|i| i.as_str())
+                        {
+                            let pretty_name = pretty_model_name(model_id);
+                            // Update the node in the registry
+                            state.registry.write().await.update_model(&node.role, &node.id, &pretty_name);
+                            updated += 1;
+                            info!("MODEL_REFRESH: role={} id={} model={}", node.role, node.id, pretty_name);
+                        } else {
+                            errors.push(format!("{} ({}): no model id in response", node.id, node.role));
+                        }
+                    }
+                    Err(e) => errors.push(format!("{} ({}): parse error: {}", node.id, node.role, e)),
+                }
+            }
+            Ok(resp) => {
+                errors.push(format!("{} ({}): HTTP {}", node.id, node.role, resp.status()));
+            }
+            Err(e) => {
+                errors.push(format!("{} ({}): connection error: {}", node.id, node.role, e));
+            }
+        }
+    }
+
+    let registry = state.registry.read().await;
+    json_response(
+        serde_json::json!({
+            "status": "ok",
+            "updated": updated,
+            "errors": errors,
+            "nodes": registry.nodes().iter().map(|n| node_view(n)).collect::<Vec<_>>(),
+        }),
+        StatusCode::OK,
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Raw text completions (OpenAI /v1/completions -> main role)
 // ---------------------------------------------------------------------------
@@ -1157,8 +1312,12 @@ pub async fn rag_extract(State(state): State<Arc<GatewayState>>, req: Request<Bo
 
 pub async fn register_extraction_backend_handler(
     State(state): State<Arc<GatewayState>>,
+    headers: axum::http::HeaderMap,
     Json(entry): Json<ExtractionBackendEntry>,
 ) -> Response {
+    if admin_forbidden(&state, &headers) {
+        return json_response(serde_json::json!({"error": "forbidden"}), StatusCode::FORBIDDEN);
+    }
     state.register_extraction_backend(entry.clone()).await;
     json_response(
         serde_json::json!({ "status": "ok", "id": entry.id }),
@@ -1168,8 +1327,12 @@ pub async fn register_extraction_backend_handler(
 
 pub async fn remove_extraction_backend_handler(
     State(state): State<Arc<GatewayState>>,
+    headers: axum::http::HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
+    if admin_forbidden(&state, &headers) {
+        return json_response(serde_json::json!({"error": "forbidden"}), StatusCode::FORBIDDEN);
+    }
     let removed = state.remove_extraction_backend(&id).await;
     if removed {
         json_response(serde_json::json!({ "status": "deleted", "id": id }), StatusCode::OK)

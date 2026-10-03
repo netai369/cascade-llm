@@ -39,6 +39,13 @@ pub struct AppConfig {
     pub llama_api_key: Option<String>,
     /// Deterministic routing mode: none|inference|auxiliary|ocr (CASCADE_DEFAULT_ROUTE).
     pub default_route: Option<String>,
+    /// Hybrid complexity router: when the default route is auto, a short plain
+    /// prompt goes to the auxiliary (fast) model instead of always using main
+    /// (CASCADE_HYBRID_AUTO). Off by default.
+    pub hybrid_auto: bool,
+    /// Max length of the last user message that still counts as a "simple"
+    /// prompt (CASCADE_HYBRID_AUX_MAX_CHARS). 0 disables the length gate.
+    pub hybrid_aux_max_chars: usize,
     /// Marker matching mode for doc/compression detection: substring|prefix.
     pub marker_mode: String,
 
@@ -206,6 +213,13 @@ impl AppConfig {
             admin_key: std::env::var("CASCADE_ADMIN_KEY").ok().filter(|s| !s.is_empty()),
             llama_api_key: std::env::var("LLAMA_API_KEY").ok().filter(|s| !s.is_empty()),
             default_route: std::env::var("CASCADE_DEFAULT_ROUTE").ok().filter(|s| !s.is_empty()),
+            hybrid_auto: std::env::var("CASCADE_HYBRID_AUTO")
+                .unwrap_or_else(|_| "false".to_string())
+                .eq_ignore_ascii_case("true"),
+            hybrid_aux_max_chars: std::env::var("CASCADE_HYBRID_AUX_MAX_CHARS")
+                .ok()
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .unwrap_or(600),
             marker_mode: std::env::var("MARKER_MODE").unwrap_or_else(|_| "substring".to_string()),
 
             image_generation_url: std::env::var("IMAGE_GENERATION_URL")
@@ -294,6 +308,8 @@ impl AppConfig {
                 confidence_threshold: self.confidence_threshold,
                 route_tools_to_large: self.route_tools_to_large,
                 default_route: self.default_route.clone(),
+                hybrid_auto: Some(self.hybrid_auto),
+                hybrid_aux_max_chars: Some(self.hybrid_aux_max_chars),
                 marker_mode: self.marker_mode.clone(),
             },
             audio: AudioSettings {
