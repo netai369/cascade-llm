@@ -214,28 +214,39 @@ pub async fn chat_completions(
 }
 
 async fn fetch_models_from(client: &reqwest::Client, base_url: &str, model_type: &str) -> Vec<serde_json::Value> {
-    let url = format!("{}/models", base_url.trim_end_matches('/'));
-    match client.get(&url).send().await {
-        Ok(resp) if resp.status().is_success() => {
-            match resp.json::<serde_json::Value>().await {
-                Ok(val) => {
-                    let mut models = val.get("data")
-                        .and_then(|d| d.as_array())
-                        .cloned()
-                        .unwrap_or_default();
-                    for m in &mut models {
-                        if let Some(obj) = m.as_object_mut() {
-                            obj.insert("model_type".to_string(), serde_json::Value::String(model_type.to_string()));
+    let base = base_url.trim_end_matches('/');
+    // vLLM and OVMS serve /v1/models; llama.cpp serves both /v1/models and
+    // /models. Fetching only /models got a 400 from OVMS ("Invalid request URL")
+    // and left the dashboard's Local Models table empty while it kept showing
+    // stale llama.cpp entries.
+    let mut models: Vec<serde_json::Value> = Vec::new();
+    for path in ["/v1/models", "/models"] {
+        let url = format!("{base}{path}");
+        match client.get(&url).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                match resp.json::<serde_json::Value>().await {
+                    Ok(val) => {
+                        models = val.get("data")
+                            .and_then(|d| d.as_array())
+                            .cloned()
+                            .unwrap_or_default();
+                        if !models.is_empty() {
+                            break;
                         }
                     }
-                    models
+                    Err(e) => { tracing::warn!("Failed to parse models from {}: {}", url, e); }
                 }
-                Err(e) => { tracing::warn!("Failed to parse models from {}: {}", url, e); vec![] }
             }
+            Ok(resp) => { tracing::warn!("Models fetch from {} returned HTTP {}", url, resp.status()); }
+            Err(e) => { tracing::warn!("Failed to connect to {}: {}", url, e); }
         }
-        Ok(resp) => { tracing::warn!("Models fetch from {} returned HTTP {}", url, resp.status()); vec![] }
-        Err(e) => { tracing::warn!("Failed to connect to {}: {}", url, e); vec![] }
     }
+    for m in &mut models {
+        if let Some(obj) = m.as_object_mut() {
+            obj.insert("model_type".to_string(), serde_json::Value::String(model_type.to_string()));
+        }
+    }
+    models
 }
 
 pub async fn list_models(State(state): State<Arc<GatewayState>>) -> Response {

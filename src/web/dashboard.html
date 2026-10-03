@@ -309,7 +309,7 @@
       try {
         const r = await fetch('models');
         const models = await r.json();
-        const localModels = models.data.filter(m => m.owned_by === 'netai-stack' || m.owned_by === 'llamacpp');
+        const localModels = models.data.filter(m => m.owned_by === 'netai-stack' || m.owned_by === 'llamacpp' || m.owned_by === 'OVMS' || m.owned_by === 'vllm');
         const tbody = document.getElementById('local-models-table');
         if (localModels.length === 0) {
           tbody.innerHTML = '<tr><td colspan="5" style="color:var(--text-faint)">No local models configured</td></tr>';
