@@ -184,6 +184,50 @@ async fn put_get_delete_upstream_lifecycle() {
 }
 
 #[tokio::test]
+async fn native_engine_base_urls_and_embeddings_role_are_supported() {
+    let base = spawn_gateway().await;
+    let client = reqwest::Client::new();
+    let response = client
+        .put(format!("{}/web/api/upstreams/main", base))
+        .headers(admin_headers())
+        .json(&serde_json::json!({
+            "endpoint_url": "http://localhost:8080/v1",
+            "engine": "vmlx",
+            "model": "mlx-main",
+            "max_context_length": 32768
+        }))
+        .send().await.unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::CREATED);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["node"]["endpoint_url"], "http://localhost:8080/v1/chat/completions");
+    assert_eq!(body["node"]["engine"], "vmlx");
+
+    let response = client
+        .put(format!("{}/web/api/upstreams/embeddings", base))
+        .headers(admin_headers())
+        .json(&serde_json::json!({
+            "endpoint_url": "http://localhost:8081/v1",
+            "engine": "inferencer",
+            "label": "Mac embeddings"
+        }))
+        .send().await.unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::CREATED);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["role"], "embeddings");
+    assert_eq!(body["node"]["endpoint_url"], "http://localhost:8081/v1");
+
+    // User-facing `vision` is an alias for the existing `ocr` router role.
+    let response = client
+        .put(format!("{}/web/api/upstreams/vision", base))
+        .headers(admin_headers())
+        .json(&serde_json::json!({"endpoint_url":"http://localhost:8081/v1","engine":"llamacpp"}))
+        .send().await.unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::CREATED);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["role"], "ocr");
+}
+
+#[tokio::test]
 async fn rag_extract_without_worker_returns_503() {
     let base = spawn_gateway().await;
     let client = reqwest::Client::new();

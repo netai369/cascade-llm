@@ -193,6 +193,9 @@ pub struct ProxyError {
     /// True when the failure is a transport/connectivity issue (endpoint down),
     /// rather than an HTTP error returned by the backend itself.
     pub unreachable: bool,
+    /// Actionable hint for a disconnected native engine (e.g. start vmlx on
+    /// the Mac host); omitted for ordinary HTTP errors and container services.
+    pub service_action: Option<String>,
 }
 
 impl ProxyError {
@@ -206,6 +209,7 @@ impl ProxyError {
             backend: backend.into(),
             context: context.into(),
             unreachable: false,
+            service_action: None,
         }
     }
 
@@ -219,7 +223,13 @@ impl ProxyError {
             backend: backend.into(),
             context: context.into(),
             unreachable: true,
+            service_action: None,
         }
+    }
+
+    pub fn with_service_action(mut self, action: Option<String>) -> Self {
+        self.service_action = action;
+        self
     }
 }
 
@@ -230,6 +240,7 @@ impl From<axum::http::StatusCode> for ProxyError {
             backend: "backend".to_string(),
             context: format!("backend request failed with HTTP {}", s.as_u16()),
             unreachable: false,
+            service_action: None,
         }
     }
 }

@@ -12,7 +12,7 @@ use http_body_util::BodyExt;
 use base64::Engine;
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::info;
+use tracing::{info, warn};
 
 fn json_response(body: serde_json::Value, status: StatusCode) -> Response {
     let body_str = body.to_string();
@@ -207,6 +207,7 @@ pub async fn chat_completions(
                         "message": details,
                         "type": err_type,
                         "backend": e.backend,
+                        "service_action": e.service_action,
                         "param": serde_json::Value::Null,
                         "code": serde_json::Value::Number(status.as_u16().into())
                     }
@@ -1363,6 +1364,13 @@ fn mask_bearer(b: &Option<String>) -> Option<String> {
     })
 }
 
+async fn persist_upstream_registry(state: &Arc<GatewayState>) {
+    let nodes: Vec<_> = state.registry.read().await.nodes().into_iter().cloned().collect();
+    if let Err(e) = state.db.save_upstreams(&nodes) {
+        warn!("Could not persist upstream registry: {}", e);
+    }
+}
+
 /// Public JSON view of a node — never leaks the bearer token.
 fn node_view(node: &crate::registry::UpstreamNode) -> serde_json::Value {
     let mut v = serde_json::to_value(node).unwrap_or(serde_json::Value::Null);
@@ -1401,8 +1409,10 @@ pub async fn list_upstreams(
             "defaults": {
                 "main": state.config.large_text_url,
                 "auxiliary": state.config.small_mllm_url,
+                "vision": state.config.ocr_server_url,
                 "ocr": state.config.ocr_server_url,
                 "image": state.config.image_generation_url,
+                "embeddings": state.config.embeddings_url,
                 "rag_worker": null,
             }
         }),
@@ -1446,9 +1456,15 @@ pub async fn put_upstream(
             )
         }
     };
-    let req = RegisterUpstreamRequest { endpoint_url: Some(url), ..req };
+    let host_gateway = std::env::var("CASCADE_HOST_GATEWAY").is_ok_and(|v| v.eq_ignore_ascii_case("true"));
+    let url = crate::registry::resolve_host_gateway_url(&url, host_gateway);
+    let url = crate::registry::normalize_endpoint_url(&role, &url);
+    let health_url = req.health_url.as_deref()
+        .map(|u| crate::registry::resolve_host_gateway_url(u, host_gateway));
+    let req = RegisterUpstreamRequest { endpoint_url: Some(url), health_url, ..req };
 
     let result = state.registry.write().await.upsert(&role, req);
+    persist_upstream_registry(&state).await;
     info!("UPSTREAM_PUT: role={} id={} created={}", role, result.node.id, result.created);
     json_response(
         serde_json::json!({
@@ -1481,7 +1497,12 @@ pub async fn delete_upstream(
     };
     // `?id=` targets a single node; without it the whole role pool is cleared.
     if let Some(id) = query.get("id") {
+        let belongs = state.registry.read().await.get(id).is_some_and(|n| n.role == role);
+        if !belongs {
+            return json_response(serde_json::json!({"error": "node not found for this role"}), StatusCode::NOT_FOUND);
+        }
         let removed = state.registry.write().await.remove_id(id);
+        persist_upstream_registry(&state).await;
         return match removed {
             Some(n) if n.role == role => json_response(
                 serde_json::json!({"status": "cleared", "id": id}),
@@ -1494,6 +1515,7 @@ pub async fn delete_upstream(
         };
     }
     let removed = state.registry.write().await.remove_role(&role);
+    persist_upstream_registry(&state).await;
     info!("UPSTREAM_DELETE: role={} removed={}", role, removed);
     json_response(
         serde_json::json!({"status": "cleared", "removed": removed}),
@@ -1518,6 +1540,7 @@ async fn set_node_active(
         );
     }
     state.registry.write().await.set_active(&id, active);
+    persist_upstream_registry(&state).await;
     info!("NODE_TOGGLE: id={} active={}", id, active);
     json_response(
         serde_json::json!({"status": "ok", "id": id, "active": active}),
@@ -1567,8 +1590,10 @@ pub async fn admin_upstreams(
             "defaults": {
                 "main": state.config.large_text_url,
                 "auxiliary": state.config.small_mllm_url,
+                "vision": state.config.ocr_server_url,
                 "ocr": state.config.ocr_server_url,
                 "image": state.config.image_generation_url,
+                "embeddings": state.config.embeddings_url,
                 "video": state.config.video_generation_url,
             },
             "health": {

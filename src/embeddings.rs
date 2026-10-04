@@ -27,7 +27,7 @@ pub async fn rerank_handler(
 }
 
 async fn proxy_json_api(state: Arc<GatewayState>, req: Request<Body>, service: &str) -> Response {
-    let (base_url, endpoint) = match service {
+    let (default_url, endpoint) = match service {
         "embeddings" => (
             state.config.embeddings_url.clone(),
             "/v1/embeddings",
@@ -35,7 +35,33 @@ async fn proxy_json_api(state: Arc<GatewayState>, req: Request<Body>, service: &
         "rerank" => (state.config.rerank_url.clone(), "/v1/rerank"),
         _ => unreachable!("unsupported embedding service"),
     };
-    let target_url = format!("{}{}", base_url.trim_end_matches('/'), endpoint);
+    let (node, had_registered_pool) = {
+        let registry = state.registry.read().await;
+        let had_pool = registry.nodes().iter().any(|n| n.role == "embeddings");
+        (registry.pick("embeddings"), had_pool)
+    };
+    if had_registered_pool && node.is_none() {
+        let body = serde_json::json!({"error": {
+            "message": format!("No healthy embeddings backend is available for {service}; start the configured native/container service and check its health."),
+            "type": "cascade_backend_unavailable", "backend": "embeddings", "code": 503
+        }});
+        return Response::builder().status(StatusCode::SERVICE_UNAVAILABLE)
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string())).unwrap();
+    }
+    let (target_url, bearer, node_id) = if let Some(node) = node {
+        let base = node.endpoint_url.trim_end_matches('/');
+        let target = if base.ends_with(endpoint) {
+            base.to_string()
+        } else if base.ends_with("/v1") {
+            format!("{}{}", base.trim_end_matches("/v1"), endpoint)
+        } else {
+            format!("{}{}", base, endpoint)
+        };
+        (target, node.bearer_token, Some(node.id))
+    } else {
+        (format!("{}{}", default_url.trim_end_matches('/'), endpoint), None, None)
+    };
     info!("{} proxy: {} -> {}", service, req.uri(), target_url);
 
     let method = req.method().clone();
@@ -52,9 +78,14 @@ async fn proxy_json_api(state: Arc<GatewayState>, req: Request<Body>, service: &
 
     let mut upstream = state.http_client.request(method, target_url);
     for (key, value) in &headers {
-        if key != "host" {
+        if key != "host" && key != "authorization" {
             upstream = upstream.header(key, value);
         }
+    }
+    if let Some(token) = bearer.as_deref().filter(|t| !t.is_empty()) {
+        upstream = upstream.bearer_auth(token);
+    } else if let Some(value) = headers.get("authorization") {
+        upstream = upstream.header("authorization", value);
     }
 
     match upstream.body(body).send().await {
@@ -82,8 +113,12 @@ async fn proxy_json_api(state: Arc<GatewayState>, req: Request<Body>, service: &
         Err(error) => {
             warn!("{} proxy error: {}", service, error);
             Response::builder()
-                .status(StatusCode::BAD_GATEWAY)
-                .body(Body::from(format!("Proxy error: {}", error)))
+                .status(StatusCode::SERVICE_UNAVAILABLE)
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::json!({"error": {
+                    "message": format!("{} backend {} is unreachable: {}. Start or restart that native/container service, then retry.", service, node_id.as_deref().unwrap_or("default"), error),
+                    "type": "cascade_backend_unavailable", "backend": "embeddings", "code": 503
+                }}).to_string()))
                 .unwrap()
         }
     }

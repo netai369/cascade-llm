@@ -23,6 +23,17 @@ use tracing::{info, warn};
 /// direction for a router whose whole job is to avoid downgrading real work.
 const HYBRID_MAX_KEYWORD_SCORE: f64 = 0.0;
 
+fn native_service_action(engine: &str) -> Option<String> {
+    let action = match engine.to_ascii_lowercase().as_str() {
+        "vmlx" | "mlx" => "Start the vmlx/MLX server on the registered Mac host URL.",
+        "inferencer" => "Start the Inferencer service on the registered Mac host URL.",
+        "llamacpp" | "llama.cpp" => "Start llama-server on the registered host URL.",
+        "sd.cpp" | "sd-cpp" => "Start sd.cpp on the registered host URL.",
+        _ => return None,
+    };
+    Some(action.to_string())
+}
+
 pub async fn fetch_large_model_multimodal_async(capability_url: &str) -> bool {
     let url = capability_url.trim_end_matches('/');
     match reqwest::Client::new().get(url).send().await {
@@ -1184,11 +1195,14 @@ impl GatewayState {
         if self.circuit_breaker.is_open(url).await {
             warn!("Circuit breaker OPEN for {}, refusing {}", url, backend_name);
             self.metrics.record_fallback("backend_unavailable");
+            let action = if let Some(id) = node_id {
+                self.registry.read().await.get(id).and_then(|n| n.engine.as_deref().and_then(native_service_action))
+            } else { None };
             return Err(ProxyError::unreachable(
                 StatusCode::SERVICE_UNAVAILABLE,
                 backend_name,
                 format!("{} circuit breaker open (too many recent failures)", backend_name),
-            ));
+            ).with_service_action(action));
         }
 
         let mut header_latency = None;
@@ -1218,11 +1232,14 @@ impl GatewayState {
                     self.metrics.record_fallback("backend_unavailable");
                 }
                 if e.unreachable {
+                    let action = if let Some(id) = node_id {
+                        self.registry.read().await.get(id).and_then(|n| n.engine.as_deref().and_then(native_service_action))
+                    } else { None };
                     Err(ProxyError::unreachable(
                         StatusCode::SERVICE_UNAVAILABLE,
                         backend_name,
                         format!("{} server unavailable: {}", backend_name, e.context),
-                    ))
+                    ).with_service_action(action))
                 } else {
                     Err(ProxyError::new(
                         e.status,

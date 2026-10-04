@@ -14,7 +14,7 @@ use tracing::{info, warn};
 use futures_util::StreamExt;
 
 /// Canonical upstream roles managed by the registry.
-pub const ROLES: &[&str] = &["main", "auxiliary", "ocr", "image", "rag_worker"];
+pub const ROLES: &[&str] = &["main", "auxiliary", "ocr", "image", "embeddings", "rag_worker"];
 
 /// Node selection strategy across a role's pool (LiteLLM-inspired).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -54,9 +54,43 @@ pub fn canonical_role(role: &str) -> Option<&'static str> {
         "auxiliary" | "aux" => Some("auxiliary"),
         "ocr" | "vision" => Some("ocr"),
         "image" | "img" => Some("image"),
+        "embeddings" | "embedding" => Some("embeddings"),
         "rag_worker" | "rag" => Some("rag_worker"),
         _ => None,
     }
+}
+
+/// Resolve loopback URLs registered from inside a container to the host alias.
+/// Native gateway processes keep localhost unchanged. Container deployments
+/// opt in with `CASCADE_HOST_GATEWAY=true`; this avoids guessing based on OS or
+/// Docker internals and leaves service-DNS URLs untouched.
+pub fn resolve_host_gateway_url(url: &str, enabled: bool) -> String {
+    if !enabled {
+        return url.to_string();
+    }
+    for prefix in ["http://localhost:", "https://localhost:", "http://127.0.0.1:", "https://127.0.0.1:"] {
+        if let Some(rest) = url.strip_prefix(prefix) {
+            let scheme = if prefix.starts_with("https") { "https" } else { "http" };
+            return format!("{}://host.docker.internal:{}", scheme, rest);
+        }
+    }
+    url.to_string()
+}
+
+/// Accept either an exact OpenAI endpoint or a server's `/v1` base URL.
+pub fn normalize_endpoint_url(role: &str, url: &str) -> String {
+    let trimmed = url.trim_end_matches('/');
+    if !trimmed.ends_with("/v1") {
+        return trimmed.to_string();
+    }
+    let suffix = match role {
+        "main" | "auxiliary" | "ocr" => "/chat/completions",
+        "image" => "/images/generations",
+        // The embedding proxy selects /v1/embeddings or /v1/rerank per route.
+        "embeddings" | "rag_worker" => return trimmed.to_string(),
+        _ => return trimmed.to_string(),
+    };
+    format!("{}{}", trimmed, suffix)
 }
 
 /// Payload for `PUT /web/api/upstreams/{role}`. Accepts both the current field
@@ -66,6 +100,10 @@ pub struct RegisterUpstreamRequest {
     /// Exact URL requests are forwarded to (chat roles: `/v1/chat/completions`).
     #[serde(alias = "url")]
     pub endpoint_url: Option<String>,
+    /// Backend family for diagnostics/UI (`vmlx`, `inferencer`, `llamacpp`,
+    /// `ovms`, `vllm`, `sglang`, `triton`, or an external API label).
+    #[serde(default)]
+    pub engine: Option<String>,
     #[serde(alias = "bearer", alias = "bearer_token")]
     pub bearer_token: Option<String>,
     #[serde(default)]
@@ -111,6 +149,8 @@ pub struct UpstreamNode {
     pub id: String,
     pub role: String,
     pub endpoint_url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub engine: Option<String>,
     #[serde(skip_serializing)]
     pub bearer_token: Option<String>,
     pub weight: u32,
@@ -252,6 +292,9 @@ impl UpstreamRegistry {
                     node.last_latency_ms = None;
                 }
                 node.endpoint_url = url.clone();
+                if req.engine.is_some() {
+                    node.engine = req.engine;
+                }
                 if req.bearer_token.is_some() {
                     node.bearer_token = req.bearer_token;
                 }
@@ -285,6 +328,7 @@ impl UpstreamRegistry {
                     id: req.id.clone().unwrap_or_else(|| generated_id(role, &url)),
                     role: role.to_string(),
                     endpoint_url: url.clone(),
+                    engine: req.engine,
                     bearer_token: req.bearer_token,
                     weight: req.weight.unwrap_or(1).clamp(1, 64),
                     max_context_length: req.max_context_length,
@@ -526,20 +570,30 @@ pub async fn run_health_sweep(
     let results = futures_util::stream::iter(targets)
         .map(|(id, url, bearer)| async move {
             let start = Instant::now();
-            // Any HTTP response below 500 proves the node is up — minimal
-            // workers without a /health route (404/405) stay in the pool.
-            // Nodes behind an armed LLAMA_API_KEY answer 401 without the
-            // bearer, so attach the registered token when present.
+            // Nodes behind an API key answer 401 without the bearer, so attach
+            // the registered token when present. Missing `/health` falls back
+            // to OpenAI model discovery below.
             let mut req = client.get(&url);
-            if let Some(token) = bearer {
+            if let Some(token) = &bearer {
                 if !token.is_empty() {
                     req = req.bearer_auth(token);
                 }
             }
-            let ok = req.send().await.map(|r| {
-                let s = r.status();
-                s.is_success() || s.is_redirection() || s.as_u16() == 404 || s.as_u16() == 405
-            }).unwrap_or(false);
+            let ok = match req.send().await {
+                Ok(response) if response.status().is_success() || response.status().is_redirection() => true,
+                // Some OpenAI-compatible servers have no `/health`. Probe the
+                // discovery endpoint instead of treating an arbitrary 404 as
+                // healthy (a restarted native Mac process should demote/recover).
+                Ok(response) if matches!(response.status().as_u16(), 404 | 405) => {
+                    let models_url = format!("{}/v1/models", origin_of(&url));
+                    let mut fallback = client.get(models_url);
+                    if let Some(token) = &bearer {
+                        if !token.is_empty() { fallback = fallback.bearer_auth(token); }
+                    }
+                    fallback.send().await.map(|r| r.status().is_success() || r.status().is_redirection()).unwrap_or(false)
+                }
+                Ok(_) | Err(_) => false,
+            };
             (id, ok, start.elapsed().as_millis() as u64)
         })
         .buffer_unordered(16)
@@ -570,6 +624,7 @@ mod tests {
     fn req(url: &str) -> RegisterUpstreamRequest {
         RegisterUpstreamRequest {
             endpoint_url: Some(url.to_string()),
+            engine: None,
             bearer_token: None,
             weight: None,
             max_context_length: None,
@@ -589,7 +644,25 @@ mod tests {
         assert_eq!(canonical_role("Inference"), Some("main"));
         assert_eq!(canonical_role("aux"), Some("auxiliary"));
         assert_eq!(canonical_role("rag"), Some("rag_worker"));
+        assert_eq!(canonical_role("embedding"), Some("embeddings"));
+        assert_eq!(canonical_role("vision"), Some("ocr"));
         assert_eq!(canonical_role("nope"), None);
+    }
+
+    #[test]
+    fn localhost_is_rewritten_only_for_container_host_bridge_mode() {
+        assert_eq!(resolve_host_gateway_url("http://localhost:8080/v1", false), "http://localhost:8080/v1");
+        assert_eq!(resolve_host_gateway_url("http://localhost:8080/v1", true), "http://host.docker.internal:8080/v1");
+        assert_eq!(resolve_host_gateway_url("http://127.0.0.1:8081/v1", true), "http://host.docker.internal:8081/v1");
+        assert_eq!(resolve_host_gateway_url("http://ovms:18000/v1", true), "http://ovms:18000/v1");
+    }
+
+    #[test]
+    fn v1_base_urls_are_expanded_for_chat_and_image_roles() {
+        assert_eq!(normalize_endpoint_url("main", "http://localhost:8080/v1"), "http://localhost:8080/v1/chat/completions");
+        assert_eq!(normalize_endpoint_url("ocr", "http://localhost:8081/v1/"), "http://localhost:8081/v1/chat/completions");
+        assert_eq!(normalize_endpoint_url("image", "http://localhost:8082/v1"), "http://localhost:8082/v1/images/generations");
+        assert_eq!(normalize_endpoint_url("embeddings", "http://localhost:8801/v1"), "http://localhost:8801/v1");
     }
 
     #[test]

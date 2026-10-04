@@ -99,6 +99,23 @@ async fn main() {
         }
     }
 
+    // Restore operator-registered local/cloud upstreams from SQLite. Health
+    // observations intentionally start fresh and are repopulated by the
+    // background prober; endpoint identity and active/inactive state persist.
+    match db.load_upstreams() {
+        Ok(saved) => {
+            for (role, request) in saved {
+                if let Some(role) = registry::canonical_role(&role) {
+                    state.registry.write().await.upsert(role, request);
+                }
+            }
+            if !state.registry.read().await.nodes().is_empty() {
+                info!("Restored persisted dynamic upstreams");
+            }
+        }
+        Err(e) => warn!("Cannot restore persisted upstreams: {}", e),
+    }
+
     // Providers saved earlier re-enter the runtime registry here.
     match db.load_providers() {
         Ok(list) if !list.is_empty() => {
