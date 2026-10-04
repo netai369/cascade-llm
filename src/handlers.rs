@@ -118,11 +118,15 @@ pub async fn chat_completions(
 
     let json: ChatCompletionRequest = match serde_json::from_slice(&body_bytes) {
         Ok(j) => j,
-        Err(_) => {
+        Err(e) => {
+            // Name the parse failure. The message used to be a flat "Invalid
+            // JSON" for *every* deserialization problem, so the single most
+            // common cause — omitting `model`, which this struct requires —
+            // read as a client bug with no way to tell.
             return json_response(
                 serde_json::json!({
                     "error": {
-                        "message": "Invalid JSON",
+                        "message": format!("Invalid request body: {}", e),
                         "type": "cascade_proxy_error",
                         "param": serde_json::Value::Null,
                         "code": 400
@@ -250,27 +254,75 @@ async fn fetch_models_from(client: &reqwest::Client, base_url: &str, model_type:
 }
 
 pub async fn list_models(State(state): State<Arc<GatewayState>>) -> Response {
-    let large_models = fetch_models_from(&state.http_client, &state.config.large_text_url.replace("/v1/chat/completions", ""), "Main").await;
-    let small_models = fetch_models_from(&state.http_client, &state.config.small_mllm_url.replace("/v1/chat/completions", ""), "Compression").await;
-    let ocr_models = fetch_models_from(&state.http_client, &state.config.ocr_server_url.replace("/v1/chat/completions", ""), "OCR").await;
+    let large_base = state.config.large_text_url.replace("/v1/chat/completions", "");
+    let small_base = state.config.small_mllm_url.replace("/v1/chat/completions", "");
+    let ocr_base = state.config.ocr_server_url.replace("/v1/chat/completions", "");
 
-    let mut all_models = large_models;
-    all_models.extend(small_models);
-    all_models.extend(if ocr_models.is_empty() {
-        // Backend not reachable yet — still advertise the configured OCR model id.
-        serde_json::to_value(build_model_info(&state.config.ocr_model_name))
-            .ok()
-            .filter(|m| m.is_object())
-            .into_iter()
-            .collect()
-    } else {
-        ocr_models
-    });
+    // Each fetch reports where it found the model rather than pretending to know
+    // what it can do. Under OVMS one process serves the chat AND the embedding
+    // graphs, so "found on the main origin" is the only honest claim available —
+    // calling `bge-m3` a "Main" model (the old `model_type` tag) is a guess that
+    // was wrong on the live system.
+    let large_models = fetch_models_from(&state.http_client, &large_base, "Main").await;
+    let small_models = fetch_models_from(&state.http_client, &small_base, "Auxiliary").await;
+    let ocr_models = fetch_models_from(&state.http_client, &ocr_base, "OCR").await;
 
-    // Unified model identity: prepend the cascade-hybrid model so
-    // clients (LibreChat, Hermes, etc.) see one stable model name.
+    // Unified model identity: the cascade-hybrid model is what clients
+    // (LibreChat, Hermes, …) send, so it leads the list. It carries an explicit
+    // flag rather than relying on `owned_by`: the configured OCR fallback is
+    // built by the same helper and is also `netai-stack`, and the console used
+    // to label it "gateway identity — send this one".
     let hybrid = build_model_info(&state.config.cascade_model_name);
-    all_models.insert(0, serde_json::to_value(hybrid).unwrap_or_default());
+    let mut all_models = vec![serde_json::to_value(hybrid)
+        .map(|mut m| {
+            if let Some(obj) = m.as_object_mut() {
+                obj.insert("advertised_identity".into(), serde_json::json!(true));
+            }
+            m
+        })
+        .unwrap_or_default()];
+
+    let mut seen: std::collections::HashSet<String> = all_models
+        .iter()
+        .filter_map(|m| m.get("id").and_then(|v| v.as_str()).map(str::to_string))
+        .collect();
+
+    let append = |models: Vec<serde_json::Value>, origin: &str, seen: &mut std::collections::HashSet<String>, out: &mut Vec<serde_json::Value>| {
+        for mut m in models {
+            if let Some(obj) = m.as_object_mut() {
+                obj.insert("discovered_via".into(), serde_json::json!(origin));
+            }
+            let id = m.get("id").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+            // De-duplicate by id. The gateway identity wins the slot: it is the
+            // id that actually works upstream (gotcha 40/68), so a second entry
+            // with the same name — which the live OVMS setup produced — is noise
+            // in every consumer's model picker.
+            if id.is_empty() || !seen.insert(id) {
+                continue;
+            }
+            out.push(m);
+        }
+    };
+
+    append(large_models, &large_base, &mut seen, &mut all_models);
+    append(small_models, &small_base, &mut seen, &mut all_models);
+    if ocr_models.is_empty() {
+        // Backend not reachable yet — still advertise the configured OCR model id.
+        if seen.insert(state.config.ocr_model_name.clone()) {
+            all_models.push(serde_json::to_value(build_model_info(&state.config.ocr_model_name))
+                .ok()
+                .filter(|m| m.is_object())
+                .map(|mut m| {
+                    if let Some(obj) = m.as_object_mut() {
+                        obj.insert("discovered_via".into(), serde_json::json!(ocr_base));
+                    }
+                    m
+                })
+                .unwrap_or_default());
+        }
+    } else {
+        append(ocr_models, &ocr_base, &mut seen, &mut all_models);
+    }
 
     json_response(
         serde_json::json!({
@@ -292,6 +344,26 @@ pub async fn active_models(State(state): State<Arc<GatewayState>>) -> Response {
         registry.nodes().into_iter().cloned().collect()
     };
     let providers = state.runtime.read().await.providers.clone();
+    // Which model id does this role actually serve? A registered node declares
+    // its own; otherwise it is the configured default. This is what we look for
+    // in the upstream's `/v1/models` — see `fetch_reported_model`.
+    let declared: std::collections::HashMap<&str, Option<String>> = {
+        let registry = state.registry.read().await;
+        ["main", "auxiliary"]
+            .iter()
+            .map(|r| (*r, registry.get_by_role_active(r).and_then(|n| n.model.clone())))
+            .collect()
+    };
+    let main_preferred = declared
+        .get("main")
+        .cloned()
+        .flatten()
+        .unwrap_or_else(|| state.config.main_model_name.clone());
+    let aux_preferred = declared
+        .get("auxiliary")
+        .cloned()
+        .flatten()
+        .unwrap_or_else(|| state.config.small_model_name.clone());
     let main = role_active_status(
         &state.http_client,
         &nodes,
@@ -299,6 +371,7 @@ pub async fn active_models(State(state): State<Arc<GatewayState>>) -> Response {
         "main",
         &state.config.large_text_url,
         &state.config.main_model_name,
+        &main_preferred,
     )
     .await;
     let auxiliary = role_active_status(
@@ -308,6 +381,7 @@ pub async fn active_models(State(state): State<Arc<GatewayState>>) -> Response {
         "auxiliary",
         &state.config.small_mllm_url,
         &state.config.small_model_name,
+        &aux_preferred,
     )
     .await;
     json_response(
@@ -325,7 +399,11 @@ fn pretty_model_name(id: &str) -> String {
     id.strip_suffix(".gguf").unwrap_or(id).to_string()
 }
 
-async fn fetch_reported_model(client: &reqwest::Client, endpoint: &str) -> Option<String> {
+async fn fetch_reported_model(
+    client: &reqwest::Client,
+    endpoint: &str,
+    preferred: &str,
+) -> Option<String> {
     let origin = crate::registry::origin_of(endpoint);
     for path in ["/v1/models", "/models"] {
         let url = format!("{}{}", origin, path);
@@ -338,24 +416,33 @@ async fn fetch_reported_model(client: &reqwest::Client, endpoint: &str) -> Optio
         let Ok(val) = resp.json::<serde_json::Value>().await else {
             continue;
         };
-        if let Some(id) = val
+        let ids: Vec<String> = val
             .get("data")
             .and_then(|d| d.as_array())
-            .and_then(|a| a.first())
-            .and_then(|m| m.get("id"))
-            .and_then(|i| i.as_str())
-        {
-            return Some(pretty_model_name(id));
+            .map(|a| a.iter().filter_map(|m| m.get("id").and_then(|i| i.as_str()).map(pretty_model_name)).collect())
+            .or_else(|| {
+                val.get("models").and_then(|m| m.as_array()).map(|a| {
+                    a.iter()
+                        .filter_map(|m| m.get("model").and_then(|i| i.as_str()).map(pretty_model_name))
+                        .collect()
+                })
+            })
+            .unwrap_or_default();
+        if ids.is_empty() {
+            continue;
         }
-        if let Some(id) = val
-            .get("models")
-            .and_then(|m| m.as_array())
-            .and_then(|a| a.first())
-            .and_then(|m| m.get("model"))
-            .and_then(|i| i.as_str())
-        {
-            return Some(pretty_model_name(id));
+        // Prefer the model this role is configured to serve.
+        //
+        // The old code returned `data[0]`, which on the live OVMS node is
+        // `bge-m3` — the console then reported the main chat model as an
+        // *embedding* model. A single OVMS process serves every graph from one
+        // port, so list order carries no meaning; membership does.
+        if !preferred.is_empty() {
+            if let Some(hit) = ids.iter().find(|id| id.as_str() == preferred) {
+                return Some(hit.clone());
+            }
         }
+        return Some(ids[0].clone());
     }
     None
 }
@@ -367,6 +454,7 @@ async fn role_active_status(
     role: &str,
     fallback_endpoint: &str,
     fallback_model: &str,
+    preferred_model: &str,
 ) -> serde_json::Value {
     let node = nodes
         .iter()
@@ -379,7 +467,7 @@ async fn role_active_status(
             p.use_as.as_deref() == Some(role) && node.label.as_deref() == Some(p.name.as_str())
         })
     });
-    let reported = fetch_reported_model(client, &endpoint).await;
+    let reported = fetch_reported_model(client, &endpoint, preferred_model).await;
     serde_json::json!({
         "role": role,
         "model": reported.clone().unwrap_or_else(|| fallback_model.to_string()),
@@ -452,7 +540,10 @@ pub async fn health_check(State(state): State<Arc<GatewayState>>) -> Response {
             "extract_fallback_url": state.config.extract_fallback_url,
             "session_cache_entries": state.session_cache.entry_count(),
             "uptime_seconds": state.start_time.elapsed().as_secs(),
-            "providers": state.config.providers.len(),
+            // The runtime list, not `config.providers` — that vec is initialised
+            // empty and never written, so reading it reported "0 providers" on
+            // every healthy install with providers registered.
+            "providers": state.runtime.read().await.providers.len(),
             "extraction_backends": extract_summary,
         }),
         StatusCode::OK,
@@ -489,22 +580,24 @@ pub async fn video_generation(
     crate::media::video_generation_handler(State(state), req).await
 }
 
+/// The single-page console. One document for every section — the previous pair
+/// of pages (`dashboard.html` + `settings.html`) duplicated the chrome, the
+/// styles and the fetch layer, and had already drifted apart.
 pub async fn dashboard(_state: State<Arc<GatewayState>>) -> Response {
-    let html = include_str!("web/dashboard.html");
+    let html = include_str!("web/app.html");
     Response::builder()
         .status(StatusCode::OK)
         .header("content-type", "text/html; charset=utf-8")
+        .header("cache-control", "no-store")
         .body(Body::from(html))
         .unwrap()
 }
 
+/// `/web/settings` was the second page's canonical URL. It now serves the same
+/// document and lets the client-side section routing pick the view, so existing
+/// bookmarks keep working.
 pub async fn settings_page(_state: State<Arc<GatewayState>>) -> Response {
-    let html = include_str!("web/settings.html");
-    Response::builder()
-        .status(StatusCode::OK)
-        .header("content-type", "text/html; charset=utf-8")
-        .body(Body::from(html))
-        .unwrap()
+    dashboard(_state).await
 }
 
 const DOCS: &[(&str, &str)] = &[
@@ -547,14 +640,18 @@ pub async fn settings_redirect(_state: State<Arc<GatewayState>>) -> Response {
         .unwrap()
 }
 
-pub async fn dashboard_api(State(state): State<Arc<GatewayState>>) -> Response {
-    let uptime = state.start_time.elapsed().as_secs();
+/// Collects the counter snapshot shared by `/web/api/dashboard` and
+/// `/web/api/overview`, so the two can never disagree.
+fn dashboard_metrics(state: &Arc<GatewayState>) -> DashboardMetrics {
     let cache_entries = state.session_cache.entry_count();
 
-    let known_backends = ["small", "large", "large_multimodal", "session_affinity", "stt_proxy", "ocr", "auxiliary", "inference"];
+    // One label set, owned by the metrics registry (see
+    // `MetricsRegistry::backend_labels`). This used to be a second, shorter
+    // hardcoded list, so every backend the router only reaches through the newer
+    // paths was counted by prometheus but never summed here.
     let mut requests_by_backend = std::collections::HashMap::new();
     let mut total_requests: u64 = 0;
-    for backend in &known_backends {
+    for backend in crate::cascade_features::MetricsRegistry::backend_labels() {
         let val = state
             .metrics
             .requests_total
@@ -566,6 +663,18 @@ pub async fn dashboard_api(State(state): State<Arc<GatewayState>>) -> Response {
         }
     }
 
+    let mut fallback_by_reason = std::collections::HashMap::new();
+    for reason in crate::cascade_features::MetricsRegistry::fallback_reasons() {
+        let v = state
+            .metrics
+            .fallback_triggered
+            .with_label_values(&[reason])
+            .get() as u64;
+        if v > 0 {
+            fallback_by_reason.insert(reason.to_string(), v);
+        }
+    }
+
     let origin_counts = state.metrics.get_origin_counts().clone();
     let requests_by_origin: std::collections::HashMap<String, u64> = origin_counts
         .iter()
@@ -573,20 +682,23 @@ pub async fn dashboard_api(State(state): State<Arc<GatewayState>>) -> Response {
         .map(|(k, v)| (k.clone(), *v))
         .collect();
 
-    let metrics = DashboardMetrics {
+    DashboardMetrics {
         requests_total: total_requests,
         requests_by_backend,
-        fallback_count: ["primary_failed", "quality_low", "timeout",
-                         "backend_unavailable", "extraction_backend_unavailable"]
-            .iter()
-            .map(|r| state.metrics.fallback_triggered.with_label_values(&[r]).get() as u64)
-            .sum(),
-        uptime_seconds: uptime,
+        fallback_count: fallback_by_reason.values().sum(),
+        uptime_seconds: state.start_time.elapsed().as_secs(),
         session_cache_entries: cache_entries,
         large_model_multimodal: state.config.large_model_multimodal,
         requests_by_origin,
-    };
-    json_response(serde_json::to_value(metrics).unwrap(), StatusCode::OK)
+        fallback_by_reason,
+    }
+}
+
+pub async fn dashboard_api(State(state): State<Arc<GatewayState>>) -> Response {
+    json_response(
+        serde_json::to_value(dashboard_metrics(&state)).unwrap(),
+        StatusCode::OK,
+    )
 }
 
 pub async fn get_settings(State(state): State<Arc<GatewayState>>) -> Response {
@@ -605,6 +717,20 @@ pub async fn get_settings(State(state): State<Arc<GatewayState>>) -> Response {
     if !rt.providers.is_empty() {
         s.providers = rt.providers.iter().cloned().map(redact_provider).collect();
     }
+    // Report the *effective* chat URLs. `to_settings()` returns the env
+    // defaults, so a UI that reloaded the form after saving showed the old URL
+    // again while a `manual-main` / `manual-auxiliary` node carrying the new one
+    // sat in the pool — an override that looked like it had been reverted.
+    {
+        let registry = state.registry.read().await;
+        if let Some(n) = registry.get("manual-main") {
+            s.large_text_url = Some(n.endpoint_url.clone());
+        }
+        if let Some(n) = registry.get("manual-auxiliary") {
+            s.small_mllm_url = Some(n.endpoint_url.clone());
+        }
+    }
+    s.routing_strategy = Some(state.registry.read().await.strategy().to_string());
     json_response(serde_json::to_value(s).unwrap(), StatusCode::OK)
 }
 
@@ -656,25 +782,45 @@ pub async fn update_settings(
     }
     // …chat URLs additionally flow into the dynamic registry as manual nodes
     // so the routing layer actually uses them.
+    //
+    // Reconciled in both directions: previously only the "create" branch
+    // existed, so a user could set an override, clear the field and never get
+    // the old node back out of the pool — the override was write-only.
     for (role, url_opt, default) in [
         ("auxiliary", &settings.small_mllm_url, &state.config.small_mllm_url),
         ("main", &settings.large_text_url, &state.config.large_text_url),
     ] {
-        if let Some(url) = url_opt {
-            if url != default && url.starts_with("http") {
+        let node_id = format!("manual-{}", role);
+        let wanted = url_opt
+            .as_deref()
+            .map(str::trim)
+            .filter(|u| !u.is_empty() && u.starts_with("http"));
+        match wanted {
+            Some(url) if url != default => {
                 let req = RegisterUpstreamRequest {
-                    endpoint_url: Some(url.clone()),
-                    id: Some(format!("manual-{}", role)),
+                    endpoint_url: Some(url.to_string()),
+                    id: Some(node_id),
                     ..Default::default()
                 };
                 state.registry.write().await.upsert(role, req);
             }
+            _ => {
+                // Back to the default (or explicitly cleared): drop the override.
+                state.registry.write().await.remove_id(&node_id);
+            }
         }
     }
-    // Persist for next boot.
+    // Persist only the runtime-owned subset. Sending the whole `Settings`
+    // back would overwrite the stored providers list with the settings page's
+    // *redacted* copy (api_key: null), i.e. a read would silently delete every
+    // stored credential.
+    let persisted = serde_json::json!({
+        "routing": settings.routing,
+        "audio": settings.audio,
+    });
     if let Err(e) = state
         .db
-        .save_config("settings", &serde_json::to_string(&settings).unwrap_or_default())
+        .save_config("settings", &persisted.to_string())
     {
         return json_response(
             serde_json::json!({"error": format!("Failed to save: {}", e)}),
@@ -685,10 +831,27 @@ pub async fn update_settings(
     json_response(serde_json::json!({"status": "ok"}), StatusCode::OK)
 }
 
+/// Public view of a provider: never the key itself, but *whether* one is set and
+/// its last four characters — the same masking convention as `mask_bearer` and
+/// `list_extraction_backends`. Without this the settings page could not tell
+/// "no key" from "key stripped by redaction", and a user re-entering a key on
+/// every page load had no way to know one was already stored.
+fn provider_view(p: &ProviderConfig) -> serde_json::Value {
+    let mut v = serde_json::to_value(redact_provider(p.clone())).unwrap_or(serde_json::Value::Null);
+    if let Some(obj) = v.as_object_mut() {
+        obj.insert("has_key".into(), serde_json::json!(p.api_key.is_some()));
+        obj.insert(
+            "key_masked".into(),
+            serde_json::json!(mask_bearer(&p.api_key)),
+        );
+    }
+    v
+}
+
 pub async fn list_providers(State(state): State<Arc<GatewayState>>) -> Response {
     let rt = state.runtime.read().await;
     json_response(
-        serde_json::to_value(rt.providers.iter().cloned().map(redact_provider).collect::<Vec<_>>())
+        serde_json::to_value(rt.providers.iter().map(provider_view).collect::<Vec<_>>())
             .unwrap_or(serde_json::Value::Array(vec![])),
         StatusCode::OK,
     )
@@ -711,32 +874,18 @@ pub async fn add_provider(
     if model.is_empty() {
         return json_response(serde_json::json!({"error": "At least one model is required"}), StatusCode::BAD_REQUEST);
     }
-    let endpoint = format!("{}/chat/completions", provider.base_url.trim_end_matches('/'));
-    let mut request = state.http_client.post(&endpoint).json(&serde_json::json!({
-        "model": model,
-        "messages": [{"role": "user", "content": "Hello, are you there? respond with yes"}],
-        "max_tokens": 16,
-        "temperature": 0
-    }));
-    if let Some(key) = &provider.api_key {
-        request = request.bearer_auth(key);
-    }
-    let response = match request.send().await {
-        Ok(response) => response,
-        Err(error) => return json_response(serde_json::json!({"error": format!("Provider is unreachable: {}", error)}), StatusCode::BAD_GATEWAY),
+    let (_, answer) = match probe_provider(&state.http_client, &provider, &model).await {
+        Ok(ok) => ok,
+        Err((status, body)) => return json_response(body, status),
     };
-    let status = response.status();
-    let body = response.json::<serde_json::Value>().await.unwrap_or_default();
-    let answer = body.pointer("/choices/0/message/content").and_then(|v| v.as_str()).unwrap_or("").trim();
-    if !status.is_success() || answer.is_empty() {
-        return json_response(serde_json::json!({"error": "Provider did not return a valid chat response", "upstream_status": status.as_u16()}), StatusCode::BAD_GATEWAY);
-    }
+    let endpoint = format!("{}/chat/completions", provider.base_url.trim_end_matches('/'));
     let register = RegisterUpstreamRequest {
         endpoint_url: Some(endpoint),
         bearer_token: provider.api_key.clone(),
         id: Some(format!("provider-{}", provider.id)),
         label: Some(provider.name.clone()),
         model: Some(model),
+        enabled: Some(true),
         ..Default::default()
     };
     state.registry.write().await.upsert(&role, register);
@@ -762,12 +911,309 @@ pub async fn get_provider(
     Path(id): Path<String>,
 ) -> Response {
     match state.runtime.read().await.providers.iter().find(|p| p.id == id) {
-        Some(p) => json_response(serde_json::to_value(redact_provider(p.clone())).unwrap(), StatusCode::OK),
+        Some(p) => json_response(provider_view(p), StatusCode::OK),
         None => json_response(
             serde_json::json!({"error": "Provider not found"}),
             StatusCode::NOT_FOUND,
         ),
     }
+}
+
+/// Live chat probe against a provider's own endpoint, using a caller-supplied
+/// model. Reused by `add_provider` and exposed standalone so an *existing*
+/// provider can be tested — previously "test" only happened as a side effect of
+/// adding, which meant a provider whose key later expired could only be
+/// diagnosed by deleting and re-adding it.
+async fn probe_provider(
+    client: &reqwest::Client,
+    provider: &ProviderConfig,
+    model: &str,
+) -> Result<(StatusCode, String), (StatusCode, serde_json::Value)> {
+    let endpoint = format!("{}/chat/completions", provider.base_url.trim_end_matches('/'));
+    let mut request = client
+        .post(&endpoint)
+        .json(&serde_json::json!({
+            "model": model,
+            "messages": [{"role": "user", "content": "Hello, are you there? respond with yes"}],
+            "max_tokens": 16,
+            "temperature": 0
+        }));
+    if let Some(key) = &provider.api_key {
+        request = request.bearer_auth(key);
+    }
+    let response = match request.send().await {
+        Ok(r) => r,
+        Err(error) => {
+            return Err((
+                StatusCode::BAD_GATEWAY,
+                serde_json::json!({"error": format!("Provider is unreachable: {}", error)}),
+            ))
+        }
+    };
+    let status = response.status();
+    let body = response.json::<serde_json::Value>().await.unwrap_or_default();
+    let answer = body
+        .pointer("/choices/0/message/content")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if !status.is_success() || answer.is_empty() {
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            serde_json::json!({
+                "error": "Provider did not return a valid chat response",
+                "upstream_status": status.as_u16(),
+            }),
+        ));
+    }
+    Ok((status, answer))
+}
+
+/// Test body. Either a bare `{"model": …}` against a stored provider, or the
+/// full draft of a *not yet registered* provider so a key can be checked before
+/// it is committed to the DB.
+#[derive(serde::Deserialize, Default)]
+pub struct ProviderTestBody {
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub base_url: Option<String>,
+    #[serde(default)]
+    pub api_key: Option<String>,
+    #[serde(default)]
+    pub models: Vec<String>,
+}
+
+pub async fn test_provider(
+    State(state): State<Arc<GatewayState>>,
+    headers: axum::http::HeaderMap,
+    Path(id): Path<String>,
+    body: Option<Json<ProviderTestBody>>,
+) -> Response {
+    if admin_forbidden(&state, &headers) {
+        return json_response(serde_json::json!({"error": "forbidden"}), StatusCode::FORBIDDEN);
+    }
+    let body = body.map(|Json(b)| b).unwrap_or_default();
+    let stored = state
+        .runtime
+        .read()
+        .await
+        .providers
+        .iter()
+        .find(|p| p.id == id)
+        .cloned();
+
+    let provider = match stored {
+        Some(p) => {
+            // A posted key wins over the stored one — that is how a user verifies
+            // a *new* key before committing it.
+            let mut p = p;
+            if let Some(k) = &body.api_key {
+                p.api_key = if k.is_empty() { None } else { Some(k.clone()) };
+            }
+            if body.base_url.is_some() {
+                p.base_url = body.base_url.clone().unwrap_or(p.base_url);
+            }
+            p
+        }
+        None if body.base_url.is_some() => ProviderConfig {
+            id: id.clone(),
+            name: id.clone(),
+            provider_type: ProviderType::Custom,
+            base_url: body.base_url.clone().unwrap_or_default(),
+            api_key: body.api_key.clone().filter(|k| !k.is_empty()),
+            models: body.models.clone(),
+            enabled: true,
+            priority: 10,
+            capabilities: Default::default(),
+            use_as: None,
+        },
+        None => {
+            return json_response(
+                serde_json::json!({"error": "Provider not found"}),
+                StatusCode::NOT_FOUND,
+            )
+        }
+    };
+
+    let model = body
+        .model
+        .filter(|m| !m.is_empty())
+        .or_else(|| provider.models.first().cloned())
+        .unwrap_or_default();
+    if provider.base_url.is_empty() || model.is_empty() {
+        return json_response(
+            serde_json::json!({"error": "provider needs a base_url and at least one model"}),
+            StatusCode::BAD_REQUEST,
+        );
+    }
+    match probe_provider(&state.http_client, &provider, &model).await {
+        Ok((_, answer)) => json_response(
+            serde_json::json!({"status": "ok", "model": model, "answer": answer}),
+            StatusCode::OK,
+        ),
+        Err((status, body)) => json_response(body, status),
+    }
+}
+
+/// Partial update. `api_key` semantics are the only subtle part:
+/// * omitted / null → keep the stored key;
+/// * `""` → clear it;
+/// * anything else → replace it.
+///
+/// Every change that moves the upstream (base_url / models / role / enabled)
+/// re-registers or withdraws the registry node, because a provider that is not
+/// in the pool is a provider that never receives traffic no matter what the
+/// settings page says.
+#[derive(serde::Deserialize)]
+pub struct ProviderUpdate {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub base_url: Option<String>,
+    #[serde(default)]
+    pub api_key: Option<String>,
+    #[serde(default)]
+    pub models: Option<Vec<String>>,
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub use_as: Option<String>,
+}
+
+pub async fn update_provider(
+    State(state): State<Arc<GatewayState>>,
+    headers: axum::http::HeaderMap,
+    Path(id): Path<String>,
+    Json(update): Json<ProviderUpdate>,
+) -> Response {
+    if admin_forbidden(&state, &headers) {
+        return json_response(serde_json::json!({"error": "forbidden"}), StatusCode::FORBIDDEN);
+    }
+    let Some(mut provider) = state
+        .runtime
+        .read()
+        .await
+        .providers
+        .iter()
+        .find(|p| p.id == id)
+        .cloned()
+    else {
+        return json_response(
+            serde_json::json!({"error": "Provider not found"}),
+            StatusCode::NOT_FOUND,
+        );
+    };
+
+    if let Some(v) = update.name {
+        provider.name = v;
+    }
+    if let Some(v) = update.base_url {
+        if !v.starts_with("http") {
+            return json_response(
+                serde_json::json!({"error": "base_url must be http(s)"}),
+                StatusCode::BAD_REQUEST,
+            );
+        }
+        provider.base_url = v;
+    }
+    match update.api_key {
+        Some(ref k) if k.is_empty() => provider.api_key = None,
+        Some(k) => provider.api_key = Some(k),
+        None => {}
+    }
+    if let Some(v) = update.models {
+        if v.is_empty() {
+            return json_response(
+                serde_json::json!({"error": "At least one model is required"}),
+                StatusCode::BAD_REQUEST,
+            );
+        }
+        provider.models = v;
+    }
+    if let Some(v) = update.enabled {
+        provider.enabled = v;
+    }
+    if let Some(v) = update.use_as {
+        match crate::registry::canonical_role(&v) {
+            Some(r) if matches!(r, "main" | "auxiliary") => provider.use_as = Some(r.to_string()),
+            Some(r) => {
+                return json_response(
+                    serde_json::json!({"error": format!(
+                        "providers back the main/auxiliary chat roles only (got '{}')",
+                        r
+                    )}),
+                    StatusCode::BAD_REQUEST,
+                )
+            }
+            None => {
+                return json_response(
+                    serde_json::json!({"error": "use_as must be main or auxiliary"}),
+                    StatusCode::BAD_REQUEST,
+                )
+            }
+        }
+    }
+
+    // Save first, then reconcile the pool — a failed write must not leave the
+    // registry pointing at a configuration that was never stored.
+    if let Err(e) = state.db.save_provider(&provider) {
+        return json_response(
+            serde_json::json!({"error": format!("Failed to save: {}", e)}),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        );
+    }
+    sync_provider_node(&state, &provider).await;
+    {
+        let mut rt = state.runtime.write().await;
+        rt.providers.retain(|p| p.id != provider.id);
+        rt.providers.push(provider.clone());
+    }
+    json_response(
+        serde_json::json!({"status": "ok", "provider": provider_view(&provider)}),
+        StatusCode::OK,
+    )
+}
+
+/// Adds or withdraws the registry node that makes a provider reachable, and
+/// keeps its model name in step with the stored list.
+///
+/// The single source of truth for the provider ⇄ registry relationship: called
+/// by `add_provider`, `update_provider` and the boot-time restore alike. The
+/// restore path used to register unconditionally, which resurrected a provider
+/// the operator had explicitly disabled — the setting looked persisted right up
+/// until the next gateway restart put it back into the pool.
+pub async fn sync_provider_node(state: &Arc<GatewayState>, provider: &ProviderConfig) {
+    let node_id = format!("provider-{}", provider.id);
+    let role = match provider.use_as.as_deref().and_then(crate::registry::canonical_role) {
+        Some(r) => r.to_string(),
+        None => {
+            state.registry.write().await.remove_id(&node_id);
+            return;
+        }
+    };
+    if !provider.enabled {
+        state.registry.write().await.remove_id(&node_id);
+        return;
+    }
+    let Some(model) = provider.models.first().cloned() else {
+        state.registry.write().await.remove_id(&node_id);
+        return;
+    };
+    let register = RegisterUpstreamRequest {
+        endpoint_url: Some(format!(
+            "{}/chat/completions",
+            provider.base_url.trim_end_matches('/')
+        )),
+        bearer_token: provider.api_key.clone(),
+        id: Some(node_id),
+        label: Some(provider.name.clone()),
+        model: Some(model),
+        enabled: Some(true),
+        ..Default::default()
+    };
+    state.registry.write().await.upsert(&role, register);
 }
 
 pub async fn delete_provider(
@@ -780,6 +1226,11 @@ pub async fn delete_provider(
     }
     state.db.delete_provider(&id);
     state.runtime.write().await.providers.retain(|p| p.id != id);
+    // The registry node created when the provider was added has its own id and
+    // was never tied to the provider row, so deleting the provider used to leave
+    // a live node in the pool pointing at a removed provider — traffic kept
+    // going to it until the gateway restarted.
+    state.registry.write().await.remove_id(&format!("provider-{}", id));
     json_response(
         serde_json::json!({"status": "deleted", "id": id}),
         StatusCode::OK,
@@ -1321,6 +1772,162 @@ pub async fn rag_extract(State(state): State<Arc<GatewayState>>, req: Request<Bo
     }
 }
 
+/// Everything the UI needs for one coherent header render, in one round trip.
+///
+/// The old dashboard assembled its header from three independent endpoints on a
+/// 5-second timer, so a partial outage left a mixture of live numbers and `—`
+/// with no indication which was which. One payload means one atomic snapshot and
+/// one place to report "could not load".
+///
+/// Deliberately *excludes* per-node details: those carry endpoints and token
+/// state and stay behind the admin guard (`admin_upstreams`).
+pub async fn overview(
+    State(state): State<Arc<GatewayState>>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    let metrics = dashboard_metrics(&state);
+    let rt = state.runtime.read().await;
+    let (providers_total, providers_enabled, providers_with_key) = {
+        let p = &rt.providers;
+        (p.len(), p.iter().filter(|x| x.enabled).count(), p.iter().filter(|x| x.api_key.is_some()).count())
+    };
+    let (routing_strategy, node_count, active_nodes, roles) = {
+        let registry = state.registry.read().await;
+        let nodes = registry.nodes();
+        let mut roles = serde_json::Map::new();
+        for role in crate::registry::ROLES {
+            let pool: Vec<_> = nodes.iter().filter(|n| n.role == *role).collect();
+            roles.insert(
+                role.to_string(),
+                serde_json::json!({
+                    "total": pool.len(),
+                    "active": pool.iter().filter(|n| n.active).count(),
+                    "healthy": pool.iter().filter(|n| n.active && n.healthy).count(),
+                    "serving": registry.has_active(role),
+                }),
+            );
+        }
+        (
+            registry.strategy().to_string(),
+            nodes.len(),
+            nodes.iter().filter(|n| n.active && n.healthy).count(),
+            roles,
+        )
+    };
+    drop(rt);
+
+    // Health is derived from the same probes /health uses — one definition of
+    // "degraded", reused by the compose healthcheck and by this header.
+    let (large_up, small_up) = tokio::join!(
+        probe_origin(&state.http_client, &state.config.large_text_url),
+        probe_origin(&state.http_client, &state.config.small_mllm_url),
+    );
+
+    let (configured, reachable) = match &state.config.provisioner_url {
+        Some(url) => (true, crate::provisioner::reachable(&state, url).await),
+        None => (false, false),
+    };
+
+    json_response(
+        serde_json::json!({
+            "status": if large_up || small_up { "ok" } else { "degraded" },
+            "uptime_seconds": state.start_time.elapsed().as_secs(),
+            "inference_reachable": large_up,
+            "auxiliary_reachable": small_up,
+            "cascade_model": state.config.cascade_model_name,
+            "main_model": state.config.main_model_name,
+            "small_model": state.config.small_model_name,
+            "ocr_model": state.config.ocr_model_name,
+            "large_model_multimodal": state.config.large_model_multimodal,
+            "large_text_url": state.config.large_text_url,
+            "small_mllm_url": state.config.small_mllm_url,
+            "ocr_server_url": state.config.ocr_server_url,
+            "image_generation_url": state.config.image_generation_url,
+            "tts_url": state.config.tts_url,
+            "stt_url": state.config.stt_url,
+            "embeddings_url": state.config.embeddings_url,
+            "rerank_url": state.config.rerank_url,
+            "admin_key_required": state.config.admin_key.is_some(),
+            // Whether *this* caller may write. Through Caddy the key is injected
+            // after forward_auth; on the raw port the browser has to supply it.
+            "caller_is_admin": admin_authorized(&state, &headers) || state.config.admin_key.is_none(),
+            "routing": {
+                "strategy": routing_strategy,
+                "default_route": state.runtime.read().await.default_route,
+                "hybrid_auto": state.runtime.read().await.hybrid_auto,
+                "hybrid_aux_max_chars": state.runtime.read().await.hybrid_aux_max_chars,
+                "marker_mode": state.runtime.read().await.marker_mode,
+                "router_threshold": state.runtime.read().await.router_threshold,
+                "confidence_threshold": state.runtime.read().await.confidence_threshold,
+                "route_tools_to_large": state.runtime.read().await.route_tools_to_large,
+            },
+            "registry": {
+                "nodes": node_count,
+                "serving": active_nodes,
+                "roles": roles,
+            },
+            "providers": {
+                "total": providers_total,
+                "enabled": providers_enabled,
+                "with_key": providers_with_key,
+            },
+            "provisioner": { "configured": configured, "reachable": reachable },
+            "metrics": metrics,
+            "extraction_backends": state.extraction_backends.read().await.len(),
+        }),
+        StatusCode::OK,
+    )
+}
+
+async fn probe_origin(client: &reqwest::Client, url: &str) -> bool {
+    let trimmed = url.trim_end_matches('/');
+    let probe = match trimmed.find("://") {
+        Some(i) => {
+            let rest = &trimmed[i + 3..];
+            match rest.find('/') {
+                Some(j) => format!("{}/health", &trimmed[..i + 3 + j]),
+                None => format!("{}/health", trimmed),
+            }
+        }
+        None => format!("{}/health", trimmed),
+    };
+    matches!(
+        tokio::time::timeout(Duration::from_secs(3), client.get(probe).send()).await,
+        Ok(Ok(r)) if r.status().is_success()
+    )
+}
+
+#[derive(serde::Deserialize)]
+pub struct StrategyBody {
+    pub strategy: String,
+}
+
+/// Node selection across a role pool. Previously reachable only through the
+/// `CASCADE_ROUTING_STRATEGY` env var at boot, while the dashboard *displayed*
+/// the current value as if it were a setting.
+pub async fn set_routing_strategy(
+    State(state): State<Arc<GatewayState>>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<StrategyBody>,
+) -> Response {
+    if admin_forbidden(&state, &headers) {
+        return json_response(serde_json::json!({"error": "forbidden"}), StatusCode::FORBIDDEN);
+    }
+    match crate::registry::RoutingStrategy::parse(&body.strategy) {
+        Some(s) => {
+            state.registry.write().await.set_strategy(s);
+            json_response(
+                serde_json::json!({"status": "ok", "strategy": s.to_string()}),
+                StatusCode::OK,
+            )
+        }
+        None => json_response(
+            serde_json::json!({"error": "strategy must be round_robin or least_latency"}),
+            StatusCode::BAD_REQUEST,
+        ),
+    }
+}
+
 pub async fn register_extraction_backend_handler(
     State(state): State<Arc<GatewayState>>,
     headers: axum::http::HeaderMap,
@@ -1352,5 +1959,65 @@ pub async fn remove_extraction_backend_handler(
             serde_json::json!({ "error": "Backend not found" }),
             StatusCode::NOT_FOUND,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The defect this pins: `dashboard_api` summed a hand-written, *shorter*
+    /// list of backend labels than the one `MetricsRegistry::init` creates, so
+    /// "Total Requests" under-counted and the charts silently omitted every
+    /// backend the router only reaches through the newer paths (`main`,
+    /// `image`, `rag_worker`, `extraction`, `large_text`, `fallback`) — while
+    /// listing two labels (`session_affinity`, `stt_proxy`) that were never
+    /// recorded at all. Both sides now read one list; this asserts the KPI is
+    /// exactly the sum of every counter prometheus can report.
+    #[test]
+    fn dashboard_total_is_the_sum_of_every_backend_counter() {
+        let metrics = crate::cascade_features::MetricsRegistry::init();
+        let labels = crate::cascade_features::MetricsRegistry::backend_labels();
+        // Record on every label, so "the total is the sum" cannot pass by
+        // accident on an empty fixture.
+        for (i, label) in labels.iter().enumerate() {
+            for _ in 0..=i {
+                metrics.record_request(label);
+            }
+        }
+        let expected: u64 = (0..labels.len() as u64).map(|i| i + 1).sum();
+
+        let state = Arc::new(GatewayState::new(
+            crate::config::AppConfig::from_env(),
+            Arc::new(metrics),
+            Arc::new(crate::db::Db::new_in_memory().unwrap()),
+        ));
+        let snapshot = dashboard_metrics(&state);
+        assert_eq!(snapshot.requests_total, expected);
+        assert_eq!(snapshot.requests_by_backend.len(), labels.len());
+        for (i, label) in labels.iter().enumerate() {
+            assert_eq!(
+                snapshot.requests_by_backend.get(*label).copied(),
+                Some(i as u64 + 1),
+                "label {label} missing from the dashboard payload"
+            );
+        }
+    }
+
+    #[test]
+    fn fallback_total_is_the_sum_of_every_reason() {
+        let metrics = crate::cascade_features::MetricsRegistry::init();
+        let reasons = crate::cascade_features::MetricsRegistry::fallback_reasons();
+        metrics.record_fallback(reasons[0]);
+        metrics.record_fallback(reasons[2]);
+
+        let state = Arc::new(GatewayState::new(
+            crate::config::AppConfig::from_env(),
+            Arc::new(metrics),
+            Arc::new(crate::db::Db::new_in_memory().unwrap()),
+        ));
+        let snapshot = dashboard_metrics(&state);
+        assert_eq!(snapshot.fallback_count, 2);
+        assert_eq!(snapshot.fallback_by_reason.len(), 2);
     }
 }

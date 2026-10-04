@@ -63,10 +63,7 @@ impl MetricsRegistry {
 
         // Pre-initialize label values so metrics appear in /metrics from startup
         // (prometheus prunes empty MetricFamilies during gather)
-        for backend in &[
-            "small", "large", "large_multimodal", "large_text", "fallback",
-            "ocr", "auxiliary", "inference", "main", "image", "rag_worker", "extraction",
-        ] {
+        for backend in Self::backend_labels() {
             requests_total.with_label_values(&[backend]);
         }
         for reason in &["primary_failed", "quality_low", "timeout", "backend_unavailable", "extraction_backend_unavailable"] {
@@ -82,6 +79,43 @@ impl MetricsRegistry {
 
     pub fn record_request(&self, backend: &str) {
         self.requests_total.with_label_values(&[backend]).inc();
+    }
+
+    /// Every `selected_backend` label the router can emit.
+    ///
+    /// This list used to be duplicated: `init()` pre-created one set and
+    /// `handlers::dashboard_api` summed a *different*, shorter one. The two
+    /// drifting copies meant the dashboard's "Total Requests" silently omitted
+    /// every backend the router only emits under the newer paths (`main`,
+    /// `image`, `rag_worker`, `extraction`, `large_text`, `fallback`) while
+    /// listing two labels that are never recorded at all. One list, owned here.
+    pub fn backend_labels() -> &'static [&'static str] {
+        &[
+            "small",
+            "large",
+            "large_multimodal",
+            "large_text",
+            "fallback",
+            "ocr",
+            "auxiliary",
+            "inference",
+            "main",
+            "image",
+            "rag_worker",
+            "extraction",
+            "session_affinity",
+            "stt_proxy",
+        ]
+    }
+
+    pub fn fallback_reasons() -> &'static [&'static str] {
+        &[
+            "primary_failed",
+            "quality_low",
+            "timeout",
+            "backend_unavailable",
+            "extraction_backend_unavailable",
+        ]
     }
 
     pub fn record_fallback(&self, reason: &str) {

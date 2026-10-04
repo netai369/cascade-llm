@@ -137,11 +137,29 @@ them automatically after gateway restarts (reconcile self-heal).
 
 ## Web UI
 
-The dashboard (served at `/`, `/web/`, and via Caddy at `/cascade/`) has a
-Node Control Center with active toggles, probe-now, register form and
-cost/provider badges. All admin endpoints are mirrored under both
-`/api/v1/…` and `/web/api/v1/…`; `/settings` redirects to `/web/settings`
-so relative links work from every mount point.
+The console is one document served at `/`, `/web/` and (through Caddy's
+`/cascade/* → /web*` rewrite) at `/cascade/`. Sections:
+
+| Section | What it manages |
+|---|---|
+| **Overview** | one-shot header (health, registry, providers, fleet), traffic per backend, fallbacks per reason, and a routing self-test that reports the `x-cascade-route` a real request got |
+| **Backends** | the registry: per-node activate/deactivate, inline weight, edit, remove, probe-all, refresh-model-names, selection strategy, add-node form, static defaults, image-role probe |
+| **GPU fleet** | the provisioner: status, instances (flagging anything still billing), inference nodes with activate/deactivate/terminate/logs, budget, cost history, cloud providers, admission rules, hosted-API (Pollinations) registration |
+| **Providers** | external APIs: add / edit / enable / disable / test / remove, key state (never the key), and the registry node each one occupies |
+| **Models** | `/v1/models` discovery plus a live probe of what each role is actually serving |
+| **Routing** | router thresholds, default route, hybrid routing, marker mode, chat upstream overrides, TTS/STT endpoints |
+| **Diagnostics** | the documented direct bindings, extraction backends, parsed Prometheus counters, raw endpoint links |
+
+Admin endpoints are mirrored under both `/api/…` and `/web/api/…`;
+`/web/settings` serves the same document so existing bookmarks keep working.
+Root-level paths the console needs (`/health`, `/extraction/v1/backends`) also
+have `/web/api/…` aliases, because the Caddy rewrite puts a request for them
+under `/web` where they would otherwise 404.
+
+`GET/POST/PUT/DELETE /web/api/provisioner/*` is an **allowlist**, not a proxy: only
+the documented read and lifecycle paths are forwarded to
+`$GPU_PROVISIONER_URL`, behind the admin key, with the provisioner's own API key
+attached server-side and never echoed.
 
 ## Declarative seed file (LiteLLM-inspired)
 

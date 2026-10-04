@@ -34,6 +34,17 @@ pub struct AppConfig {
     pub extract_fallback_url: String,
     /// Shared secret guarding the upstream-override admin API (CASCADE_ADMIN_KEY).
     pub admin_key: Option<String>,
+    /// Base URL of the stack's GPU provisioner (GPU_PROVISIONER_URL). The
+    /// gateway proxies a small allowlist of its read/lifecycle endpoints to it
+    /// so the GPU fleet is manageable from the same UI as the routing pool —
+    /// these are exactly the endpoints whose effect lands in our registry.
+    /// Empty disables the integration (the UI then says so instead of failing).
+    pub provisioner_url: Option<String>,
+    /// API key the provisioner expects in `X-API-Key`
+    /// (GPU_PROVISIONER_API_KEY, falling back to KNOWLEDGE_API_KEY). Kept
+    /// server-side on purpose: the browser authenticates to *us* with the admin
+    /// key and never sees this.
+    pub provisioner_api_key: Option<String>,
     /// Bearer token sent to local static llama upstreams (LLAMA_API_KEY).
     /// Read once at startup; empty/unset means no header (today's behavior).
     pub llama_api_key: Option<String>,
@@ -211,6 +222,19 @@ impl AppConfig {
             extract_fallback_url: std::env::var("EXTRACT_FALLBACK_URL")
                 .unwrap_or_else(|_| "http://auxiliary-server:8080".to_string()),
             admin_key: std::env::var("CASCADE_ADMIN_KEY").ok().filter(|s| !s.is_empty()),
+            provisioner_url: std::env::var("GPU_PROVISIONER_URL")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .or_else(|| Some("http://netai-gpu-provisioner:8091".to_string())),
+            // KNOWLEDGE_API_KEY is the stack-wide service key the provisioner's
+            // `require_api_key` checks, so it is the natural default here; the
+            // dedicated variable exists so a deployment can hand the gateway a
+            // differently scoped credential.
+            provisioner_api_key: std::env::var("GPU_PROVISIONER_API_KEY")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .or_else(|| std::env::var("KNOWLEDGE_API_KEY").ok())
+                .filter(|s| !s.is_empty()),
             llama_api_key: std::env::var("LLAMA_API_KEY").ok().filter(|s| !s.is_empty()),
             default_route: std::env::var("CASCADE_DEFAULT_ROUTE").ok().filter(|s| !s.is_empty()),
             hybrid_auto: std::env::var("CASCADE_HYBRID_AUTO")
@@ -325,6 +349,7 @@ impl AppConfig {
             extract_cloud_url: self.extract_cloud_url.clone(),
             extract_cloud_model: self.extract_cloud_model.clone(),
             extract_fallback_url: Some(self.extract_fallback_url.clone()),
+            routing_strategy: Some(self.routing_strategy.to_string()),
         }
     }
 }

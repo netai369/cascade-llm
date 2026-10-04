@@ -19,12 +19,20 @@ pub fn build_router(state: Arc<GatewayState>) -> Router {
             put(handlers::update_settings),
         )
         .route(
+            "/web/api/routing-strategy",
+            put(handlers::set_routing_strategy),
+        )
+        .route(
             "/web/api/providers",
             post(handlers::add_provider),
         )
         .route(
             "/web/api/providers/:id",
-            delete(handlers::delete_provider),
+            put(handlers::update_provider).delete(handlers::delete_provider),
+        )
+        .route(
+            "/web/api/providers/:id/test",
+            post(handlers::test_provider),
         )
         .route(
             "/api/providers",
@@ -32,7 +40,11 @@ pub fn build_router(state: Arc<GatewayState>) -> Router {
         )
         .route(
             "/api/providers/:id",
-            delete(handlers::delete_provider),
+            put(handlers::update_provider).delete(handlers::delete_provider),
+        )
+        .route(
+            "/api/providers/:id/test",
+            post(handlers::test_provider),
         )
         .route(
             "/extraction/v1/backends",
@@ -41,6 +53,30 @@ pub fn build_router(state: Arc<GatewayState>) -> Router {
         .route(
             "/extraction/v1/backends/:id",
             delete(handlers::remove_extraction_backend_handler),
+        )
+        // GPU provisioner passthrough (admin-only, allowlisted inside
+        // `provisioner::proxy`). Both the /web and the bare /api mount exist so
+        // the dashboard's relative fetch works on either mount — Caddy serves
+        // the UI from /web* and /api/v1* straight to the gateway.
+        //
+        // `status` is a *static* route so it wins over the wildcard below; the
+        // wildcard exists because a forwarded path has several segments
+        // (`inference-nodes/gpu_…/activate`), which a `:param` cannot match.
+        .route("/web/api/provisioner/status", get(crate::provisioner::status))
+        .route("/api/provisioner/status", get(crate::provisioner::status))
+        .route(
+            "/web/api/provisioner/*tail",
+            get(crate::provisioner::proxy)
+                .post(crate::provisioner::proxy)
+                .put(crate::provisioner::proxy)
+                .delete(crate::provisioner::proxy),
+        )
+        .route(
+            "/api/provisioner/*tail",
+            get(crate::provisioner::proxy)
+                .post(crate::provisioner::proxy)
+                .put(crate::provisioner::proxy)
+                .delete(crate::provisioner::proxy),
         )
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
@@ -56,8 +92,19 @@ pub fn build_router(state: Arc<GatewayState>) -> Router {
         .route("/v1/models", get(handlers::list_models))
         .route("/models", get(handlers::list_models))
         .route("/model", get(handlers::get_model))
+        // Same payload under the /web/api namespace the console uses. The old
+        // dashboard fetched `models` (relative), which only resolved on the
+        // /web mount; an /api-namespaced route removes that class of guesswork.
+        .route("/web/api/models", get(handlers::list_models))
+        .route("/api/models", get(handlers::list_models))
         .route("/web/api/active-models", get(handlers::active_models))
         .route("/health", get(handlers::health_check))
+        // Same payload under the /web/api namespace. Caddy exposes the console
+        // at /cascade/* and rewrites to /web*, so the root /health is NOT
+        // reachable through the proxy at all — the UI has to ask for the
+        // namespaced path or every health read is a 404 in production.
+        .route("/web/api/health", get(handlers::health_check))
+        .route("/api/health", get(handlers::health_check))
         // Audio / media proxies
         .route("/v1/audio/speech", post(handlers::tts))
         .route("/v1/audio/transcriptions", post(handlers::stt))
@@ -75,6 +122,8 @@ pub fn build_router(state: Arc<GatewayState>) -> Router {
         .route("/web/settings", get(handlers::settings_page))
         .route("/web/docs/:name", get(handlers::docs_page))
         .route("/web/api/dashboard", get(handlers::dashboard_api))
+        .route("/web/api/overview", get(handlers::overview))
+        .route("/api/overview", get(handlers::overview))
         .route(
             "/web/api/settings",
             get(handlers::get_settings),
@@ -105,6 +154,17 @@ pub fn build_router(state: Arc<GatewayState>) -> Router {
         )
         .route(
             "/extraction/v1/backends",
+            get(handlers::list_extraction_backends),
+        )
+        // Namespaced alias: the extraction pool is a root-level path that
+        // Caddy's /cascade/* → /web* rewrite cannot reach, so the console could
+        // not display it at all.
+        .route(
+            "/web/api/extraction-backends",
+            get(handlers::list_extraction_backends),
+        )
+        .route(
+            "/api/extraction-backends",
             get(handlers::list_extraction_backends),
         )
         // Dynamic upstream registry API
@@ -154,6 +214,19 @@ pub fn build_router(state: Arc<GatewayState>) -> Router {
         .route(
             "/api/v1/admin/upstreams/refresh-models",
             post(handlers::refresh_models_upstreams),
+        )
+        // `/web/api/v1/upstreams/{role}` is the sibling of the v1 inference-node
+        // routes above, and it did not exist: the console's Remove button used it
+        // for symmetry, answered 404, and left the node in the pool while the
+        // table still showed it. A UI that guesses a path gets a silent no-op,
+        // so the admin namespace is complete now.
+        .route(
+            "/web/api/v1/upstreams/:role",
+            put(handlers::put_upstream).delete(handlers::delete_upstream),
+        )
+        .route(
+            "/api/v1/upstreams/:role",
+            put(handlers::put_upstream).delete(handlers::delete_upstream),
         )
         .route("/settings", get(handlers::settings_redirect))
         .with_state(state)

@@ -1,0 +1,1998 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Cascade LLM — Gateway Console</title>
+  <link rel="stylesheet" href="/theme/netai-theme.css">
+  <script src="/theme/netai-theme.js"></script>
+  <script src="/theme/netai-lang.js"></script>
+  <style>
+    /* ------------------------------------------------------------------
+     * Every colour is a theme token (see data/caddy/static/theme/NOTES.md).
+     * No CDN assets (gotcha 13): the only external files are the stack's own
+     * /theme/* assets. The previous dashboard pulled Chart.js from
+     * cdn.jsdelivr.net, which left two permanently blank chart cards on an
+     * air-gapped install with no error anywhere — the charts below are
+     * hand-rolled SVG for exactly that reason.
+     * ------------------------------------------------------------------ */
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: var(--font-sans);
+      background: var(--bg); color: var(--text);
+      min-height: 100vh; font-size: 15px; line-height: 1.5;
+    }
+    a { color: var(--accent); }
+    code, .mono { font-family: var(--font-mono); font-size: .82em; }
+
+    /* --- shell -------------------------------------------------------- */
+    .shell { display: grid; grid-template-columns: 232px 1fr; min-height: calc(100vh - 56px); }
+    /* Grid items default to `min-width: auto`, so one long endpoint URL or a wide
+       table pushes the whole page into a horizontal scroll and clips every
+       panel on the right. Both the shell children and the panel grid children
+       need `min-width: 0`; the tables themselves scroll inside `.tw`. */
+    .shell > *, .grid2 > *, .grid3 > * { min-width: 0; }
+    .side {
+      border-right: 1px solid var(--card-border); background: var(--bg-soft);
+      padding: 1rem .7rem; display: flex; flex-direction: column; gap: .2rem;
+      position: sticky; top: 56px; align-self: start; max-height: calc(100vh - 56px);
+      overflow-y: auto;
+    }
+    .side .grp {
+      font-size: .68rem; text-transform: uppercase; letter-spacing: .09em;
+      color: var(--text-faint); padding: .9rem .6rem .35rem;
+    }
+    .side button.tab {
+      display: flex; align-items: center; gap: .6rem; width: 100%; text-align: left;
+      background: transparent; border: 0; border-radius: var(--radius-sm);
+      color: var(--text-muted); padding: .5rem .6rem; cursor: pointer; font-size: .88rem;
+      font-family: inherit;
+    }
+    .side button.tab:hover { background: var(--hover-bg); color: var(--text); }
+    .side button.tab.active { background: var(--accent-soft-bg); color: var(--accent); font-weight: 600; }
+    .side button.tab .ic { width: 1.1rem; text-align: center; opacity: .85; }
+    .side button.tab .count {
+      margin-left: auto; font-size: .7rem; background: var(--card);
+      border: 1px solid var(--card-border); border-radius: 999px; padding: 0 .45rem;
+      color: var(--text-muted);
+    }
+    .side .foot { margin-top: auto; padding: .8rem .6rem 0; font-size: .72rem; color: var(--text-faint); border-top: 1px solid var(--card-border); }
+
+    main { padding: 1.4rem 1.6rem 3rem; max-width: 1400px; min-width: 0; }
+    .view { display: none; }
+    .view.active { display: block; }
+    .view > h1 { font-size: 1.25rem; margin-bottom: .2rem; }
+    .view > .sub { color: var(--text-muted); font-size: .85rem; margin-bottom: 1.1rem; }
+
+    /* --- surfaces ------------------------------------------------------ */
+    .panel {
+      background: var(--card); border: 1px solid var(--card-border);
+      border-radius: var(--radius-lg); padding: 1.1rem 1.2rem; margin-bottom: 1rem;
+    }
+    .panel > h2 {
+      font-size: .82rem; text-transform: uppercase; letter-spacing: .07em;
+      color: var(--text-muted); margin-bottom: .9rem;
+      display: flex; align-items: center; gap: .6rem; flex-wrap: wrap;
+    }
+    .panel > h2 .spacer { margin-left: auto; }
+    .panel > h2 .hint { text-transform: none; letter-spacing: 0; font-weight: 400; color: var(--text-faint); font-size: .78rem; }
+    /* `align-items: start` so a short panel does not stretch to match a tall
+       neighbour — an empty chart next to a full table otherwise leaves a large
+       dead rectangle. */
+    .grid2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: 1rem; align-items: start; }
+    .grid3 { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: .9rem; align-items: start; }
+
+    .stat { background: var(--input-bg); border: 1px solid var(--card-border); border-radius: var(--radius); padding: .8rem .9rem; }
+    .stat .k { font-size: .72rem; color: var(--text-faint); text-transform: uppercase; letter-spacing: .06em; }
+    .stat .v { font-size: 1.45rem; font-weight: 700; margin-top: .15rem; word-break: break-all; }
+    .stat .s { font-size: .74rem; color: var(--text-muted); margin-top: .15rem; word-break: break-all; }
+
+    /* --- tables -------------------------------------------------------- */
+    .tw { overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; font-size: .85rem; }
+    th {
+      text-align: left; padding: .55rem .5rem; border-bottom: 1px solid var(--card-border);
+      color: var(--text-faint); font-size: .7rem; text-transform: uppercase;
+      letter-spacing: .06em; font-weight: 600; white-space: nowrap;
+    }
+    td { padding: .55rem .5rem; border-bottom: 1px solid var(--table-row-border); vertical-align: top; }
+    tbody tr:hover { background: var(--row-hover-bg); }
+    td.num { text-align: right; font-variant-numeric: tabular-nums; }
+    .nowrap { white-space: nowrap; }
+    /* URLs and node ids are the longest strings in every table; break them
+       inside the cell so one long endpoint cannot force a page-wide horizontal
+       scroll (which clips every panel on the right). */
+    td .mono, td.mono { overflow-wrap: anywhere; }
+
+    /* --- controls ------------------------------------------------------ */
+    .btn {
+      font-family: inherit; font-size: .82rem; font-weight: 600; cursor: pointer;
+      border-radius: var(--radius-sm); padding: .42rem .8rem;
+      border: 1px solid var(--card-border); background: var(--button-bg); color: var(--text);
+      transition: border-color .12s, background .12s;
+    }
+    .btn:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+    .btn:disabled { opacity: .45; cursor: not-allowed; }
+    .btn.primary { background: var(--accent-soft-bg); color: var(--accent); border-color: var(--accent); }
+    .btn.primary:hover:not(:disabled) { background: var(--accent); color: var(--bg); }
+    .btn.danger:hover:not(:disabled) { border-color: var(--error); color: var(--error); }
+    .btn.sm { font-size: .74rem; padding: .25rem .55rem; }
+    .btn-row { display: flex; gap: .5rem; flex-wrap: wrap; align-items: center; }
+
+    input[type=text], input[type=password], input[type=number], select, textarea {
+      font-family: inherit; font-size: .84rem; width: 100%;
+      padding: .42rem .6rem; border-radius: var(--radius-sm);
+      border: 1px solid var(--card-border); background: var(--input-bg); color: var(--text);
+      outline: none;
+    }
+    input:focus, select:focus, textarea:focus { border-color: var(--accent); box-shadow: 0 0 0 2px var(--ring); }
+    label.f { display: block; margin-bottom: .7rem; }
+    label.f > span { display: block; font-size: .72rem; color: var(--text-muted); text-transform: uppercase; letter-spacing: .05em; margin-bottom: .25rem; }
+    label.f > .h { display: block; font-size: .74rem; color: var(--text-faint); margin-top: .25rem; text-transform: none; letter-spacing: 0; }
+    .f-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 0 .7rem; }
+    details.form { border: 1px solid var(--card-border); border-radius: var(--radius); padding: .7rem .9rem; background: var(--input-bg); }
+    details.form > summary { cursor: pointer; color: var(--accent); font-size: .84rem; font-weight: 600; }
+    details.form[open] > summary { margin-bottom: .8rem; }
+
+    /* --- badges / status ----------------------------------------------- */
+    .badge {
+      display: inline-flex; align-items: center; gap: .3rem; padding: .1rem .5rem;
+      border-radius: 999px; font-size: .71rem; font-weight: 600; white-space: nowrap;
+    }
+    .badge.ok { background: var(--success-bg); color: var(--success); }
+    .badge.warn { background: var(--running-bg); color: var(--running); }
+    .badge.err { background: var(--error-bg); color: var(--error); }
+    .badge.idle { background: var(--idle-bg); color: var(--idle); }
+    .badge.info { background: var(--accent-soft-bg); color: var(--accent); }
+    .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+    .dot.up { background: var(--success); }
+    .dot.down { background: var(--error); }
+    .dot.warn { background: var(--running); }
+    .dot.unknown { background: var(--idle); }
+
+    /* --- state vocabulary (one place, used by every section) ----------- */
+    .state { padding: .8rem 0; font-size: .85rem; color: var(--text-muted); }
+    .state.loading { color: var(--text-faint); }
+    .state.loading::before {
+      content: ""; display: inline-block; width: .8em; height: .8em; margin-right: .5em;
+      border: 2px solid var(--spinner-track); border-top-color: var(--spinner-fg);
+      border-radius: 50%; animation: spin .7s linear infinite; vertical-align: -.1em;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .state.error {
+      color: var(--error); border-left: 3px solid var(--error);
+      background: var(--error-bg); padding: .6rem .8rem; border-radius: var(--radius-sm);
+    }
+    .state.error code { color: var(--error); }
+    .empty { padding: 1rem .2rem; color: var(--text-faint); font-size: .85rem; }
+    .empty strong { color: var(--text-muted); display: block; margin-bottom: .2rem; font-size: .88rem; }
+
+    /* --- toast --------------------------------------------------------- */
+    #toasts { position: fixed; right: 1.2rem; bottom: 1.2rem; z-index: 200; display: flex; flex-direction: column; gap: .5rem; max-width: min(480px, 90vw); }
+    .toast {
+      padding: .7rem 1rem; border-radius: var(--radius); font-size: .84rem; font-weight: 500;
+      background: var(--card); border: 1px solid var(--card-border); box-shadow: var(--shadow);
+      display: flex; gap: .6rem; align-items: flex-start;
+    }
+    .toast.ok { border-color: var(--success); }
+    .toast.err { border-color: var(--error); color: var(--error); }
+    .toast.warn { border-color: var(--running); color: var(--running); }
+    .toast .body { flex: 1; word-break: break-word; }
+    .toast button { background: none; border: 0; color: var(--text-faint); cursor: pointer; font-size: 1rem; line-height: 1; padding: 0; }
+
+    /* --- misc ---------------------------------------------------------- */
+    .kv { display: grid; grid-template-columns: minmax(120px, auto) 1fr; gap: .3rem .9rem; font-size: .84rem; }
+    .kv dt { color: var(--text-muted); }
+    .kv dd { color: var(--text); word-break: break-all; }
+    .chartwrap { position: relative; }
+    .muted { color: var(--text-muted); }
+    .faint { color: var(--text-faint); }
+    .small { font-size: .78rem; }
+    .mb0 { margin-bottom: 0; }
+    .row { display: flex; gap: .6rem; align-items: center; flex-wrap: wrap; }
+    .stack { display: flex; flex-direction: column; gap: .5rem; }
+    .pill-row { display: flex; gap: .4rem; flex-wrap: wrap; }
+    .inline-edit { width: 5.5rem; padding: .15rem .35rem; font-size: .76rem; }
+    details.raw > summary { cursor: pointer; color: var(--text-muted); font-size: .78rem; }
+    pre.raw {
+      background: var(--code-bg); border: 1px solid var(--code-border); border-radius: var(--radius-sm);
+      padding: .7rem; overflow-x: auto; font-family: var(--font-mono); font-size: .74rem;
+      color: var(--code-text); max-height: 340px;
+    }
+    .bar-meter { height: 6px; border-radius: 999px; background: var(--spinner-track); overflow: hidden; margin-top: .3rem; }
+    .bar-meter > i { display: block; height: 100%; background: var(--accent); }
+    .bar-meter > i.warn { background: var(--running); }
+    .bar-meter > i.err { background: var(--error); }
+    footer.page { text-align: center; padding: 1.5rem; color: var(--text-faint); font-size: .78rem; }
+
+    @media (max-width: 900px) {
+      .shell { grid-template-columns: 1fr; }
+      .side { position: static; max-height: none; flex-direction: row; flex-wrap: wrap; border-right: 0; border-bottom: 1px solid var(--card-border); }
+      .side .grp, .side .foot { display: none; }
+      .side button.tab { width: auto; }
+      main { padding: 1rem; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="bar">
+      <a class="netai-brandmark" href="/menu/" title="Main menu">
+        <img src="/theme/NETAI_LOGO_Gold_Black_big.png" alt="NetAI logo">
+        <span class="wordmark"><strong data-i18n="menu.cascade">Cascade LLM</strong><span data-i18n="menu.subtitle">On-premise AI for your business</span></span>
+      </a>
+      <span id="hdr-status" class="badge idle" style="margin-left:.6rem">connecting…</span>
+      <span id="hdr-updated" class="small faint"></span>
+      <button data-theme-toggle class="netai-theme-toggle" aria-label="Switch theme"></button>
+      <button data-lang-toggle class="netai-lang-toggle" aria-label="Language"></button>
+    </div>
+  </header>
+
+  <div class="shell">
+    <nav class="side" aria-label="Sections">
+      <div class="grp">Operate</div>
+      <button class="tab active" data-view="overview"><span class="ic">◈</span>Overview</button>
+      <button class="tab" data-view="backends"><span class="ic">▤</span>Backends<span class="count" id="cnt-backends">–</span></button>
+      <button class="tab" data-view="fleet"><span class="ic">▣</span>GPU fleet<span class="count" id="cnt-fleet">–</span></button>
+      <div class="grp">Supply</div>
+      <button class="tab" data-view="providers"><span class="ic">◈</span>Providers<span class="count" id="cnt-providers">–</span></button>
+      <button class="tab" data-view="models"><span class="ic">◇</span>Models<span class="count" id="cnt-models">–</span></button>
+      <div class="grp">Configure</div>
+      <button class="tab" data-view="routing"><span class="ic">⇄</span>Routing</button>
+      <button class="tab" data-view="diagnostics"><span class="ic">⚑</span>Diagnostics</button>
+      <div class="foot">
+        <div id="foot-uptime">uptime –</div>
+        <div id="foot-admin"></div>
+        <div class="btn-row" style="margin-top:.5rem">
+          <button class="btn sm" id="btn-refresh-all">Refresh all</button>
+        </div>
+      </div>
+    </nav>
+
+    <main>
+      <!-- ============================ OVERVIEW ============================ -->
+      <section class="view active" id="view-overview">
+        <h1>Overview</h1>
+        <p class="sub">Everything the gateway knows right now: which backends serve which role, where traffic actually went, and what is billing.</p>
+
+        <div class="panel">
+          <h2>Gateway <span class="spacer"></span><span class="hint" id="ov-prov-note"></span></h2>
+          <div id="ov-stats" class="grid3"><div class="state loading">Loading gateway status…</div></div>
+        </div>
+
+        <div class="grid2">
+          <div class="panel">
+            <h2>Requests by backend <span class="spacer"></span><span class="hint">since process start</span></h2>
+            <div class="chartwrap" id="ov-chart"></div>
+          </div>
+          <div class="panel">
+            <h2>Role coverage</h2>
+            <div id="ov-roles" class="state loading">Loading…</div>
+          </div>
+        </div>
+
+        <div class="grid2">
+          <div class="panel">
+            <h2>Where traffic came from</h2>
+            <div id="ov-origins" class="state loading">Loading…</div>
+          </div>
+          <div class="panel">
+            <h2>Fallbacks <span class="spacer"></span><span class="hint">reasons, not just a total</span></h2>
+            <div id="ov-fallbacks" class="state loading">Loading…</div>
+          </div>
+        </div>
+
+        <div class="panel">
+          <h2>Routing self-test <span class="spacer"></span><span class="hint">sends one real request and reports which backend answered</span></h2>
+          <p class="small muted" style="margin-bottom:.7rem">
+            The hybrid router only proves itself against a live model. This issues the request through the
+            gateway and reports the <code>x-cascade-route</code> the router decided on — the same signal
+            <code>tests/test_cascade_routes.py</code> asserts on.
+          </p>
+          <div class="f-row">
+            <label class="f"><span>Prompt</span><input type="text" id="rt-prompt" value="Say OK"></label>
+            <label class="f"><span>Route hint (optional)</span>
+              <select id="rt-hint">
+                <option value="">auto (content detection)</option>
+                <option value="inference-server">inference-server (main)</option>
+                <option value="auxiliary-server">auxiliary-server (fast)</option>
+                <option value="auto-small">auto-small</option>
+                <option value="auto-large">auto-large</option>
+                <option value="session-affinity">session-affinity</option>
+              </select>
+            </label>
+            <label class="f"><span>Model</span><input type="text" id="rt-model" placeholder="defaults to the gateway identity">
+              <span class="h">Required by the gateway. Defaults to the id it advertises on /v1/models.</span>
+            </label>
+          </div>
+          <div class="btn-row">
+            <button class="btn primary" id="rt-run">Send test request</button>
+            <button class="btn" id="rt-simple">Simple prompt → aux</button>
+            <button class="btn" id="rt-complex">Complex prompt → main</button>
+          </div>
+          <div id="rt-out" class="mt" style="margin-top:.8rem"><div class="state">Not run yet.</div></div>
+        </div>
+      </section>
+
+      <!-- ============================ BACKENDS ============================ -->
+      <section class="view" id="view-backends">
+        <h1>Backends</h1>
+        <p class="sub">The routing registry. Every role resolves to a pool of nodes; weighted round-robin or lowest-latency wins, and the health prober demotes a node after repeated failed probes.</p>
+
+        <div class="panel">
+          <h2>Pool &amp; prober
+            <span class="spacer"></span>
+            <button class="btn sm" id="btn-probe">Probe all now</button>
+            <button class="btn sm" id="btn-refresh-models">Refresh model names</button>
+          </h2>
+          <div id="bk-summary" class="state loading">Loading…</div>
+          <div class="btn-row" style="margin-top:.8rem">
+            <label class="f mb0" style="min-width:220px;margin:0">
+              <span>Selection strategy</span>
+              <select id="bk-strategy">
+                <option value="round_robin">Weighted round-robin</option>
+                <option value="least_latency">Lowest latency (EMA)</option>
+              </select>
+            </label>
+            <button class="btn" id="bk-strategy-save" style="margin-top:1.15rem">Apply</button>
+          </div>
+        </div>
+
+        <div class="panel">
+          <h2>Registered nodes <span class="spacer"></span><span class="hint" id="bk-count"></span></h2>
+          <div id="bk-table"><div class="state loading">Loading registry…</div></div>
+        </div>
+
+        <div class="panel">
+          <h2>Static defaults <span class="hint">used when a role has no active node</span></h2>
+          <div id="bk-defaults" class="state loading">Loading…</div>
+        </div>
+
+        <div class="panel">
+          <h2>Image role probe <span class="spacer"></span><span class="hint">exercises the <code>image</code> role end to end</span></h2>
+          <p class="small muted" style="margin-bottom:.7rem">
+            The old dashboard had this quick test and it failed with a 404 in production, because it
+            fetched a relative <code>v1/images/generations</code> that resolved to
+            <code>/web/v1/images/generations</code> — a route the gateway does not have. It is here
+            again, built from the same derived prefix as every other request.
+          </p>
+          <div class="f-row">
+            <label class="f"><span>Prompt</span><input type="text" id="img-prompt" value="a small red apple on a white background"></label>
+            <label class="f"><span>Size</span><input type="text" id="img-size" value="512x512"></label>
+            <label class="f"><span>Model</span><input type="text" id="img-model" placeholder="(upstream default)"></label>
+          </div>
+          <div class="btn-row">
+            <button class="btn primary" id="img-run">Generate</button>
+            <span class="small faint" id="img-active"></span>
+          </div>
+          <div id="img-out" style="margin-top:.8rem"></div>
+        </div>
+
+        <div class="panel">
+          <h2>Register a node</h2>
+          <details class="form">
+            <summary>Add / update an upstream endpoint</summary>
+            <div class="f-row">
+              <label class="f"><span>Role</span>
+                <select id="nf-role">
+                  <option value="main">main — complex chat</option>
+                  <option value="auxiliary">auxiliary — fast / compression</option>
+                  <option value="ocr">ocr — vision / document</option>
+                  <option value="image">image — image generation</option>
+                  <option value="rag_worker">rag_worker — heavy extraction</option>
+                </select>
+              </label>
+              <label class="f"><span>Endpoint URL</span><input type="text" id="nf-url" placeholder="http://host:port/v1/chat/completions">
+                <span class="h">The exact URL requests are forwarded to.</span>
+              </label>
+            </div>
+            <div class="f-row">
+              <label class="f"><span>Label</span><input type="text" id="nf-label" placeholder="Vast.ai RTX 4070"></label>
+              <label class="f"><span>Model name</span><input type="text" id="nf-model" placeholder="netai-hybrid">
+                <span class="h">Forced onto requests routed here. Leave empty to forward the client's name.</span>
+              </label>
+              <label class="f"><span>Weight</span><input type="number" id="nf-weight" min="1" max="64" value="1"></label>
+              <label class="f"><span>Max context</span><input type="number" id="nf-ctx" placeholder="131072"></label>
+            </div>
+            <div class="f-row">
+              <label class="f"><span>Provider</span><input type="text" id="nf-provider" placeholder="vast.ai"></label>
+              <label class="f"><span>Cost / hour (USD)</span><input type="number" id="nf-cost" step="0.001" placeholder="0.09"></label>
+              <label class="f"><span>Bearer token</span><input type="password" id="nf-bearer" placeholder="(optional)" autocomplete="off"></label>
+              <label class="f"><span>Health URL override</span><input type="text" id="nf-health" placeholder="(origin)/health"></label>
+            </div>
+            <div class="btn-row">
+              <button class="btn primary" id="nf-submit">Register node</button>
+              <span class="small faint">Re-registering the same URL updates the existing node instead of adding a second one.</span>
+            </div>
+          </details>
+        </div>
+      </section>
+
+      <!-- ============================== FLEET ============================= -->
+      <section class="view" id="view-fleet">
+        <h1>GPU fleet</h1>
+        <p class="sub">Provisioned and hosted-API nodes. These land in the <a href="#" data-goto="backends">registry</a> when they are ready and activated — the two views are one system, so they are managed together here.</p>
+
+        <div class="panel">
+          <h2>Provisioner</h2>
+          <div id="fl-provisioner"><div class="state loading">Checking provisioner…</div></div>
+        </div>
+
+        <div class="panel">
+          <h2>Instances <span class="spacer"></span><span class="hint">any state that still bills is flagged</span></h2>
+          <div id="fl-instances"><div class="state loading">Loading instances…</div></div>
+        </div>
+
+        <div class="panel">
+          <h2>Inference nodes <span class="spacer"></span>
+            <button class="btn sm" id="fl-reconcile">Reconcile into registry</button>
+            <a class="btn sm" href="/gpu-provisioner/" target="_blank" rel="noopener">Open full provisioner UI ↗</a>
+          </h2>
+          <div id="fl-nodes"><div class="state loading">Loading inference nodes…</div></div>
+        </div>
+
+        <div class="grid2">
+          <div class="panel">
+            <h2>Budget</h2>
+            <div id="fl-budget"><div class="state loading">Loading budget…</div></div>
+          </div>
+          <div class="panel">
+            <h2>Cost — last 7 days</h2>
+            <div class="chartwrap" id="fl-cost-chart"></div>
+            <div id="fl-cost-providers" style="margin-top:.7rem"></div>
+          </div>
+        </div>
+
+        <div class="grid2">
+          <div class="panel">
+            <h2>Cloud providers <span class="spacer"></span>
+              <button class="btn sm" id="fl-cloud-toggle">Toggle cloud</button>
+            </h2>
+            <div id="fl-providers"><div class="state loading">Loading providers…</div></div>
+          </div>
+          <div class="panel">
+            <h2>GPU admission rules</h2>
+            <div id="fl-rules"><div class="state loading">Loading rules…</div></div>
+          </div>
+        </div>
+
+        <div class="panel">
+          <h2>Register a hosted API node</h2>
+          <p class="small muted" style="margin-bottom:.8rem">
+            A zero-cost hosted model (Pollinations) registered straight into a cascade role. No machine is rented
+            and nothing bills, but the node is a real registry entry like any other.
+          </p>
+          <div class="f-row">
+            <label class="f"><span>Role</span>
+              <select id="pl-role"><option value="image">image</option><option value="auxiliary">auxiliary</option><option value="main">main</option></select>
+            </label>
+            <label class="f"><span>Model</span><input type="text" id="pl-model" value="openai"></label>
+          </div>
+          <div class="btn-row">
+            <button class="btn primary" id="pl-submit">Register hosted node</button>
+            <span class="small faint">Renting a GPU stays in the provisioner UI: offer selection, region rules and VRAM estimation live there.</span>
+          </div>
+        </div>
+      </section>
+
+      <!-- ============================ PROVIDERS ============================ -->
+      <section class="view" id="view-providers">
+        <h1>Providers</h1>
+        <p class="sub">External APIs behind the main or auxiliary chat role. A provider is only useful if it is in the pool, so every edit here re-registers or withdraws its registry node.</p>
+
+        <div class="panel">
+          <h2>Registered providers <span class="spacer"></span><span class="hint">keys are never displayed, only their state</span></h2>
+          <div id="pv-list"><div class="state loading">Loading providers…</div></div>
+        </div>
+
+        <div class="panel">
+          <h2 id="pv-editor-title">Add a provider</h2>
+          <p class="small muted" style="margin-bottom:.8rem">
+            The key is tested with a real chat request before it is stored. A provider that cannot answer is
+            never registered, because an unreachable pool entry is a silent failure for every user routed to it.
+          </p>
+          <div class="f-row">
+            <label class="f"><span>Name</span><input type="text" id="pe-name" placeholder="My OpenAI"></label>
+            <label class="f"><span>Type</span>
+              <select id="pe-type">
+                <option value="custom">OpenAI-compatible</option>
+                <option value="open_ai">OpenAI</option>
+                <option value="anthropic">Anthropic</option>
+                <option value="gemini">Gemini</option>
+                <option value="ollama">Ollama</option>
+                <option value="local">Local (llama.cpp)</option>
+              </select>
+            </label>
+          </div>
+          <div class="f-row">
+            <label class="f"><span>Base URL</span><input type="text" id="pe-url" placeholder="https://api.openai.com/v1"></label>
+            <label class="f"><span>API key</span><input type="password" id="pe-key" placeholder="sk-…" autocomplete="off">
+              <span class="h" id="pe-key-hint"></span>
+            </label>
+          </div>
+          <div class="f-row">
+            <label class="f"><span>Models (comma separated)</span><input type="text" id="pe-models" placeholder="gpt-4o, gpt-4o-mini">
+              <span class="h">The first entry is tested and forced onto requests routed here.</span>
+            </label>
+            <label class="f"><span>Use as</span>
+              <select id="pe-use-as">
+                <option value="main">main — complex chat</option>
+                <option value="auxiliary">auxiliary — fast / compression</option>
+              </select>
+            </label>
+            <label class="f"><span>State</span>
+              <select id="pe-enabled"><option value="true">Enabled — in the pool</option><option value="false">Disabled — keep config, serve no traffic</option></select>
+            </label>
+          </div>
+          <div class="btn-row">
+            <button class="btn" id="pe-test">Test connection</button>
+            <button class="btn primary" id="pe-save">Save provider</button>
+            <button class="btn" id="pe-reset" style="display:none">Cancel edit</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- ============================= MODELS ============================= -->
+      <section class="view" id="view-models">
+        <h1>Models</h1>
+        <p class="sub">What the gateway advertises on <code>/v1/models</code>, and where each role's traffic is actually going.</p>
+
+        <div class="panel">
+          <h2>Active roles <span class="hint">probed live from each role's endpoint</span></h2>
+          <div id="md-roles"><div class="state loading">Probing active models…</div></div>
+        </div>
+
+        <div class="panel">
+          <h2>Advertised models <span class="spacer"></span>
+            <button class="btn sm" id="md-refresh">Reload</button>
+            <span class="hint">discovery surface — clients pick from this list</span>
+          </h2>
+          <div id="md-table"><div class="state loading">Loading models…</div></div>
+        </div>
+      </section>
+
+      <!-- ============================= ROUTING ============================ -->
+      <section class="view" id="view-routing">
+        <h1>Routing</h1>
+        <p class="sub">Live routing behaviour. These values apply immediately and are persisted for the next boot; the chat URL overrides create real registry nodes.</p>
+
+        <div class="panel">
+          <h2>Router</h2>
+          <div class="f-row">
+            <label class="f"><span>Complexity threshold</span><input type="number" id="st-router" step="0.05" min="0" max="1">
+              <span class="h">Below this the router treats a prompt as simple.</span></label>
+            <label class="f"><span>Confidence threshold</span><input type="number" id="st-confidence" step="0.05" min="0" max="1"></label>
+            <label class="f"><span>Route tools to main</span>
+              <select id="st-tools"><option value="true">Yes</option><option value="false">No</option></select></label>
+          </div>
+          <div class="f-row">
+            <label class="f"><span>Default route</span>
+              <select id="st-default">
+                <option value="">Auto — content detection</option>
+                <option value="inference">Inference — always main</option>
+                <option value="auxiliary">Auxiliary — always fast</option>
+              </select>
+              <span class="h">An explicit pin overrides hybrid routing.</span></label>
+            <label class="f"><span>Hybrid routing</span>
+              <select id="st-hybrid"><option value="false">Off — every prompt to main</option><option value="true">On — short plain prompts to auxiliary</option></select>
+              <span class="h">Only applies while Default route is Auto.</span></label>
+            <label class="f"><span>Simple-prompt length budget (chars)</span><input type="number" id="st-hybrid-chars" min="0" max="100000" step="50">
+              <span class="h">Length of the newest user message that still counts as simple. 0 disables the check.</span></label>
+          </div>
+          <div class="f-row">
+            <label class="f"><span>Marker matching</span>
+              <select id="st-marker">
+                <option value="substring">Substring anywhere (legacy)</option>
+                <option value="prefix">System prompt must start with it (strict)</option>
+              </select></label>
+          </div>
+          <div class="btn-row"><button class="btn primary" id="st-save">Save routing settings</button><span class="small faint" id="st-note"></span></div>
+        </div>
+
+        <div class="panel">
+          <h2>Chat upstream overrides</h2>
+          <p class="small muted" style="margin-bottom:.8rem">
+            Point a chat role at any OpenAI-compatible endpoint. An override creates a registry node
+            (<code>manual-main</code> / <code>manual-auxiliary</code>) and is shown on the
+            <a href="#" data-goto="backends">Backends</a> page. Clearing the field removes it again.
+          </p>
+          <div class="f-row">
+            <label class="f"><span>Inference URL (main chat)</span><input type="text" id="st-large-url" placeholder="(env default)"></label>
+            <label class="f"><span>Auxiliary URL (fast / compression)</span><input type="text" id="st-small-url" placeholder="(env default)"></label>
+          </div>
+          <div class="f-row">
+            <label class="f"><span>TTS URL</span><input type="text" id="st-tts" placeholder="http://speech-tts:8800/v1/audio"></label>
+            <label class="f"><span>STT URL</span><input type="text" id="st-stt" placeholder="http://speech-stt:5092/v1/audio"></label>
+          </div>
+          <div class="btn-row"><button class="btn primary" id="st-endpoints-save">Save endpoints</button></div>
+        </div>
+
+        <div class="panel">
+          <h2>Reference</h2>
+          <div class="btn-row">
+            <a class="btn sm" href="#" data-doc="routing-settings.md">Routing settings reference</a>
+            <a class="btn sm" href="#" data-doc="dynamic-upstreams.md">Dynamic upstreams reference</a>
+          </div>
+        </div>
+      </section>
+
+      <!-- =========================== DIAGNOSTICS =========================== -->
+      <section class="view" id="view-diagnostics">
+        <h1>Diagnostics</h1>
+        <p class="sub">Raw gateway surfaces for when a number above looks wrong.</p>
+
+        <div class="panel">
+          <h2>Direct bindings <span class="hint">routes that deliberately bypass the gateway</span></h2>
+          <div id="dx-bindings" class="stack"></div>
+        </div>
+
+        <div class="panel">
+          <h2>Extraction backends <span class="hint">/extraction/v1 pool</span></h2>
+          <div id="dx-extraction"><div class="state loading">Loading…</div></div>
+        </div>
+
+        <div class="panel">
+          <h2>Prometheus metrics <span class="spacer"></span><a class="btn sm" href="#" data-raw="metrics">Open raw</a></h2>
+          <div id="dx-metrics"><div class="state loading">Loading metrics…</div></div>
+        </div>
+
+        <div class="panel">
+          <h2>Raw endpoints</h2>
+          <div class="btn-row" id="dx-links"></div>
+        </div>
+      </section>
+
+      <footer class="page">Cascade LLM Gateway — NetAI Stack SE</footer>
+    </main>
+  </div>
+
+  <div id="toasts"></div>
+  <dialog id="modal" style="border:1px solid var(--card-border);border-radius:var(--radius-lg);background:var(--card);color:var(--text);max-width:min(880px,92vw);width:100%;padding:0">
+    <div style="padding:1rem 1.2rem;border-bottom:1px solid var(--card-border);display:flex;align-items:center;gap:.6rem">
+      <strong id="modal-title" style="font-size:.95rem"></strong>
+      <button class="btn sm" id="modal-close" style="margin-left:auto">Close</button>
+    </div>
+    <pre class="raw" id="modal-body" style="border:0;border-radius:0;margin:0;max-height:70vh"></pre>
+  </dialog>
+
+<script>
+"use strict";
+/* ===========================================================================
+ * Gateway console — one document, seven sections.
+ *
+ * Two invariants this file exists to enforce:
+ *
+ * 1. **The API base is derived from the location, never assumed.** The old
+ *    dashboard fetched relative URLs (`fetch('models')`,
+ *    `fetch('v1/images/generations')`). Caddy serves this UI at /cascade/*,
+ *    rewriting to /web{path}, so "v1/images/generations" resolved to
+ *    /web/v1/images/generations — which does not exist, and the image test
+ *    answered 404 in production while the same code worked when served from
+ *    "/". Every request goes through api() below, which anchors on the real
+ *    prefix.
+ *
+ * 2. **No innerHTML with API or user data.** Everything is built with
+ *    createElement/textContent. The stack hardened its own UIs against exactly
+ *    this (tests/test_ui_xss_roles.py) and provider labels, node ids and model
+ *    descriptions are upstream-supplied strings.
+ * ========================================================================= */
+
+/* --- gateway path → browser URL -----------------------------------------
+ * Every endpoint is written as a *gateway* path (`/web/api/…`, `/v1/…`,
+ * `/web/metrics`) and `gw()` maps it to the URL this page must actually call.
+ *
+ * The page is reachable two ways, and the mapping differs:
+ *
+ *   http://gateway:3000/     →  /web/api/overview,  /v1/chat/completions
+ *   http://gateway:3000/web/ →  /web/api/overview,  /v1/chat/completions
+ *   https://host/cascade/    →  /cascade/api/overview,  /cascade/v1/chat/completions
+ *
+ * because Caddy serves the UI with `handle_path /cascade/* { rewrite * /web{path} }`
+ * and /v1/* through a separate block. So under a Caddy prefix the literal
+ * `/web` segment of a gateway path is NOT part of the public URL.
+ *
+ * This is the whole class of bug the previous dashboard had: it fetched
+ * relative URLs, so `v1/images/generations` became /web/v1/images/generations —
+ * a route that does not exist — and the image test answered 404 in production
+ * while the same code worked when the page was served from "/".
+ */
+const PREFIX = (() => {
+  const p = location.pathname;
+  const i = p.indexOf("/web");
+  if (i >= 0) return p.slice(0, i);                    // "/web/x" → "",  "/cascade/web/x" → "/cascade"
+  let base = p.replace(/\/+$/, "");                    // "/cascade/" → "/cascade",  "/" → ""
+  if (base.endsWith("/settings")) base = base.slice(0, -"/settings".length);
+  return base;                                          // "/cascade/settings" → "/cascade"
+})();
+/** Map a gateway path to the URL this page must call. */
+const gw = (path) => (PREFIX === "" ? path : PREFIX + path.replace(/^\/web/, ""));
+const API = { prefix: PREFIX, u: gw };
+
+const $  = (sel, root = document) => root.querySelector(sel);
+const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
+
+function el(tag, opts = {}, children = []) {
+  const node = document.createElement(tag);
+  if (opts.text != null) node.textContent = String(opts.text);
+  if (opts.class) node.className = opts.class;
+  if (opts.attrs) for (const [k, v] of Object.entries(opts.attrs)) {
+    if (v === true) node.setAttribute(k, "");
+    else if (v !== false && v != null) node.setAttribute(k, String(v));
+  }
+  if (opts.style) for (const [k, v] of Object.entries(opts.style)) node.style[k] = v;
+  // Event wiring lives here rather than in `onclick="…"` attributes: inline
+  // handlers would have to interpolate ids and text into HTML, which is exactly
+  // the injection surface the no-innerHTML rule exists to close.
+  if (opts.on) for (const [type, fn] of Object.entries(opts.on)) node.addEventListener(type, fn);
+  for (const c of [].concat(children)) if (c != null) node.append(c);
+  return node;
+}
+const clear = (node) => { while (node.firstChild) node.removeChild(node.firstChild); return node; };
+
+/* --- small shared vocabulary ------------------------------------------- */
+function loading(host, what = "Loading") { clear(host).append(el("div", { class: "state loading", text: what + "…" })); }
+function emptyState(host, title, hint) {
+  clear(host).append(el("div", { class: "empty" }, [el("strong", { text: title }), hint ? el("div", { text: hint }) : null]));
+}
+function errorState(host, err) {
+  const detail = err && err.message ? err.message : String(err);
+  clear(host).append(el("div", { class: "state error" }, [
+    el("div", { text: "Could not load: " + (err && err.status ? "HTTP " + err.status : "network error") }),
+    el("div", { class: "small", text: detail }),
+  ]));
+}
+
+function toast(msg, kind = "ok", ms = 4200) {
+  const t = el("div", { class: "toast " + kind }, [
+    el("div", { class: "body", text: msg }),
+    el("button", { text: "×", attrs: { "aria-label": "Dismiss" }, on: { click: () => t.remove() } }),
+  ]);
+  $("#toasts").append(t);
+  setTimeout(() => t.remove(), ms);
+}
+
+/**
+ * Fetch with an honest failure. `fetch` only rejects on a *network* error, so
+ * without the status check a 403 (missing admin key) resolved happily and the
+ * caller rendered it as success — which is how the old node toggle "snapped
+ * back silently with no message".
+ */
+async function api(path, { method = "GET", body, headers = {}, timeout = 20000 } = {}) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeout);
+  let resp;
+  try {
+    resp = await fetch(API.u(path), {
+      method, signal: ctrl.signal,
+      headers: body === undefined ? headers : { "Content-Type": "application/json", ...headers },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+  } catch (e) {
+    clearTimeout(timer);
+    const err = new Error(e.name === "AbortError" ? `timed out after ${timeout} ms` : e.message);
+    err.offline = true;
+    throw err;
+  }
+  clearTimeout(timer);
+  const text = await resp.text();
+  let json = null;
+  try { json = text ? JSON.parse(text) : null; } catch { /* non-JSON (markdown, prometheus) */ }
+  if (!resp.ok) {
+    const err = new Error(extractError(json, text) || `HTTP ${resp.status}`);
+    err.status = resp.status;
+    throw err;
+  }
+  return json ?? { raw: text };
+}
+
+function extractError(json, text) {
+  if (!json) return (text || "").slice(0, 300);
+  if (typeof json === "string") return json;
+  if (json.error) {
+    if (typeof json.error === "string") return json.error;
+    if (json.error.message) return json.error.message;
+  }
+  if (json.detail) return typeof json.detail === "string" ? json.detail : JSON.stringify(json.detail);
+  return JSON.stringify(json).slice(0, 300);
+}
+
+/* --- formatting -------------------------------------------------------- */
+const fmtInt = (n) => (n == null ? "—" : Number(n).toLocaleString());
+function fmtUptime(sec) {
+  if (sec == null) return "—";
+  const d = Math.floor(sec / 86400), h = Math.floor((sec % 86400) / 3600), m = Math.floor((sec % 3600) / 60);
+  if (d) return `${d}d ${h}h`;
+  if (h) return `${h}h ${m}m`;
+  return `${m}m ${sec % 60}s`;
+}
+function fmtMoney(v) { return v == null ? "—" : "$" + Number(v).toFixed(4).replace(/0+$/, "").replace(/\.$/, ""); }
+function fmtAge(iso) {
+  if (!iso) return "—";
+  const t = Date.parse(iso);
+  if (Number.isNaN(t)) return String(iso);
+  const s = Math.max(0, (Date.now() - t) / 1000);
+  if (s < 60) return `${Math.round(s)}s ago`;
+  if (s < 3600) return `${Math.round(s / 60)}m ago`;
+  if (s < 86400) return `${Math.round(s / 3600)}h ago`;
+  return `${Math.round(s / 86400)}d ago`;
+}
+const fmtWhen = (iso) => (iso ? String(iso).replace("T", " ").replace(/\..*$/, "").replace("+00:00", "Z") : "—");
+
+function badge(text, kind = "idle") { return el("span", { class: "badge " + kind, text }); }
+function healthBadge(node) {
+  if (!node.last_health_check) return badge("no probe yet", "idle");
+  if (node.active === false) return badge("disabled", "idle");
+  if (node.healthy) return badge(`${node.last_latency_ms ?? "?"} ms`, "ok");
+  return badge(`${node.consecutive_failures} failed probes`, "err");
+}
+
+/* --- inline SVG charts (no third-party library, see header comment) ------ */
+const SVG = "http://www.w3.org/2000/svg";
+function svgEl(tag, attrs = {}) {
+  const n = document.createElementNS(SVG, tag);
+  for (const [k, v] of Object.entries(attrs)) if (v != null) n.setAttribute(k, String(v));
+  return n;
+}
+const PALETTE = ["#3b82f6", "#a78bfa", "#ec4899", "#34d399", "#f59e0b", "#22d3ee", "#f472b6"];
+
+/** Horizontal bars. Labelled values, because an unlabelled axis in a console is
+ *  decoration; this is meant to be read, not admired. */
+function barChart(entries, { unit = "", height = 20, gap = 6 } = {}) {
+  const rows = entries.filter((e) => e.value > 0);
+  if (!rows.length) return el("div", { class: "empty", text: "No traffic recorded yet." });
+  const max = Math.max(...rows.map((r) => r.value));
+  const wrap = el("div", { class: "stack", style: { gap: gap + "px" } });
+  rows.forEach((r, i) => {
+    const pct = max ? Math.max(2, (r.value / max) * 100) : 2;
+    wrap.append(el("div", {}, [
+      el("div", { class: "row", style: { justifyContent: "space-between", gap: ".4rem" } }, [
+        el("span", { class: "small mono", text: r.label }),
+        el("span", { class: "small muted nowrap", text: fmtInt(r.value) + unit }),
+      ]),
+      el("div", { class: "bar-meter", style: { height: height / 2 + "px" } }, [
+        el("i", { style: { width: pct + "%", background: PALETTE[i % PALETTE.length] } }),
+      ]),
+    ]));
+  });
+  return wrap;
+}
+
+function sparkline(values, { height = 90 } = {}) {
+  if (!values.length) return el("div", { class: "empty", text: "No cost records." });
+  const max = Math.max(...values.map((v) => v.value), 0.0000001);
+  const w = 320, h = height, pad = 4;
+  const bw = w / values.length;
+  const svg = svgEl("svg", { viewBox: `0 0 ${w} ${h}`, width: "100%", height: h, role: "img",
+                             "aria-label": "Daily cost" });
+  values.forEach((v, i) => {
+    const bh = Math.max(1, (v.value / max) * (h - pad * 2));
+    const rect = svgEl("rect", {
+      x: (i * bw + bw * 0.2).toFixed(2), y: (h - pad - bh).toFixed(2),
+      width: (bw * 0.6).toFixed(2), height: bh.toFixed(2),
+      rx: 2, fill: PALETTE[0],
+    });
+    const title = svgEl("title", {});
+    title.textContent = `${v.label}: ${fmtMoney(v.value)}`;
+    rect.append(title);
+    svg.append(rect);
+  });
+  return el("div", {}, [
+    svg,
+    el("div", { class: "row small faint", style: { justifyContent: "space-between", marginTop: ".2rem" } }, [
+      el("span", { text: values[0].label }), el("span", { text: "peak " + fmtMoney(max) }), el("span", { text: values[values.length - 1].label }),
+    ]),
+  ]);
+}
+
+/* --- modal for raw payloads -------------------------------------------- */
+function showModal(title, text) {
+  $("#modal-title").textContent = title;
+  $("#modal-body").textContent = text;
+  const m = $("#modal");
+  if (typeof m.showModal === "function") m.showModal(); else m.setAttribute("open", "");
+}
+$("#modal-close").addEventListener("click", () => { const m = $("#modal"); if (m.close) m.close(); else m.removeAttribute("open"); });
+
+/* =========================================================================
+ * NAVIGATION
+ * ========================================================================= */
+const VIEWS = ["overview", "backends", "fleet", "providers", "models", "routing", "diagnostics"];
+let activeView = "overview";
+
+function showView(name) {
+  if (!VIEWS.includes(name)) name = "overview";
+  activeView = name;
+  VIEWS.forEach((v) => $("#view-" + v).classList.toggle("active", v === name));
+  $$(".side button.tab").forEach((b) => b.classList.toggle("active", b.dataset.view === name));
+  if (location.hash.slice(1) !== name) history.replaceState(null, "", "#" + name);
+  refreshView(name);
+}
+$$(".side button.tab").forEach((b) => b.addEventListener("click", () => showView(b.dataset.view)));
+document.addEventListener("click", (e) => {
+  const go = e.target.closest("[data-goto]");
+  if (go) { e.preventDefault(); showView(go.dataset.goto); }
+  const doc = e.target.closest("[data-doc]");
+  if (doc) { e.preventDefault(); openDoc(doc.dataset.doc); }
+  const raw = e.target.closest("[data-raw]");
+  if (raw) { e.preventDefault(); openRaw(raw.dataset.raw); }
+});
+
+/* =========================================================================
+ * STATE + one polling loop
+ *
+ * The old page ran three independent setIntervals (5 s dashboard, 10 s nodes,
+ * 10 s image status) with no cancellation, so a slow response stacked on top of
+ * the next tick. One loop, one in-flight guard per view, and a visible "last
+ * updated" stamp so a frozen console is distinguishable from a quiet one.
+ * ========================================================================= */
+const cache = {};
+let pollTimer = null;
+let refreshing = false;
+
+const POLL_MS = 8000;
+function startPolling() {
+  if (pollTimer) return;
+  const tick = async () => {
+    if (!refreshing && !document.hidden) { refreshing = true; try { await refreshView(activeView); } finally { refreshing = false; } }
+    pollTimer = setTimeout(tick, POLL_MS);
+  };
+  pollTimer = setTimeout(tick, POLL_MS);
+}
+function stopPolling() { if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; } }
+
+function stamp() {
+  const t = new Date();
+  $("#hdr-updated").textContent = "updated " + t.toTimeString().slice(0, 8);
+}
+
+async function refreshView(name) {
+  const fn = ({
+    overview: refreshOverview, backends: refreshBackends, fleet: refreshFleet,
+    providers: refreshProviders, models: refreshModels, routing: refreshSettings,
+    diagnostics: refreshDiagnostics,
+  })[name];
+  if (!fn) return;
+  try { await fn(); stamp(); }
+  catch (e) { console.error("refresh failed:", e); }
+}
+
+/* =========================================================================
+ * OVERVIEW
+ * ========================================================================= */
+async function refreshOverview() {
+  const host = $("#ov-stats");
+  let d;
+  try { d = cache.overview = await api("/web/api/overview"); }
+  catch (e) { errorState(host, e); $("#hdr-status").textContent = "gateway unreachable"; $("#hdr-status").className = "badge err"; return; }
+
+  $("#hdr-status").textContent = d.status === "ok" ? "operational" : "degraded";
+  $("#hdr-status").className = "badge " + (d.status === "ok" ? "ok" : "warn");
+  $("#foot-uptime").textContent = "uptime " + fmtUptime(d.uptime_seconds);
+  $("#foot-admin").textContent = d.admin_key_required
+    ? (d.caller_is_admin ? "admin key accepted" : "read-only — admin key missing")
+    : "admin key not configured";
+  $("#ov-prov-note").textContent = d.provisioner.configured
+    ? (d.provisioner.reachable ? "provisioner reachable" : "provisioner NOT reachable")
+    : "provisioner integration disabled";
+
+  clear(host);
+  const stat = (k, v, s) => el("div", { class: "stat" }, [
+    el("div", { class: "k", text: k }), el("div", { class: "v", text: v }), s ? el("div", { class: "s", text: s }) : null,
+  ]);
+  host.append(
+    stat("Requests routed", fmtInt(d.metrics.requests_total), `${Object.keys(d.metrics.requests_by_backend).length} backends used`),
+    stat("Registry nodes", fmtInt(d.registry.nodes), `${d.registry.serving} serving`),
+    stat("Main / aux reachable", (d.inference_reachable ? "main ✓" : "main ✗") + " · " + (d.auxiliary_reachable ? "aux ✓" : "aux ✗"), d.cascade_model),
+    stat("Providers", fmtInt(d.providers.total), `${d.providers.enabled} enabled · ${d.providers.with_key} keyed`),
+    stat("Fallbacks", fmtInt(d.metrics.fallback_count), Object.keys(d.metrics.fallback_by_reason).length + " reasons triggered"),
+    stat("GPU fleet", d.provisioner.reachable ? "reachable" : d.provisioner.configured ? "unreachable" : "disabled",
+         `${d.extraction_backends} extraction backends`),
+  );
+
+  clear($("#ov-chart")).append(barChart(
+    Object.entries(d.metrics.requests_by_backend).map(([k, v]) => ({ label: k, value: v }))));
+
+  // Role coverage — the single most useful table: which role has a pool at all.
+  const roleHost = clear($("#ov-roles"));
+  const roles = Object.entries(d.registry.roles || {});
+  if (!roles.length) emptyState(roleHost, "No roles registered", "The registry has not been populated.");
+  else {
+    const t = el("table", {}, [el("thead", {}, [el("tr", {}, [
+      el("th", { text: "Role" }), el("th", { text: "Nodes" }), el("th", { text: "Active" }), el("th", { text: "Serving" })])])]);
+    const tb = el("tbody");
+    roles.forEach(([role, s]) => tb.append(el("tr", {}, [
+      el("td", {}, [el("code", { text: role })]),
+      el("td", { class: "num", text: fmtInt(s.total) }),
+      el("td", { class: "num", text: fmtInt(s.active) }),
+      el("td", {}, [s.serving ? badge("serving", "ok") : badge(s.total ? "no serving node" : "static default", s.total ? "warn" : "idle")]),
+    ])));
+    t.append(tb);
+    roleHost.append(t, el("div", { class: "small faint", style: { marginTop: ".5rem" },
+      text: "“static default” means no registry node: the role falls back to its configured URL." }));
+  }
+
+  const origins = clear($("#ov-origins"));
+  const oentries = Object.entries(d.metrics.requests_by_origin || {}).sort((a, b) => b[1] - a[1]);
+  if (!oentries.length) emptyState(origins, "No request origins yet", "x-request-origin is recorded per request.");
+  else origins.append(barChart(oentries.map(([k, v]) => ({ label: k, value: v }))));
+
+  const fb = clear($("#ov-fallbacks"));
+  const fentries = Object.entries(d.metrics.fallback_by_reason || {});
+  if (!fentries.length) emptyState(fb, "No fallbacks triggered", "The primary backend has answered every request.");
+  else fb.append(barChart(fentries.map(([k, v]) => ({ label: k, value: v }))));
+}
+
+/* --- routing self-test -------------------------------------------------- */
+const SIMPLE_PROMPT = "Say OK";
+const COMPLEX_PROMPT = "Analyse this beam to Eurocode: a 6 m reinforced concrete beam carrying q = 12 kN/m. " +
+  "Derive the ULS load combination step by step, state every partial factor, compute the design bending moment " +
+  "and check the bending utilisation with the section properties.";
+
+async function runRouteTest(prompt, hint) {
+  const out = $("#rt-out");
+  clear(out).append(el("div", { class: "state loading", text: "Sending request…" }));
+  const headers = { "Content-Type": "application/json" };
+  if (hint) headers["x-cascade-route"] = hint;
+  const body = { messages: [{ role: "user", content: prompt }], max_tokens: 16, temperature: 0 };
+  // `model` is REQUIRED by the gateway's request struct — omitting it is a 400,
+  // not a defaulted field. Default to the identity the gateway advertises, which
+  // is the only id guaranteed to be served upstream (gotcha 40/68).
+  const modelInput = $("#rt-model");
+  if (!modelInput.value.trim()) {
+    const identity = (cache.overview && cache.overview.cascade_model) || (cache.settings && cache.settings.main_model_name);
+    if (identity) modelInput.value = identity;
+  }
+  if (modelInput.value.trim()) body.model = modelInput.value.trim();
+
+  const t0 = performance.now();
+  let resp, text;
+  try {
+    resp = await fetch(API.u("/v1/chat/completions"), { method: "POST", headers, body: JSON.stringify(body) });
+    text = await resp.text();
+  } catch (e) {
+    clear(out).append(el("div", { class: "state error", text: "Request failed: " + e.message }));
+    return;
+  }
+  const ms = Math.round(performance.now() - t0);
+  let json = null;
+  try { json = JSON.parse(text); } catch { /* non-JSON upstream */ }
+
+  if (!resp.ok) {
+    clear(out).append(el("div", { class: "state error" }, [
+      el("div", { text: `HTTP ${resp.status}` }),
+      el("div", { class: "small", text: extractError(json, text) }),
+    ]));
+    return;
+  }
+  const route = resp.headers.get("x-cascade-route") || "(none)";
+  const served = resp.headers.get("x-model-name") || json?.model || "";
+  const answer = json?.choices?.[0]?.message?.content ?? "";
+  const expected = hint === "auxiliary-server" ? "auxiliary-server"
+    : hint === "inference-server" ? "inference-server" : null;
+  const agree = expected ? route === expected : null;
+
+  clear(out).append(
+    el("div", { class: "row", style: { marginBottom: ".5rem" } }, [
+      badge("x-cascade-route: " + route, agree === false ? "err" : "ok"),
+      agree === true ? badge("matches expectation", "ok") : null,
+      badge(ms + " ms", "idle"),
+      served ? badge("model: " + served, "info") : null,
+    ]),
+    el("div", { class: "small muted", style: { marginBottom: ".4rem" },
+      text: "The gateway forwards the client's model name verbatim to a static upstream — an id the engine does not serve is a 404 here, not a silent downgrade." }),
+    el("pre", { class: "raw", style: { maxHeight: "180px" }, text: answer || text.slice(0, 800) }),
+  );
+}
+$("#rt-run").addEventListener("click", () => runRouteTest($("#rt-prompt").value.trim() || "Say OK", $("#rt-hint").value));
+$("#rt-simple").addEventListener("click", () => { $("#rt-prompt").value = SIMPLE_PROMPT; $("#rt-hint").value = ""; runRouteTest(SIMPLE_PROMPT, ""); });
+$("#rt-complex").addEventListener("click", () => { $("#rt-prompt").value = COMPLEX_PROMPT; $("#rt-hint").value = ""; runRouteTest(COMPLEX_PROMPT, ""); });
+
+/* =========================================================================
+ * BACKENDS (registry)
+ * ========================================================================= */
+async function refreshBackends() {
+  const sum = $("#bk-summary"), host = $("#bk-table"), defs = $("#bk-defaults");
+  loading(sum, "Loading registry");
+  let d;
+  try { d = cache.upstreams = await api("/web/api/v1/admin/upstreams"); }
+  catch (e) { errorState(sum, e); loading(host, "Registry"); errorState(host, e); return; }
+
+  $("#cnt-backends").textContent = (d.nodes || []).length;
+  clear(sum).append(el("dl", { class: "kv" }, [
+    el("dt", { text: "Strategy" }), el("dd", { text: String(d.strategy).replace(/_/g, " ") }),
+    el("dt", { text: "Nodes" }), el("dd", { text: `${(d.nodes || []).length} registered, ${(d.nodes || []).filter((n) => n.active && n.healthy).length} serving` }),
+    el("dt", { text: "Prober" }), el("dd", { text: `every ${d.health.interval_secs}s · demote after ${d.health.failure_threshold} failures · ${d.health.timeout_secs}s timeout` }),
+  ]));
+  $("#bk-strategy").value = d.strategy === "least_latency" ? "least_latency" : "round_robin";
+  updateImageStatus();
+
+  const nodes = d.nodes || [];
+  if (!nodes.length) {
+    emptyState(host, "No dynamic nodes registered",
+      "Every role is using its static default URL. Nodes appear here once the GPU provisioner registers one, or when you add one below.");
+  } else {
+    const t = el("table", {}, [el("thead", {}, [el("tr", {}, [
+      el("th", { text: "" }), el("th", { text: "Role" }), el("th", { text: "Label / model" }),
+      el("th", { text: "Endpoint" }), el("th", { text: "Health" }), el("th", { text: "Weight" }),
+      el("th", { text: "EMA" }), el("th", { text: "Cost" }), el("th", { text: "Key" }), el("th", { text: "" }),
+    ])])]);
+    const tb = el("tbody");
+    nodes.forEach((n) => {
+      const toggle = el("input", { attrs: { type: "checkbox", title: n.active ? "In the pool — click to remove" : "Out of the pool — click to add" } });
+      toggle.checked = n.active;
+      toggle.addEventListener("change", () => nodeAction(n.id, n.active ? "deactivate" : "activate", toggle));
+      const weight = el("input", { class: "inline-edit", attrs: { type: "number", min: "1", max: "64", title: "Weighted round-robin share" } });
+      weight.value = n.weight;
+      weight.addEventListener("change", () => nodeUpdate(n, { weight: parseInt(weight.value || "1", 10) }));
+      tb.append(el("tr", {}, [
+        el("td", { class: "nowrap" }, [toggle]),
+        el("td", {}, [badge(n.role, "info")]),
+        el("td", {}, [
+          el("div", { text: n.label || n.id }),
+          el("div", { class: "small faint mono", text: n.model || "(client model name forwarded)" }),
+          n.provider ? el("div", { class: "small faint", text: n.provider }) : null,
+        ]),
+        el("td", { class: "small mono", text: n.endpoint_url }),
+        el("td", { class: "nowrap" }, [healthBadge(n), n.last_health_check ? el("div", { class: "small faint", text: fmtAge(n.last_health_check) }) : null]),
+        el("td", { class: "num" }, [weight]),
+        el("td", { class: "num small muted", text: n.latency_ema_ms != null ? n.latency_ema_ms + " ms" : "—" }),
+        el("td", { class: "num small", text: n.cost_per_hour != null ? "$" + n.cost_per_hour + "/h" : "—" }),
+        el("td", { class: "small" }, [n.bearer_set ? badge("set", "ok") : badge("none", "idle")]),
+        el("td", { class: "nowrap" }, [
+          el("button", { class: "btn sm", text: "Edit", on: { click: () => prefillNodeForm(n) } }),
+          " ",
+          el("button", { class: "btn sm danger", text: "Remove", on: { click: () => nodeAction(n.id, "delete", null, n.role) } }),
+        ]),
+      ]));
+    });
+    t.append(tb);
+    clear(host).append(t);
+  }
+  $("#bk-count").textContent = `${nodes.length} node(s)`;
+
+  clear(defs).append(el("dl", { class: "kv" }, Object.entries(d.defaults || {}).flatMap(([role, url]) => [
+    el("dt", {}, [el("code", { text: role })]),
+    el("dd", { class: "small mono", text: url || "— none —" }),
+  ])));
+}
+
+function prefillNodeForm(n) {
+  $("#nf-role").value = n.role;
+  $("#nf-url").value = n.endpoint_url;
+  $("#nf-label").value = n.label || "";
+  $("#nf-model").value = n.model || "";
+  $("#nf-weight").value = n.weight;
+  $("#nf-ctx").value = n.max_context_length || "";
+  $("#nf-provider").value = n.provider || "";
+  $("#nf-cost").value = n.cost_per_hour ?? "";
+  $("#nf-bearer").value = "";
+  $("#nf-health").value = n.health_url || "";
+  $("details.form").open = true;
+  $("details.form").scrollIntoView({ behavior: "smooth", block: "center" });
+}
+
+async function nodeAction(id, action, inputEl, role) {
+  try {
+    if (action === "delete") {
+      if (!confirm("Remove this node from the registry?")) return;
+      await api("/web/api/v1/upstreams/" + encodeURIComponent(role) + "?id=" + encodeURIComponent(id), { method: "DELETE" });
+      toast("Node removed from the registry.");
+    } else {
+      await api("/web/api/v1/inference-nodes/" + encodeURIComponent(id) + "/" + action, { method: "POST" });
+      toast(action === "activate" ? "Node activated." : "Node deactivated.");
+    }
+    await refreshBackends();
+  } catch (e) {
+    toast(action + " failed: " + e.message, "err", 7000);
+    if (inputEl) inputEl.checked = !inputEl.checked;   // never leave the UI lying about the server
+    await refreshBackends();
+  }
+}
+
+async function nodeUpdate(node, fields) {
+  const payload = Object.assign({
+    id: node.id, endpoint_url: node.endpoint_url, label: node.label || undefined,
+    model: node.model || undefined, provider: node.provider || undefined,
+    cost_per_hour: node.cost_per_hour ?? undefined,
+    max_context_length: node.max_context_length ?? undefined,
+  }, fields);
+  for (const k of Object.keys(payload)) if (payload[k] === undefined) delete payload[k];
+  try {
+    await api("/web/api/upstreams/" + encodeURIComponent(node.role), { method: "PUT", body: payload });
+    toast("Node updated.");
+    await refreshBackends();
+  } catch (e) { toast("Update failed: " + e.message, "err"); }
+}
+
+$("#nf-submit").addEventListener("click", async () => {
+  const role = $("#nf-role").value;
+  const url = $("#nf-url").value.trim();
+  if (!url.startsWith("http")) { toast("Endpoint URL must start with http:// or https://", "err"); return; }
+  const payload = { endpoint_url: url };
+  const add = (k, v) => { if (v !== "" && v != null) payload[k] = v; };
+  add("label", $("#nf-label").value.trim());
+  add("model", $("#nf-model").value.trim());
+  add("provider", $("#nf-provider").value.trim());
+  add("health_url", $("#nf-health").value.trim());
+  add("bearer_token", $("#nf-bearer").value);
+  const w = parseInt($("#nf-weight").value || "1", 10); if (w > 0) payload.weight = w;
+  const ctx = parseInt($("#nf-ctx").value || "0", 10); if (ctx > 0) payload.max_context_length = ctx;
+  const cost = parseFloat($("#nf-cost").value || "0"); if (cost > 0) payload.cost_per_hour = cost;
+  const btn = $("#nf-submit"); btn.disabled = true;
+  try {
+    await api("/web/api/upstreams/" + encodeURIComponent(role), { method: "PUT", body: payload });
+    toast("Node registered.");
+    ["nf-url", "nf-label", "nf-model", "nf-provider", "nf-bearer", "nf-health", "nf-cost", "nf-ctx"].forEach((i) => { $("#" + i).value = ""; });
+    await refreshBackends();
+  } catch (e) { toast("Register failed: " + e.message, "err", 7000); }
+  finally { btn.disabled = false; }
+});
+
+$("#btn-probe").addEventListener("click", async (e) => {
+  const btn = e.currentTarget; btn.disabled = true; btn.textContent = "Probing…";
+  try {
+    const d = await api("/web/api/v1/admin/upstreams/probe", { method: "POST", timeout: 60000 });
+    const failing = (d.nodes || []).filter((n) => !n.healthy).length;
+    toast(failing ? `Probe done — ${failing} node(s) failing.` : "Probe done — all nodes answered.", failing ? "warn" : "ok");
+    await refreshBackends();
+  } catch (err) { toast("Probe failed: " + err.message, "err"); }
+  finally { btn.disabled = false; btn.textContent = "Probe all now"; }
+});
+
+$("#btn-refresh-models").addEventListener("click", async (e) => {
+  const btn = e.currentTarget; btn.disabled = true; btn.textContent = "Refreshing…";
+  try {
+    const d = await api("/web/api/v1/admin/upstreams/refresh-models", { method: "POST", timeout: 90000 });
+    if (d.errors && d.errors.length) toast(`Updated ${d.updated}; ${d.errors.length} error(s): ${d.errors[0]}`, "warn", 9000);
+    else toast(`Model names refreshed on ${d.updated} node(s).`);
+    await refreshBackends();
+  } catch (err) { toast("Model refresh failed: " + err.message, "err"); }
+  finally { btn.disabled = false; btn.textContent = "Refresh model names"; }
+});
+
+$("#bk-strategy-save").addEventListener("click", async () => {
+  try {
+    await api("/web/api/routing-strategy", { method: "PUT", body: { strategy: $("#bk-strategy").value } });
+    toast("Selection strategy updated.");
+    await refreshBackends();
+  } catch (e) { toast("Could not change strategy: " + e.message, "err"); }
+});
+
+/* --- image role probe --------------------------------------------------- */
+$("#img-run").addEventListener("click", async (e) => {
+  const btn = e.currentTarget;
+  const out = clear($("#img-out"));
+  const prompt = $("#img-prompt").value.trim();
+  if (!prompt) { toast("prompt required", "warn"); return; }
+  const body = { prompt, n: 1, size: $("#img-size").value.trim() || "512x512", response_format: "b64_json" };
+  const model = $("#img-model").value.trim();
+  if (model) body.model = model;
+  btn.disabled = true; btn.textContent = "Generating…";
+  out.append(el("div", { class: "state loading", text: "Requesting image…" }));
+  const t0 = performance.now();
+  try {
+    const resp = await fetch(API.u("/v1/images/generations"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const text = await resp.text();
+    const ms = Math.round(performance.now() - t0);
+    let json = null;
+    try { json = JSON.parse(text); } catch { /* non-JSON upstream */ }
+    clear(out);
+    if (!resp.ok) {
+      out.append(el("div", { class: "state error" }, [
+        el("div", { text: `HTTP ${resp.status}` }),
+        el("div", { class: "small", text: extractError(json, text) }),
+      ]));
+      return;
+    }
+    const b64 = json?.data?.[0]?.b64_json;
+    const url = json?.data?.[0]?.url;
+    if (b64) {
+      const img = el("img", { attrs: { alt: prompt, style: "max-width:320px;max-height:320px;border-radius:8px;border:1px solid var(--card-border)" } });
+      img.src = "data:image/png;base64," + b64;
+      out.append(img, el("div", { class: "small faint", style: { marginTop: ".3rem" },
+        text: `${ms} ms · ${Math.round(b64.length * 0.75 / 1024)} KB base64` }));
+    } else if (url) {
+      const img = el("img", { attrs: { alt: prompt, src: url, style: "max-width:320px;border-radius:8px;border:1px solid var(--card-border)" } });
+      out.append(img, el("div", { class: "small faint", text: `${ms} ms · ${url}` }));
+    } else {
+      out.append(el("div", { class: "state error", text: "Upstream returned neither b64_json nor url: " + text.slice(0, 200) }));
+    }
+  } catch (err) {
+    clear(out).append(el("div", { class: "state error", text: "Request failed: " + err.message }));
+  } finally {
+    btn.disabled = false; btn.textContent = "Generate";
+  }
+});
+
+async function updateImageStatus() {
+  try {
+    const d = await api("/web/api/v1/admin/upstreams");
+    const nodes = (d.nodes || []).filter((n) => n.role === "image");
+    const el2 = $("#img-active");
+    if (!el2) return;
+    const active = nodes.find((n) => n.active);
+    el2.textContent = active
+      ? `active image node: ${active.label || active.id} → ${active.endpoint_url}`
+      : (nodes.length ? "an image node exists but is deactivated" : "no image node registered — falling back to the configured URL");
+  } catch { /* the probe button reports its own failure */ }
+}
+
+/* =========================================================================
+ * GPU FLEET (provisioner passthrough)
+ * ========================================================================= */
+function prov(path, opts) { return api("/web/api/provisioner/" + path, opts); }
+
+async function refreshFleet() {
+  const provStatusHost = $("#fl-provisioner");
+
+  // Status first: everything else is meaningless when the integration is off.
+  let status;
+  try { status = cache.provStatus = await api("/web/api/provisioner/status", { timeout: 8000 }); }
+  catch (e) {
+    clear(provStatusHost).append(el("div", { class: "state error" }, [
+      el("div", { text: "Provisioner integration unavailable" }),
+      el("div", { class: "small", text: e.message }),
+      el("div", { class: "small", text: "Caddy forwards /cascade/* to the gateway, which proxies a fixed allowlist to GPU_PROVISIONER_URL. Set that variable (default http://netai-gpu-provisioner:8091) if it has moved." }),
+    ]));
+    ["fl-instances", "fl-nodes", "fl-budget", "fl-providers", "fl-rules"].forEach((id) =>
+      emptyState($("#" + id), "Not available", "The gateway cannot reach the provisioner."));
+    return;
+  }
+  if (!status.configured) {
+    emptyState(provStatusHost, "Provisioner integration disabled", "GPU_PROVISIONER_URL is empty on the gateway.");
+    return;
+  }
+  const h = status.health || {};
+  clear(provStatusHost).append(el("dl", { class: "kv" }, [
+    el("dt", { text: "Endpoint" }), el("dd", { class: "small mono", text: status.url }),
+    el("dt", { text: "Status" }), el("dd", {}, [status.reachable ? badge("reachable", "ok") : badge("unreachable", "err")]),
+    el("dt", { text: "Billed to date" }), el("dd", { text: fmtMoney(h.billed_usd) }),
+    el("dt", { text: "Hourly rate now" }), el("dd", { text: fmtMoney(h.hourly_rate_usd) + "/h across " + (h.live_contracts ?? 0) + " contract(s)" }),
+    el("dt", { text: "Instances" }), el("dd", { text: `${h.active_instances ?? 0} active of max ${h.max_instances ?? "?"}` }),
+    el("dt", { text: "Cloud services" }), el("dd", {}, [h.cloud_enabled ? badge("enabled", "ok") : badge("disabled", "warn")]),
+    el("dt", { text: "Remaining" }), el("dd", { text: `${fmtMoney(h.budget?.weekly_remaining_usd)} weekly · ${fmtMoney(h.budget?.monthly_remaining_usd)} monthly` }),
+    (h.provider_backoff && Object.keys(h.provider_backoff).length)
+      ? el("dt", { text: "Backoff" }) : null,
+    (h.provider_backoff && Object.keys(h.provider_backoff).length)
+      ? el("dd", { text: Object.keys(h.provider_backoff).join(", ") }) : null,
+    (h.pending_terminations || []).length ? el("dt", { text: "Pending terminations" }) : null,
+    (h.pending_terminations || []).length ? el("dd", { text: h.pending_terminations.join(", ") }) : null,
+  ]));
+
+  $("#fl-cloud-toggle").textContent = h.cloud_enabled ? "Disable cloud (terminates everything)" : "Enable cloud";
+  $("#fl-cloud-toggle").className = "btn sm" + (h.cloud_enabled ? " danger" : "");
+
+  await Promise.all([
+    renderInstances(), renderFleetNodes(), renderBudget(), renderCosts(), renderProvProviders(), renderRules(),
+  ]);
+}
+
+async function renderInstances() {
+  const host = $("#fl-instances");
+  loading(host, "Loading instances");
+  let d; try { d = await prov("instances"); } catch (e) { errorState(host, e); return; }
+  const rows = d.instances || [];
+  if (!rows.length) { emptyState(host, "No GPU instances", "Nothing is rented. Extraction falls back to the local auxiliary server."); return; }
+  const t = el("table", {}, [el("thead", {}, [el("tr", {}, [
+    el("th", { text: "Instance" }), el("th", { text: "Provider / GPU" }), el("th", { text: "State" }),
+    el("th", { text: "Uptime" }), el("th", { text: "Cost" }), el("th", { text: "Billing" }), el("th", { text: "" }),
+  ])])]);
+  const tb = el("tbody");
+  rows.forEach((i) => {
+    const stateKind = i.state === "running" ? "ok" : i.state === "error" || i.state === "terminate_failed" ? "err"
+      : i.state === "stopped" ? "warn" : "idle";
+    tb.append(el("tr", {}, [
+      el("td", { class: "small mono", text: i.instance_id }),
+      el("td", { class: "small" }, [el("div", { text: i.provider }), el("div", { class: "faint", text: i.gpu_type || "auto" })]),
+      el("td", {}, [badge(i.state, stateKind), i.termination_reason ? el("div", { class: "small faint", text: i.termination_reason }) : null]),
+      el("td", { class: "num small", text: i.uptime_secs ? fmtUptime(i.uptime_secs) : "—" }),
+      el("td", { class: "num small" }, [
+        el("div", { text: fmtMoney(i.cost_display_usd ?? i.cost_usd) }),
+        i.cost_is_estimate ? el("div", { class: "faint", text: "estimate" }) : null,
+      ]),
+      el("td", { class: "small" }, [i.still_billing ? badge("still billing", "err") : badge("not billing", "idle")]),
+      el("td", { class: "nowrap" }, [
+        el("button", { class: "btn sm danger", text: "Terminate", on: { click: () => provAction(`instances/${encodeURIComponent(i.instance_id)}`, "DELETE", "Terminate instance?") } }),
+      ]),
+    ]));
+  });
+  t.append(tb);
+  clear(host).append(t, el("div", { class: "small faint", style: { marginTop: ".5rem" },
+    text: `max concurrent instances: ${d.max ?? "?"}` }));
+}
+
+async function renderFleetNodes() {
+  const host = $("#fl-nodes");
+  loading(host, "Loading inference nodes");
+  let d; try { d = await prov("inference-nodes"); } catch (e) { errorState(host, e); return; }
+  const rows = d.nodes || [];
+  $("#cnt-fleet").textContent = rows.filter((n) => n.state === "running").length;
+  if (!rows.length) { emptyState(host, "No inference nodes", "Rent one in the provisioner UI, or register a hosted API node below."); return; }
+
+  const registry = cache.upstreams && cache.upstreams.nodes ? cache.upstreams.nodes : null;
+  const inRegistry = (id) => (registry || []).find((n) => n.id === id);
+
+  const t = el("table", {}, [el("thead", {}, [el("tr", {}, [
+    el("th", { text: "Node" }), el("th", { text: "Role" }), el("th", { text: "State" }),
+    el("th", { text: "Cost" }), el("th", { text: "In registry" }), el("th", { text: "" }),
+  ])])]);
+  const tb = el("tbody");
+  rows.slice().reverse().forEach((n) => {
+    const md = n.metadata || {};
+    const rid = md.cascade_backend_id || n.instance_id;
+    const reg = inRegistry(rid);
+    const regCell = reg
+      ? (reg.active ? badge("active", reg.healthy ? "ok" : "err") : badge("deactivated", "idle"))
+      : badge("not registered", "warn");
+    const buttons = el("div", { class: "btn-row" });
+    if (["running", "ready", "serving"].includes(n.state)) {
+      if (md.activated_role) buttons.append(el("button", { class: "btn sm", text: "Deactivate",
+        on: { click: () => provAction(`inference-nodes/${encodeURIComponent(n.instance_id)}/deactivate`, "POST") } }));
+      else buttons.append(el("button", { class: "btn sm primary", text: "Activate into routing",
+        on: { click: () => provAction(`inference-nodes/${encodeURIComponent(n.instance_id)}/activate`, "POST") } }));
+    }
+    buttons.append(
+      el("button", { class: "btn sm", text: "Log", on: { click: () => openProv(`inference-nodes/${encodeURIComponent(n.instance_id)}/logs`) } }),
+      el("button", { class: "btn sm danger", text: "Terminate", on: { click: () => provAction(`instances/${encodeURIComponent(n.instance_id)}`, "DELETE", "Terminate this node? The machine stops billing.") } }),
+    );
+    tb.append(el("tr", {}, [
+      el("td", { class: "small" }, [
+        el("div", { class: "mono", text: n.instance_id }),
+        el("div", { class: "faint", text: n.provider + (n.gpu_type ? " · " + n.gpu_type : "") }),
+        md.model ? el("div", { class: "faint", text: "model: " + md.model }) : null,
+        n.termination_reason ? el("div", { class: "faint", text: "ended: " + n.termination_reason }) : null,
+      ]),
+      el("td", {}, [badge(md.role || md.activated_role || "main", "info")]),
+      el("td", {}, [badge(n.state, n.state === "running" ? "ok" : n.state === "terminated" ? "idle" : "warn")]),
+      el("td", { class: "num small", text: fmtMoney(n.cost_display_usd ?? n.cost_usd) }),
+      el("td", {}, [regCell]),
+      el("td", {}, [buttons]),
+    ]));
+  });
+  t.append(tb);
+  clear(host).append(t, el("div", { class: "small faint", style: { marginTop: ".5rem" },
+    text: "A node only receives traffic after it appears in the registry. The gateway's pool is in-memory, so a gateway restart empties it until the next reconcile." }));
+}
+
+async function renderBudget() {
+  const host = $("#fl-budget");
+  loading(host, "Loading budget");
+  let d; try { d = await prov("budget"); } catch (e) { errorState(host, e); return; }
+  clear(host);
+  const meter = (label, cap, spend) => {
+    const pct = cap > 0 ? Math.min(100, (spend / cap) * 100) : 0;
+    return el("div", { style: { marginBottom: ".8rem" } }, [
+      el("div", { class: "row", style: { justifyContent: "space-between" } }, [
+        el("span", { class: "small", text: label }),
+        el("span", { class: "small muted", text: `${fmtMoney(spend)} / ${fmtMoney(cap)}` }),
+      ]),
+      el("div", { class: "bar-meter" }, [el("i", { class: pct > 85 ? "err" : pct > 60 ? "warn" : "", style: { width: pct + "%" } })]),
+    ]);
+  };
+  const budgetEnabled = el("select", { attrs: { id: "bg-enabled" } }, [
+    el("option", { text: "Yes", attrs: { value: "true" } }),
+    el("option", { text: "No", attrs: { value: "false" } }),
+  ]);
+  budgetEnabled.value = d.enabled ? "true" : "false";
+  host.append(
+    el("div", { class: "row", style: { marginBottom: ".8rem" } }, [d.enabled ? badge("budget enforced", "ok") : badge("budget disabled — unbounded spend", "warn")]),
+    meter("Weekly", d.weekly_cap_usd, d.weekly_spend_usd),
+    meter("Monthly", d.monthly_cap_usd, d.monthly_spend_usd),
+    el("div", { class: "f-row" }, [
+      el("label", { class: "f" }, [el("span", { text: "Weekly cap (USD)" }), el("input", { attrs: { type: "number", step: "0.5", id: "bg-weekly", value: d.weekly_cap_usd } })]),
+      el("label", { class: "f" }, [el("span", { text: "Monthly cap (USD)" }), el("input", { attrs: { type: "number", step: "0.5", id: "bg-monthly", value: d.monthly_cap_usd } })]),
+      el("label", { class: "f" }, [el("span", { text: "Enabled" }), budgetEnabled]),
+    ]),
+    el("div", { class: "btn-row" }, [el("button", { class: "btn primary", text: "Save budget", on: { click: saveBudget } })]),
+  );
+}
+
+async function saveBudget() {
+  const body = {
+    enabled: $("#bg-enabled").value === "true",
+    weekly_cap_usd: parseFloat($("#bg-weekly").value || "0"),
+    monthly_cap_usd: parseFloat($("#bg-monthly").value || "0"),
+  };
+  try { await prov("budget", { method: "PUT", body }); toast("Budget saved."); await renderBudget(); }
+  catch (e) { toast("Could not save budget: " + e.message, "err"); }
+}
+
+async function renderCosts() {
+  const chartHost = $("#fl-cost-chart"), provHost = $("#fl-cost-providers");
+  loading(chartHost, "Loading costs");
+  let d; try { d = await prov("costs"); } catch (e) { errorState(chartHost, e); return; }
+  const daily = (d.daily || []).slice(-7);
+  clear(chartHost).append(sparkline(daily.map((x) => ({ label: x.date, value: x.cost_usd || 0 }))));
+  clear(provHost).append(
+    el("div", { class: "small muted", text: `${fmtInt(d.total_records)} cost records · total this period ${fmtMoney(Object.values(d.provider_monthly || {}).reduce((a, b) => a + b, 0))}` }),
+    el("div", { class: "pill-row", style: { marginTop: ".35rem" } },
+      Object.entries(d.provider_monthly || {}).map(([k, v]) => badge(k + " " + fmtMoney(v), "info"))),
+  );
+}
+
+async function renderProvProviders() {
+  const host = $("#fl-providers");
+  loading(host, "Loading providers");
+  let d; try { d = await prov("providers"); } catch (e) { errorState(host, e); return; }
+  const rows = d.providers || [];
+  if (!rows.length) { emptyState(host, "No GPU providers", "The provisioner exposes none."); return; }
+  const t = el("table", {}, [el("thead", {}, [el("tr", {}, [
+    el("th", { text: "Provider" }), el("th", { text: "Kind" }), el("th", { text: "Credential" }),
+    el("th", { text: "Prerequisites" }),
+  ])])]);
+  const tb = el("tbody");
+  rows.forEach((p) => tb.append(el("tr", {}, [
+    el("td", { text: p.name }),
+    el("td", { class: "small muted", text: p.kind }),
+    el("td", {}, [p.has_key ? badge("key set", "ok") : badge("no key", "idle"),
+      el("div", { class: "small faint", text: p.env_key })]),
+    el("td", { class: "small faint", text: p.prerequisites || "—" }),
+  ])));
+  t.append(tb);
+  clear(host).append(t);
+}
+
+async function renderRules() {
+  const host = $("#fl-rules");
+  loading(host, "Loading rules");
+  let d; try { d = await prov("settings"); } catch (e) { errorState(host, e); return; }
+  const s = d.settings || {};
+  const dl = el("dl", { class: "kv" }, [
+    el("dt", { text: "Min GPU series" }), el("dd", { text: "≥ " + (s.min_gpu_series ?? "?") }),
+    el("dt", { text: "Min bandwidth" }), el("dd", { text: (s.min_bandwidth_gbps ?? "?") + " GB/s" }),
+    el("dt", { text: "Min decode speed" }), el("dd", { text: (s.min_tokens_per_sec ?? "?") + " tok/s" }),
+    el("dt", { text: "Min VRAM" }), el("dd", { text: (s.min_vram_gb ?? "?") + " GiB" }),
+    el("dt", { text: "Allowed regions" }), el("dd", { text: (s.allowed_regions || []).join(", ") || "any" }),
+    el("dt", { text: "Blocked regions" }), el("dd", { text: (s.blocked_regions || []).join(", ") || "none" }),
+    el("dt", { text: "Blocked GPUs" }), el("dd", { class: "small", text: (s.blocked_gpu_patterns || []).join(", ") || "none" }),
+    el("dt", { text: "Unknown GPU" }), el("dd", { text: s.unknown_gpu_policy || "—" }),
+  ]);
+  clear(host).append(dl, el("div", { class: "small faint", style: { marginTop: ".6rem" },
+    text: "Editable in the provisioner UI (GPU rules panel). Read-only here so the two views cannot disagree." }));
+}
+
+async function provAction(path, method, confirmMsg) {
+  if (confirmMsg && !confirm(confirmMsg)) return;
+  try {
+    await prov(path, { method, timeout: 120000 });
+    toast("Done.");
+    await refreshFleet();
+  } catch (e) { toast("Failed: " + e.message, "err", 8000); }
+}
+
+$("#fl-reconcile").addEventListener("click", async (e) => {
+  const btn = e.currentTarget; btn.disabled = true; btn.textContent = "Reconciling…";
+  try { await prov("reconcile", { method: "POST", timeout: 180000 }); toast("Reconciled — registry back in sync."); await refreshFleet(); }
+  catch (err) { toast("Reconcile failed: " + err.message, "err"); }
+  finally { btn.disabled = false; btn.textContent = "Reconcile into registry"; }
+});
+
+$("#fl-cloud-toggle").addEventListener("click", async () => {
+  const enable = (cache.provStatus?.health?.cloud_enabled) ? false : true;
+  if (!enable && !confirm("Disable all cloud GPU services? Every running instance is terminated and the budget stops being enforced.")) return;
+  try {
+    const d = await prov("cloud-toggle", { method: "POST", body: { enabled: enable }, timeout: 180000 });
+    toast(enable ? "Cloud services enabled." : `Cloud disabled — ${d.terminated_instances ?? 0} instance(s) terminated.${(d.pending_terminations || []).length ? " Still awaiting provider DELETE: " + d.pending_terminations.join(", ") : ""}`,
+      enable ? "ok" : "warn", 9000);
+    await refreshFleet();
+  } catch (e) { toast("Toggle failed: " + e.message, "err"); }
+});
+
+$("#pl-submit").addEventListener("click", async (e) => {
+  const btn = e.currentTarget; btn.disabled = true;
+  try {
+    await prov("inference-nodes/pollinations", { method: "POST", body: { role: $("#pl-role").value, model: $("#pl-model").value.trim() || "openai", activate_on_ready: true }, timeout: 60000 });
+    toast("Hosted node registered.");
+    await refreshFleet();
+  } catch (err) { toast("Registration failed: " + err.message, "err", 8000); }
+  finally { btn.disabled = false; }
+});
+
+async function openProv(path) {
+  try { showModal(path, JSON.stringify(await prov(path), null, 2)); }
+  catch (e) { showModal(path, "ERROR: " + e.message); }
+}
+
+/* =========================================================================
+ * PROVIDERS
+ * ========================================================================= */
+let providerCache = [];
+let editingProvider = null;
+
+/**
+ * The registry nodes, for the "where does this provider sit in routing" column.
+ *
+ * Fetches on demand: this section used to read `cache.upstreams`, which only the
+ * Backends view populates, so a user who opened Providers first saw "no registry
+ * node" on a provider that was in the pool. A column that answers from a cache
+ * nobody filled is worse than no column.
+ */
+async function registryNodes() {
+  if (cache.upstreams) return cache.upstreams.nodes || [];
+  try { return (await api("/web/api/v1/admin/upstreams")).nodes || []; }
+  catch { return []; }
+}
+
+async function refreshProviders() {
+  const host = $("#pv-list");
+  loading(host, "Loading providers");
+  let d; try { d = await api("/web/api/providers"); } catch (e) { errorState(host, e); return; }
+  providerCache = Array.isArray(d) ? d : [];
+  $("#cnt-providers").textContent = providerCache.length;
+
+  if (!providerCache.length) {
+    emptyState(host, "No external providers", "Chat traffic goes to the configured local backends. Add a provider below to put a hosted API into the main or auxiliary pool.");
+    return;
+  }
+  const nodes = await registryNodes();
+  clear(host);
+  providerCache.forEach((p) => {
+    const nodeId = "provider-" + p.id;
+    const node = nodes.find((n) => n.id === nodeId);
+    const inPool = p.enabled && node && node.active;
+    const head = el("div", { class: "row", style: { marginBottom: ".35rem" } }, [
+      el("strong", { text: p.name }),
+      badge((p.provider_type && p.provider_type.type) || p.provider_type || "custom", "info"),
+      badge(p.use_as ? "used as " + p.use_as : "not routed", p.use_as ? "ok" : "idle"),
+      p.enabled ? null : badge("disabled", "warn"),
+      p.has_key ? badge("key set", "ok") : badge("no key", "warn"),
+      node ? (node.active ? badge("in pool", "ok") : badge("out of pool", "idle")) : badge("no registry node", "err"),
+      el("span", { class: "spacer", style: { marginLeft: "auto" } }),
+    ]);
+    const meta = el("div", { class: "small muted" }, [
+      el("div", { class: "mono", text: p.base_url }),
+      el("div", { text: "models: " + ((p.models || []).join(", ") || "none") + (p.key_masked ? "  ·  key " + p.key_masked : "") }),
+      node ? el("div", { class: "small faint", text: "registry node " + node.id + " → " + node.endpoint_url }) : null,
+    ]);
+    const actions = el("div", { class: "btn-row", style: { marginTop: ".5rem" } }, [
+      el("button", { class: "btn sm", text: "Edit", on: { click: () => editProvider(p) } }),
+      el("button", { class: "btn sm", text: "Test", on: { click: (ev) => testProvider(p, ev.currentTarget) } }),
+      el("button", { class: "btn sm", text: p.enabled ? "Disable" : "Enable", on: { click: () => patchProvider(p, { enabled: !p.enabled }) } }),
+      el("button", { class: "btn sm danger", text: "Remove", on: { click: () => removeProvider(p) } }),
+    ]);
+    host.append(el("div", { style: { padding: ".7rem 0", borderBottom: "1px solid var(--table-row-border)" } }, [head, meta, actions]));
+  });
+}
+
+function editProvider(p) {
+  editingProvider = p;
+  $("#pv-editor-title").textContent = "Edit provider: " + p.name;
+  $("#pe-name").value = p.name;
+  $("#pe-type").value = (p.provider_type && p.provider_type.type) || p.provider_type || "custom";
+  $("#pe-url").value = p.base_url;
+  $("#pe-models").value = (p.models || []).join(", ");
+  $("#pe-use-as").value = p.use_as || "main";
+  $("#pe-enabled").value = p.enabled ? "true" : "false";
+  $("#pe-key").value = "";
+  $("#pe-key-hint").textContent = p.has_key ? "Key " + (p.key_masked || "set") + " is stored. Leave blank to keep it; a new value replaces it." : "No key stored.";
+  $("#pe-reset").style.display = "";
+}
+
+function resetProviderForm() {
+  editingProvider = null;
+  $("#pv-editor-title").textContent = "Add a provider";
+  ["pe-name", "pe-url", "pe-key", "pe-models"].forEach((i) => { $("#" + i).value = ""; });
+  $("#pe-type").value = "custom";
+  $("#pe-use-as").value = "main";
+  $("#pe-enabled").value = "true";
+  $("#pe-key-hint").textContent = "";
+  $("#pe-reset").style.display = "none";
+}
+$("#pe-reset").addEventListener("click", resetProviderForm);
+
+function providerPayload() {
+  const models = $("#pe-models").value.split(",").map((s) => s.trim()).filter(Boolean);
+  if (!$("#pe-name").value.trim()) throw new Error("name is required");
+  if (!$("#pe-url").value.trim()) throw new Error("base URL is required");
+  if (!models.length) throw new Error("at least one model is required");
+  return {
+    name: $("#pe-name").value.trim(),
+    provider_type: { type: $("#pe-type").value },
+    base_url: $("#pe-url").value.trim(),
+    models, use_as: $("#pe-use-as").value, enabled: $("#pe-enabled").value === "true",
+    api_key: $("#pe-key").value.trim() || null,
+  };
+}
+
+async function testProvider(p, btn) {
+  if (btn) { btn.disabled = true; btn.textContent = "Testing…"; }
+  try {
+    const d = await api("/web/api/providers/" + encodeURIComponent(p.id) + "/test", { method: "POST", body: { model: (p.models || [])[0] }, timeout: 60000 });
+    toast("Reachable — answered: " + JSON.stringify((d.answer || "").slice(0, 80)), "ok", 6000);
+  } catch (e) { toast("Test failed: " + e.message, "err", 8000); }
+  finally { if (btn) { btn.disabled = false; btn.textContent = "Test"; } }
+}
+
+$("#pe-test").addEventListener("click", async (e) => {
+  const btn = e.currentTarget; btn.disabled = true; btn.textContent = "Testing…";
+  try {
+    const body = providerPayload();
+    const id = editingProvider ? editingProvider.id : "draft-" + Date.now();
+    const d = await api("/web/api/providers/" + encodeURIComponent(id) + "/test", { method: "POST", body, timeout: 60000 });
+    toast("Reachable — answered: " + JSON.stringify((d.answer || "").slice(0, 100)), "ok", 6000);
+  } catch (err) { toast("Test failed: " + err.message, "err", 9000); }
+  finally { btn.disabled = false; btn.textContent = "Test connection"; }
+});
+
+$("#pe-save").addEventListener("click", async (e) => {
+  const btn = e.currentTarget; btn.disabled = true;
+  try {
+    const payload = providerPayload();
+    if (editingProvider) {
+      // api_key: null keeps the stored key; "" would clear it. Only send the
+      // field when the user actually typed something new.
+      if (payload.api_key == null) delete payload.api_key;
+      await api("/web/api/providers/" + encodeURIComponent(editingProvider.id), { method: "PUT", body: payload });
+      toast("Provider updated and the pool reconciled.");
+    } else {
+      if (!payload.api_key) payload.api_key = null;
+      await api("/web/api/providers", { method: "POST", body: Object.assign({ id: "p_" + Date.now(), priority: 10, capabilities: { chat: true, streaming: true } }, payload), timeout: 90000 });
+      toast("Provider tested, stored and registered.");
+    }
+    resetProviderForm();
+    cache.upstreams = null;
+    await refreshProviders();
+  } catch (err) { toast("Save failed: " + err.message, "err", 9000); }
+  finally { btn.disabled = false; }
+});
+
+async function patchProvider(p, fields) {
+  try {
+    await api("/web/api/providers/" + encodeURIComponent(p.id), { method: "PUT", body: fields });
+    toast("Provider updated.");
+    // Both views show this relationship; leaving the other stale is how a
+    // provider ends up disabled in one panel and in the pool in the other.
+    cache.upstreams = null;
+    await refreshProviders();
+  } catch (e) { toast("Update failed: " + e.message, "err"); }
+}
+
+async function removeProvider(p) {
+  if (!confirm("Remove provider " + p.name + "? Its registry node is withdrawn at the same time.")) return;
+  try {
+    await api("/web/api/providers/" + encodeURIComponent(p.id), { method: "DELETE" });
+    toast("Provider removed.");
+    cache.upstreams = null;
+    resetProviderForm();
+    await refreshProviders();
+  } catch (e) { toast("Remove failed: " + e.message, "err"); }
+}
+
+/* =========================================================================
+ * MODELS
+ * ========================================================================= */
+async function refreshModels() {
+  const roles = $("#md-roles"), table = $("#md-table");
+  loading(roles, "Probing active models");
+  loading(table, "Loading models");
+
+  const settled = await Promise.allSettled([api("/web/api/active-models"), api("/web/api/models")]);
+  const [am, mm] = settled;
+
+  if (am.status === "fulfilled") {
+    const rolesHost = clear(roles);
+    const t = el("table", {}, [el("thead", {}, [el("tr", {}, [
+      el("th", { text: "Role" }), el("th", { text: "Model" }), el("th", { text: "Endpoint" }), el("th", { text: "Source" }), el("th", { text: "State" }),
+    ])])]);
+    const tb = el("tbody");
+    ["main", "auxiliary"].forEach((role) => {
+      const m = (am.value || {})[role] || {};
+      tb.append(el("tr", {}, [
+        el("td", {}, [badge(role, "info")]),
+        el("td", { class: "mono small", text: m.model || "not configured" }),
+        el("td", { class: "small mono faint", text: m.endpoint || "—" }),
+        el("td", { class: "small muted", text: m.source || "local" }),
+        el("td", {}, [m.active ? badge("reachable", "ok") : badge("unreachable", "err")]),
+      ]));
+    });
+    t.append(tb);
+    rolesHost.append(t, el("div", { class: "small faint", style: { marginTop: ".5rem" },
+      text: "The gateway advertises " + ((am.value || {}).cascade_model || "?") + " as its single identity; that is the id clients should send." }));
+  } else errorState(roles, am.reason);
+
+  if (mm.status === "fulfilled") {
+    const data = (mm.value || {}).data || [];
+    $("#cnt-models").textContent = data.length;
+    if (!data.length) emptyState(table, "No models advertised", "The gateway always advertises its own identity; upstream discovery found nothing.");
+    else {
+      const t = el("table", {}, [el("thead", {}, [el("tr", {}, [
+        el("th", { text: "Id" }), el("th", { text: "Owned by" }), el("th", { text: "Discovered via" }), el("th", { text: "" }),
+      ])])]);
+      const tb = el("tbody");
+      data.forEach((m) => {
+        const isIdentity = m.advertised_identity === true;
+        const tag = isIdentity ? "gateway identity — send this one"
+          : m.discovered_via ? "discovered on an upstream"
+          : "configured fallback — upstream not reachable";
+        tb.append(el("tr", {}, [
+          el("td", { class: "mono" }, [el("strong", { text: m.id }), el("div", { class: "small faint", text: tag })]),
+          el("td", { class: "small muted", text: m.owned_by || "—" }),
+          el("td", { class: "small mono faint", text: m.discovered_via || "— (configured)" }),
+          el("td", {}, [isIdentity ? badge("advertised identity", "ok")
+            : badge(m.discovered_via ? "upstream discovered" : "configured only", "idle")]),
+        ]));
+      });
+      t.append(tb);
+      clear(table).append(t, el("div", { class: "small faint", style: { marginTop: ".5rem" },
+        text: "A discovered id is only usable if the engine actually serves it — the gateway forwards the client's model name verbatim to a static upstream." }));
+    }
+  } else errorState(table, mm.reason);
+}
+$("#md-refresh").addEventListener("click", refreshModels);
+
+/* =========================================================================
+ * ROUTING SETTINGS
+ * ========================================================================= */
+async function refreshSettings() {
+  let s;
+  try { s = cache.settings = await api("/web/api/settings"); }
+  catch (e) { errorState($("#st-note"), e); return; }
+  $("#st-note").textContent = "";
+  const r = s.routing || {};
+  $("#st-router").value = r.router_threshold ?? 0.5;
+  $("#st-confidence").value = r.confidence_threshold ?? 0.7;
+  $("#st-tools").value = r.route_tools_to_large ? "true" : "false";
+  $("#st-default").value = r.default_route || "";
+  $("#st-hybrid").value = r.hybrid_auto ? "true" : "false";
+  $("#st-hybrid-chars").value = r.hybrid_aux_max_chars ?? 600;
+  $("#st-marker").value = r.marker_mode || "substring";
+  $("#st-large-url").value = s.large_text_url || "";
+  $("#st-small-url").value = s.small_mllm_url || "";
+  $("#st-tts").value = s.audio?.tts_url || "";
+  $("#st-stt").value = s.audio?.stt_url || "";
+}
+
+async function saveRouting() {
+  const note = $("#st-note");
+  const body = {
+    routing: {
+      router_threshold: parseFloat($("#st-router").value),
+      confidence_threshold: parseFloat($("#st-confidence").value),
+      route_tools_to_large: $("#st-tools").value === "true",
+      default_route: $("#st-default").value || null,
+      hybrid_auto: $("#st-hybrid").value === "true",
+      hybrid_aux_max_chars: parseInt($("#st-hybrid-chars").value || "0", 10),
+      marker_mode: $("#st-marker").value,
+    },
+  };
+  const btn = $("#st-save"); btn.disabled = true; note.textContent = "Saving…";
+  try {
+    await api("/web/api/settings", { method: "PUT", body });
+    note.textContent = "Applied " + new Date().toLocaleTimeString();
+    toast("Routing settings applied.");
+    await refreshSettings();
+  } catch (e) { note.textContent = "Save failed: " + e.message; toast("Save failed: " + e.message, "err", 8000); }
+  finally { btn.disabled = false; }
+}
+$("#st-save").addEventListener("click", saveRouting);
+
+$("#st-endpoints-save").addEventListener("click", async () => {
+  const body = {
+    audio: { tts_url: $("#st-tts").value.trim() || null, stt_url: $("#st-stt").value.trim() || null },
+    large_mllm_url: $("#st-large-url").value.trim() || null,
+    small_mllm_url: $("#st-small-url").value.trim() || null,
+  };
+  const btn = $("#st-endpoints-save"); btn.disabled = true;
+  try {
+    await api("/web/api/settings", { method: "PUT", body });
+    toast("Endpoints saved.");
+    await refreshSettings();
+  } catch (e) { toast("Save failed: " + e.message, "err"); }
+  finally { btn.disabled = false; }
+});
+
+async function openDoc(name) {
+  try {
+    const r = await fetch(API.u("/web/docs/" + encodeURIComponent(name)));
+    showModal(name, r.ok ? await r.text() : "HTTP " + r.status);
+  } catch (e) { showModal(name, "ERROR: " + e.message); }
+}
+async function openRaw(name) {
+  try {
+    const r = await fetch(API.u("/web/" + name));
+    showModal(name, r.ok ? (await r.text()).slice(0, 40000) : "HTTP " + r.status);
+  } catch (e) { showModal(name, "ERROR: " + e.message); }
+}
+
+/* =========================================================================
+ * DIAGNOSTICS
+ * ========================================================================= */
+// Routes that deliberately do NOT go through the gateway, with the reason. This
+// list is a product decision (latency, router quirks) documented in the stack
+// AGENTS.md; showing it here means nobody re-litigates "why is LightRAG not on
+// cascade" from scratch, and a new accidental bypass becomes a visible diff.
+const DIRECT_BINDINGS = [
+  ["LightRAG vector search", "embeddings :8801", "per-request latency; the gateway only proxies /v1/embeddings for external clients"],
+  ["Realtime voice + telephony STT", "speech-stt :5092", "streaming path needs the raw websocket"],
+  ["TTS", "speech-tts :8800", "audio passthrough adds latency and no routing value"],
+  ["Dictation polish", "auxiliary model, direct", "the router would send short polish prompts to the reasoning model and burn the token budget"],
+  ["LibreChat OCR", "docling-ocr-bridge :5002", "no OpenAI-compatible OCR route exists on the gateway"],
+];
+
+async function refreshDiagnostics() {
+  const b = $("#dx-bindings");
+  clear(b).append(el("div", { class: "tw" }, [el("table", {}, [
+    el("thead", {}, [el("tr", {}, [el("th", { text: "Consumer" }), el("th", { text: "Bound to" }), el("th", { text: "Why not the gateway" })])]),
+    el("tbody", {}, DIRECT_BINDINGS.map(([c, u, w]) => el("tr", {}, [
+      el("td", { text: c }), el("td", { class: "small mono", text: u }), el("td", { class: "small faint", text: w }),
+    ]))),
+  ])]));
+
+  const ex = $("#dx-extraction");
+  try {
+    // Namespaced, not the root `/health`: Caddy exposes the console under
+    // /cascade/* and rewrites to /web*, so the root path is not reachable
+    // through the proxy — asking for it 404s in production while working on
+    // the bare port.
+    const h = cache.overview || await api("/web/api/health");    const list = h.extraction_backends || [];
+    if (!list.length) emptyState(ex, "No extraction backends", "The local fallback is always registered.");
+    else clear(ex).append(el("div", { class: "tw" }, [el("table", {}, [
+      el("thead", {}, [el("tr", {}, [el("th", { text: "Id" }), el("th", { text: "Type" }), el("th", { text: "Priority" }), el("th", { text: "State" })])]),
+      el("tbody", {}, list.map((x) => el("tr", {}, [
+        el("td", { class: "mono small", text: x.id }),
+        el("td", { class: "small", text: x.type }),
+        el("td", { class: "num small", text: fmtInt(x.priority) }),
+        el("td", {}, [x.healthy ? badge("healthy", "ok") : badge("unhealthy", "err"), x.enabled ? null : badge("disabled", "idle")]),
+      ]))),
+    ])]));
+  } catch (e) { errorState(ex, e); }
+
+  const mx = $("#dx-metrics");
+  loading(mx, "Loading metrics");
+  try {
+    const r = await fetch(API.u("/web/metrics"));
+    const text = await r.text();
+    const series = new Map();
+    for (const line of text.split("\n")) {
+      if (!line || line.startsWith("#")) continue;
+      const m = /^([a-zA-Z_:][a-zA-Z0-9_:]*)(\{(.*)\})?\s+([0-9.eE+-]+)$/.exec(line);
+      if (!m) continue;
+      const name = m[1], labels = m[3] || "", value = Number(m[4]);
+      if (!name.startsWith("cascade_")) continue;
+      series.set(name + (labels ? "{" + labels + "}" : ""), value);
+    }
+    const rows = Array.from(series.entries()).filter(([, v]) => v !== 0);
+    if (!rows.length) emptyState(mx, "No counters recorded yet", "The gateway has served no requests since start.");
+    else clear(mx).append(barChart(rows.map(([k, v]) => ({ label: k, value: v }))));
+  } catch (e) { errorState(mx, e); }
+
+  const links = $("#dx-links");
+  clear(links);
+  // Every link is a *gateway* path — `gw()` maps it for the current mount. The
+  // two that are NOT under /web (the root /health and /extraction/v1/backends)
+  // are unreachable through Caddy's /cascade/* rewrite, so the console only ever
+  // links the namespaced equivalents; the raw endpoints are still documented
+  // here because they are the ones an operator pastes into curl on :3006.
+  [["/web/api/overview", "overview"], ["/web/api/dashboard", "dashboard counters"], ["/web/api/v1/admin/upstreams", "registry (admin)"],
+   ["/web/api/providers", "providers"], ["/web/api/active-models", "active models"], ["/web/api/settings", "settings"],
+   ["/web/api/provisioner/status", "provisioner status"], ["/web/api/health", "gateway health"], ["/web/metrics", "prometheus"],
+   ["/web/api/models", "advertised models"], ["/web/api/extraction-backends", "extraction backends"],
+  ].forEach(([path, label]) => links.append(el("a", { class: "btn sm", text: label, attrs: { href: API.u(path), target: "_blank", rel: "noopener" } }), " "));
+}
+
+/* =========================================================================
+ * BOOT
+ * ========================================================================= */
+$("#btn-refresh-all").addEventListener("click", async (e) => {
+  const btn = e.currentTarget; btn.disabled = true; btn.textContent = "Refreshing…";
+  cache.upstreams = null;
+  await Promise.all([refreshOverview(), refreshBackends(), refreshModels()]);
+  if (activeView === "fleet") await refreshFleet().catch(() => {});
+  if (activeView === "providers") await refreshProviders().catch(() => {});
+  btn.disabled = false; btn.textContent = "Refresh all";
+  toast("Refreshed.");
+});
+
+resetProviderForm();
+showView(location.hash.slice(1) || "overview");
+// The overview header is cheap and always worth having, whatever section is open.
+refreshOverview().catch(() => {});
+startPolling();
+document.addEventListener("visibilitychange", () => { if (document.hidden) stopPolling(); else { startPolling(); refreshView(activeView); } });
+</script>
+</body>
+</html>

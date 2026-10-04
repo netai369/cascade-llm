@@ -38,6 +38,15 @@ impl RoutingStrategy {
     }
 }
 
+impl std::fmt::Display for RoutingStrategy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            RoutingStrategy::RoundRobin => "round_robin",
+            RoutingStrategy::LeastLatency => "least_latency",
+        })
+    }
+}
+
 /// Maps legacy/human aliases onto canonical registry roles.
 pub fn canonical_role(role: &str) -> Option<&'static str> {
     match role.trim().to_lowercase().as_str() {
@@ -78,6 +87,10 @@ pub struct RegisterUpstreamRequest {
     /// Optional explicit health probe URL; defaults to `<origin>/health`.
     #[serde(default)]
     pub health_url: Option<String>,
+    /// Register the node in a non-serving state. Lets an operator (or the
+    /// provider reconciler) stage a backend without it taking traffic.
+    #[serde(default)]
+    pub enabled: Option<bool>,
     /// Model name forced onto requests routed to this node (used by hosted
     /// APIs like Pollinations where client model ids don't exist upstream).
     #[serde(default)]
@@ -261,6 +274,9 @@ impl UpstreamRegistry {
                 if req.model.is_some() {
                     node.model = req.model;
                 }
+                if let Some(enabled) = req.enabled {
+                    node.active = enabled;
+                }
                 info!("UPSTREAM_UPDATED: role={} id={} url={}", role, node.id, url);
                 UpsertResult { node: node.clone(), created: false }
             }
@@ -272,7 +288,7 @@ impl UpstreamRegistry {
                     bearer_token: req.bearer_token,
                     weight: req.weight.unwrap_or(1).clamp(1, 64),
                     max_context_length: req.max_context_length,
-                    active: true,
+                    active: req.enabled.unwrap_or(true),
                     healthy: true,
                     consecutive_failures: 0,
                     last_health_check: None,
@@ -332,6 +348,13 @@ impl UpstreamRegistry {
 
     pub fn get(&self, id: &str) -> Option<&UpstreamNode> {
         self.roles.values().flatten().find(|n| n.id == id)
+    }
+
+    /// The node a role's traffic would go to right now (same selection as
+    /// `pick`, but without consuming a round-robin slot). Used to report which
+    /// model a role is actually serving.
+    pub fn get_by_role_active(&self, role: &str) -> Option<UpstreamNode> {
+        self.pick(role)
     }
 
     /// True when at least one active + healthy node exists for the role.
@@ -556,6 +579,7 @@ mod tests {
             cost_per_hour: None,
             health_url: None,
             model: None,
+            enabled: None,
         }
     }
 

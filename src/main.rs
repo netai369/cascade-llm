@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use cascade_llm::{cascade_features, config, db, registry, router, state::{self, GatewayState}};
+use cascade_llm::{cascade_features, config, db, handlers, registry, router, state::{self, GatewayState}};
 use tokio::net::TcpListener;
 use tracing::{info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -104,24 +104,12 @@ async fn main() {
         Ok(list) if !list.is_empty() => {
             state.runtime.write().await.providers = list.clone();
             for provider in list {
-                if let Some(role) = provider.use_as.as_deref().and_then(registry::canonical_role) {
-                    if let Some(model) = provider.models.first().cloned() {
-                        state.registry.write().await.upsert(
-                            role,
-                            registry::RegisterUpstreamRequest {
-                                endpoint_url: Some(format!(
-                                    "{}/chat/completions",
-                                    provider.base_url.trim_end_matches('/')
-                                )),
-                                bearer_token: provider.api_key.clone(),
-                                id: Some(format!("provider-{}", provider.id)),
-                                label: Some(provider.name.clone()),
-                                model: Some(model),
-                                ..Default::default()
-                            },
-                        );
-                    }
-                }
+                // Same reconciliation as the create/edit paths, so a provider
+                // the operator *disabled* stays out of the pool across a restart.
+                // Registering unconditionally here resurrected disabled
+                // providers — the setting read as persisted and silently stopped
+                // applying on the next deploy.
+                handlers::sync_provider_node(&state, &provider).await;
             }
             info!("Restored persisted providers");
         }

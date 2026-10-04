@@ -12,6 +12,7 @@ pub mod handlers;
 pub mod intent_routing;
 pub mod language;
 pub mod media;
+pub mod provisioner;
 pub mod providers;
 pub mod registry;
 pub mod router;

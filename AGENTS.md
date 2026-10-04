@@ -34,7 +34,13 @@ router assembly in `router.rs`):
 - `embeddings.rs` — pass-through proxies for `/v1/embeddings` + `/v1/rerank`
   (OpenAI-compatible embeddings/rerank backends, `EMBEDDINGS_URL`/`RERANK_URL`).
 - `media.rs`, `audio.rs` — media/audio proxies; `db.rs` — SQLite persistence;
-  `cascade_features.rs` — Prometheus metrics; `web/` — embedded dashboard UI.
+  `cascade_features.rs` — Prometheus metrics.
+- `provisioner.rs` — admin-guarded, allowlisted passthrough to the stack's GPU
+  provisioner, so the fleet is manageable from the gateway console.
+- `web/app.html` — the console: one document, seven sections (Overview,
+  Backends, GPU fleet, Providers, Models, Routing, Diagnostics), embedded via
+  `include_str!`. Analysis of the previous two-page UI, and of every defect the
+  rework fixed, is in `docs/gui-rework-analysis.md`.
 
 ## Dynamic upstream management (v0.6.0)
 
@@ -55,8 +61,15 @@ Full API reference: docs/dynamic-upstreams.md. Short form:
   (OpenAI images → Pollinations GET) and model normalization for text;
   optional per-node `model` field forces the upstream model id.
 - Health prober treats any HTTP <500 as alive (404-only workers stay in pool).
-- Web UI: nav strip + settings cog on dashboard/settings; admin API mirrored
-  under /api/v1 and /web/api/v1 (dashboard is mounted at /, /web/, /cascade/).
+- Console: one page at `/`, `/web/` and `/cascade/`; admin API mirrored under
+  `/api/…` and `/web/api/…`. **Every request goes through one prefix helper**
+  (`gw()` in `web/app.html`) — a relative fetch resolves one level too deep under
+  Caddy's `/cascade/* → /web*` rewrite, which is how the image test used to 404
+  in production while working on the raw port. No CDN assets (charts are inline
+  SVG) and no `innerHTML` with API data.
+- Provider ⇄ registry node is one function (`handlers::sync_provider_node`),
+  called by create, edit *and* the boot-time restore. A disabled provider that is
+  re-registered at startup looks persisted right up until the next deploy.
 
 ## Conventions
 

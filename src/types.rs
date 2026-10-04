@@ -369,6 +369,11 @@ pub struct Settings {
     pub extract_cloud_model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub extract_fallback_url: Option<String>,
+    /// Effective node-selection strategy across a role pool. Read-only here: it
+    /// lives in the registry (not the persisted settings), and changing it goes
+    /// through `PUT /web/api/routing-strategy`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routing_strategy: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -435,4 +440,8 @@ pub struct DashboardMetrics {
     pub session_cache_entries: u64,
     pub large_model_multimodal: bool,
     pub requests_by_origin: std::collections::HashMap<String, u64>,
+    /// Fallback activations per reason. The dashboard only ever showed the
+    /// total, which cannot distinguish "the primary was briefly busy" from
+    /// "the primary is gone and everything is failing over".
+    pub fallback_by_reason: std::collections::HashMap<String, u64>,
 }
