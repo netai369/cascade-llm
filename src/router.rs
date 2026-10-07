@@ -89,6 +89,16 @@ pub fn build_router(state: Arc<GatewayState>) -> Router {
         // OpenAI-compatible chat + model discovery
         .route("/v1/chat/completions", post(handlers::chat_completions))
         .route("/v1/completions", post(handlers::completions))
+        // Anthropic-compatible Messages API (`/v1/messages`) — lets an
+        // Anthropic SDK client talk to this gateway unchanged. Added
+        // 2026-10-07: it lived only as an untracked file in the cascade-llm
+        // working tree, so building from the committed hybrid branch silently
+        // removed the route (measured: 404). See docs/anthropic-api.md.
+        .route("/v1/messages", post(crate::anthropic::messages))
+        .route(
+            "/v1/messages/count_tokens",
+            post(crate::anthropic::count_tokens),
+        )
         .route("/v1/models", get(handlers::list_models))
         .route("/models", get(handlers::list_models))
         .route("/model", get(handlers::get_model))

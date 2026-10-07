@@ -62,6 +62,25 @@ pub async fn tts_handler(
         &state.runtime.read().await.tts_url,
         req.uri().path(),
     );
+    // ★ Inject the TTS bearer when the caller did not bring one.
+    //
+    // The key sits in the container environment (`POCKET_API_KEY`) and was
+    // never read — see the field docstring in config.rs. Without this the
+    // route answers 401 to every client that does not send it, which is what
+    // it did until 2026-10-07. A client-supplied Authorization is kept as-is:
+    // this supplies a default, it does not override a caller's credential.
+    let mut req = req;
+    if let Some(key) = state.config.tts_api_key.as_deref() {
+        if !req.headers().contains_key(axum::http::header::AUTHORIZATION) {
+            match axum::http::HeaderValue::from_str(&format!("Bearer {}", key)) {
+                Ok(value) => {
+                    req.headers_mut()
+                        .insert(axum::http::header::AUTHORIZATION, value);
+                }
+                Err(_) => warn!("TTS_API_KEY is not a valid header value — sending unauthenticated"),
+            }
+        }
+    }
     info!("TTS proxy: {} -> {}", req.uri(), target_url);
     proxy_request(state, req, &target_url).await
 }

@@ -23,6 +23,19 @@ pub struct AppConfig {
     pub multimodal_capability_url: String,
     pub providers: Vec<ProviderConfig>,
     pub tts_url: String,
+    /// Bearer the TTS service requires, injected on the TTS proxy route.
+    ///
+    /// ★ The key was ALREADY in the container environment (`POCKET_API_KEY`,
+    /// via `env_file: .env`) and nothing read it: `grep POCKET_API_KEY src/`
+    /// returned zero hits, and `audio::tts_handler` forwarded only the
+    /// CLIENT's headers, so `/v1/audio/speech` answered **401** to every
+    /// caller that did not happen to send the key itself. Measured
+    /// 2026-10-07. Same defect shape as `CASCADE_HYBRID_AUTO`: a credential
+    /// is delivered and no code consumes it.
+    ///
+    /// STT is unaffected because `netai-stt` does not require a key — that
+    /// asymmetry is why one half of the audio proxy worked and hid the other.
+    pub tts_api_key: Option<String>,
     pub stt_url: String,
     pub embeddings_url: String,
     pub rerank_url: String,
@@ -209,6 +222,9 @@ impl AppConfig {
             providers: Vec::new(),
             tts_url: std::env::var("TTS_URL")
                 .unwrap_or_else(|_| "http://speech-tts:8800/v1/audio".to_string()),
+            tts_api_key: std::env::var("POCKET_API_KEY")
+                .ok()
+                .filter(|k| !k.trim().is_empty()),
             stt_url: std::env::var("STT_URL")
                 .unwrap_or_else(|_| "http://speech-stt:5092/v1/audio".to_string()),
             embeddings_url: std::env::var("EMBEDDINGS_URL")
