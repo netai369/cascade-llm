@@ -455,6 +455,11 @@ pub async fn stt(State(state): State<Arc<GatewayState>>, req: Request<Body>) -> 
     crate::audio::stt_handler(State(state), req).await
 }
 
+/// Speaker diarization — same byte proxy as STT, different leaf.
+pub async fn stt_diarize(State(state): State<Arc<GatewayState>>, req: Request<Body>) -> Response {
+    crate::audio::stt_diarize_handler(State(state), req).await
+}
+
 pub async fn embeddings(State(state): State<Arc<GatewayState>>, req: Request<Body>) -> Response {
     crate::embeddings::embeddings_handler(State(state), req).await
 }

@@ -97,6 +97,23 @@ pub async fn stt_handler(
     proxy_request(state, req, &target_url).await
 }
 
+/// Speaker diarization (`/v1/audio/diarize`) — identical to the STT proxy.
+///
+/// Kept as its own entry point rather than folding into `stt_handler` so the
+/// two leaves stay independently visible in the logs; the URL is composed by
+/// the same `audio_target()`, so there is still exactly one composition rule.
+pub async fn stt_diarize_handler(
+    State(state): State<Arc<GatewayState>>,
+    req: Request<Body>,
+) -> Response {
+    let target_url = audio_target(
+        &state.runtime.read().await.stt_url,
+        req.uri().path(),
+    );
+    info!("STT diarize proxy: {} -> {}", req.uri(), target_url);
+    proxy_request(state, req, &target_url).await
+}
+
 async fn proxy_request(state: Arc<GatewayState>, req: Request<Body>, target_url: &str) -> Response {
     let method = req.method().clone();
     let headers = req.headers().clone();

@@ -117,6 +117,15 @@ pub fn build_router(state: Arc<GatewayState>) -> Router {
         // Audio / media proxies
         .route("/v1/audio/speech", post(handlers::tts))
         .route("/v1/audio/transcriptions", post(handlers::stt))
+        // Speaker diarization. Same byte-proxy pattern as STT — `audio_target()`
+        // strips the `/v1/audio` prefix generically, so this is one route line
+        // rather than a third composition path (gotcha 80).
+        //
+        // ★ It was MISSING while voice-chat-v2/app/dictation.py:813 already
+        // called it, so `STT_URL` could not be pointed at Cascade at all: the
+        // diarization request would have 404'd. Found before migrating, which
+        // is the only reason it is a one-line addition instead of an incident.
+        .route("/v1/audio/diarize", post(handlers::stt_diarize))
         .route("/v1/embeddings", post(handlers::embeddings))
         .route("/v1/rerank", post(handlers::rerank))
         .route("/v1/images/generations", post(handlers::image_generation))
