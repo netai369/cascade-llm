@@ -542,10 +542,15 @@ pub async fn settings_redirect(_state: State<Arc<GatewayState>>) -> Response {
 fn dashboard_metrics(state: &Arc<GatewayState>) -> DashboardMetrics {
     let cache_entries = state.session_cache.entry_count();
 
-    // One label set, owned by the metrics registry (see
-    // `MetricsRegistry::backend_labels`). This used to be a second, shorter
-    // hardcoded list, so every backend the router only reaches through the newer
-    // paths was counted by prometheus but never summed here.
+    // ★ EVERY endpoint, including the idle ones.
+    //
+    // This used to drop `val == 0`, so the chart showed only what had already
+    // been used — and an endpoint that is wired but never reached (the entire
+    // `ocr`, `rag_worker`, `image`, `extraction` set, and `small` vs
+    // `auxiliary`, which are two counters for one upstream) simply did not
+    // appear. A reader then cannot tell "no traffic" from "does not exist",
+    // which is exactly the question the owner asked about `small`. Zeroes are
+    // now part of the answer.
     let mut requests_by_backend = std::collections::HashMap::new();
     let mut total_requests: u64 = 0;
     for backend in crate::cascade_features::MetricsRegistry::backend_labels() {
@@ -555,9 +560,7 @@ fn dashboard_metrics(state: &Arc<GatewayState>) -> DashboardMetrics {
             .with_label_values(&[backend])
             .get() as u64;
         total_requests += val;
-        if val > 0 {
-            requests_by_backend.insert(backend.to_string(), val);
-        }
+        requests_by_backend.insert(backend.to_string(), val);
     }
 
     let mut fallback_by_reason = std::collections::HashMap::new();
@@ -1600,56 +1603,6 @@ pub async fn refresh_models_upstreams(
         StatusCode::OK,
     )
 }
-
-// ---------------------------------------------------------------------------
-// Raw text completions (OpenAI /v1/completions -> main role)
-// ---------------------------------------------------------------------------
-
-pub async fn completions(State(state): State<Arc<GatewayState>>, req: Request<Body>) -> Response {
-    let content_type = req
-        .headers()
-        .get("content-type")
-        .and_then(|v| v.to_str().ok())
-        .map(String::from);
-    let body_bytes = match req.into_body().collect().await {
-        Ok(b) => b.to_bytes(),
-        Err(_) => {
-            return json_response(
-                serde_json::json!({
-                    "error": { "message": "Invalid request body", "type": "proxy_error", "code": 400 }
-                }),
-                StatusCode::BAD_REQUEST,
-            );
-        }
-    };
-
-    match state.route_completions_raw(content_type.as_deref(), body_bytes).await {
-        Ok((hdrs, body)) => {
-            let mut response = Response::new(body);
-            *response.headers_mut() = hdrs;
-            response
-        }
-        Err(e) => {
-            let status = StatusCode::from_u16(e.status).unwrap_or(StatusCode::BAD_GATEWAY);
-            json_response(
-                serde_json::json!({
-                    "error": {
-                        "message": e.context,
-                        "type": if e.unreachable { "cascade_backend_unavailable" } else { "cascade_backend_error" },
-                        "backend": e.backend,
-                        "param": serde_json::Value::Null,
-                        "code": status.as_u16()
-                    }
-                }),
-                status,
-            )
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// RAG worker endpoint (heavy graph-extraction jobs)
-// ---------------------------------------------------------------------------
 
 pub async fn rag_extract(State(state): State<Arc<GatewayState>>, req: Request<Body>) -> Response {
     let content_type = req

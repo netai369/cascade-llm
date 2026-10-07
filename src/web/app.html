@@ -260,15 +260,9 @@
           <div id="ov-stats" class="grid3"><div class="state loading">Loading gateway status…</div></div>
         </div>
 
-        <div class="grid2">
-          <div class="panel">
-            <h2>Requests by backend <span class="spacer"></span><span class="hint">since process start</span></h2>
-            <div class="chartwrap" id="ov-chart"></div>
-          </div>
-          <div class="panel">
-            <h2>Role coverage</h2>
-            <div id="ov-roles" class="state loading">Loading…</div>
-          </div>
+        <div class="panel">
+          <h2>Requests by endpoint <span class="spacer"></span><span class="hint">since process start · every endpoint, including idle ones</span></h2>
+          <div class="chartwrap" id="ov-chart"></div>
         </div>
 
         <div class="grid2">
@@ -837,8 +831,11 @@ const PALETTE = ["#3b82f6", "#a78bfa", "#ec4899", "#34d399", "#f59e0b", "#22d3ee
 
 /** Horizontal bars. Labelled values, because an unlabelled axis in a console is
  *  decoration; this is meant to be read, not admired. */
-function barChart(entries, { unit = "", height = 20, gap = 6 } = {}) {
-  const rows = entries.filter((e) => e.value > 0);
+function barChart(entries, { unit = "", height = 20, gap = 6, includeZero = false } = {}) {
+  // `includeZero` exists for the endpoint inventory: an endpoint with 0
+  // requests must still be visible, otherwise "no traffic" and "does not
+  // exist" look identical.
+  const rows = includeZero ? entries.slice() : entries.filter((e) => e.value > 0);
   if (!rows.length) return el("div", { class: "empty", text: "No traffic recorded yet." });
   const max = Math.max(...rows.map((r) => r.value));
   const wrap = el("div", { class: "stack", style: { gap: gap + "px" } });
@@ -990,26 +987,10 @@ async function refreshOverview() {
   );
 
   clear($("#ov-chart")).append(barChart(
-    Object.entries(d.metrics.requests_by_backend).map(([k, v]) => ({ label: k, value: v }))));
-
-  // Role coverage — the single most useful table: which role has a pool at all.
-  const roleHost = clear($("#ov-roles"));
-  const roles = Object.entries(d.registry.roles || {});
-  if (!roles.length) emptyState(roleHost, "No roles registered", "The registry has not been populated.");
-  else {
-    const t = el("table", {}, [el("thead", {}, [el("tr", {}, [
-      el("th", { text: "Role" }), el("th", { text: "Nodes" }), el("th", { text: "Active" }), el("th", { text: "Serving" })])])]);
-    const tb = el("tbody");
-    roles.forEach(([role, s]) => tb.append(el("tr", {}, [
-      el("td", {}, [el("code", { text: role })]),
-      el("td", { class: "num", text: fmtInt(s.total) }),
-      el("td", { class: "num", text: fmtInt(s.active) }),
-      el("td", {}, [s.serving ? badge("serving", "ok") : badge(s.total ? "no serving node" : "static default", s.total ? "warn" : "idle")]),
-    ])));
-    t.append(tb);
-    roleHost.append(t, el("div", { class: "small faint", style: { marginTop: ".5rem" },
-      text: "“static default” means no registry node: the role falls back to its configured URL." }));
-  }
+    Object.entries(d.metrics.requests_by_backend)
+      .map(([k, v]) => ({ label: k, value: v }))
+      .sort((a, b) => b.value - a.value || a.label.localeCompare(b.label)),
+    { includeZero: true }));
 
   const origins = clear($("#ov-origins"));
   const oentries = Object.entries(d.metrics.requests_by_origin || {}).sort((a, b) => b[1] - a[1]);

@@ -20,6 +20,11 @@ use crate::state::GatewayState;
 
 const POLLINATIONS_DEFAULT_MODEL: &str = "flux";
 
+/// Free, zero-configuration image backend used when the configured local
+/// backend fails. No token: the anonymous tier works, which is why an empty
+/// `POLLINATIONS_TOKEN` is not a reason to leave a user without an image.
+const POLLINATIONS_FALLBACK_BASE: &str = "https://image.pollinations.ai";
+
 pub async fn image_generation_handler(
     State(state): State<Arc<GatewayState>>,
     req: Request<Body>,
@@ -40,7 +45,49 @@ pub async fn image_generation_handler(
         None => state.config.image_generation_url.clone(),
     };
     info!("Image generation proxy: {} -> {}", req.uri(), target_url);
-    proxy_request(state, req, &target_url).await
+
+    // ★ Buffer the body so a FAILED local attempt can be retried against the
+    // free tier without the client resending anything. The local backend is
+    // often absent by design (`media-gpu` off → `zimage-service` does not even
+    // resolve), and until 2026-10-07 that surfaced as a bare 502 while a
+    // working zero-config path sat one function away.
+    let (parts, body) = req.into_parts();
+    let bytes = match body.collect().await {
+        Ok(b) => b.to_bytes(),
+        Err(_) => {
+            return json_response(
+                serde_json::json!({"error": {"message": "invalid body", "code": 400}}),
+                StatusCode::BAD_REQUEST,
+            );
+        }
+    };
+    let payload: Option<serde_json::Value> = serde_json::from_slice(&bytes).ok();
+
+    let response = proxy_request(
+        state.clone(),
+        Request::from_parts(parts, Body::from(bytes.clone())),
+        &target_url,
+    )
+    .await;
+
+    if response.status().is_server_error() {
+        if let Some(payload) = payload.as_ref() {
+            warn!(
+                "IMAGE_FALLBACK: {} answered {} — retrying via Pollinations free tier",
+                target_url,
+                response.status()
+            );
+            let fallback = pollinations_render(
+                &state, payload, POLLINATIONS_FALLBACK_BASE, None, "fallback",
+            )
+            .await;
+            if fallback.status().is_success() {
+                return fallback;
+            }
+            warn!("IMAGE_FALLBACK: free tier also failed ({})", fallback.status());
+        }
+    }
+    response
 }
 
 pub async fn video_generation_handler(
@@ -147,6 +194,30 @@ async fn pollinations_image(state: &Arc<GatewayState>, req: Request<Body>, node:
         Ok(v) => v,
         Err(_) => return json_response(serde_json::json!({"error": {"message": "invalid JSON", "code": 400}}), StatusCode::BAD_REQUEST),
     };
+    pollinations_render(state, &payload, &node.endpoint_url,
+                        node.bearer_token.as_deref(), &node.id).await
+}
+
+/// Render one image through Pollinations from an already-parsed payload.
+///
+/// ★ Split out of `pollinations_image` so the SAME code serves two callers:
+/// an explicitly registered Pollinations node, and the **fallback** when the
+/// configured local backend fails. Owner's requirement (2026-10-07):
+/// "pollinations standard image model flux klein geht auch ohne key — das soll
+/// immer als fallback genommen werden wenn lokal nicht geht". Before this the
+/// free tier was only reachable by *registering a node first*, so a dead local
+/// backend (zimage, profile off → DNS failure) surfaced as a 502 and nothing
+/// else, even though a working zero-config path existed one function away.
+///
+/// `bearer` is optional on purpose: the anonymous tier needs no token, which
+/// is why `POLLINATIONS_TOKEN` may be empty.
+async fn pollinations_render(
+    state: &Arc<GatewayState>,
+    payload: &serde_json::Value,
+    base: &str,
+    bearer: Option<&str>,
+    label: &str,
+) -> Response {
     let prompt = payload.get("prompt").and_then(|p| p.as_str()).unwrap_or_default().to_string();
     if prompt.trim().is_empty() {
         return json_response(
@@ -159,12 +230,12 @@ async fn pollinations_image(state: &Arc<GatewayState>, req: Request<Body>, node:
     let seed = payload.get("seed").and_then(|s| s.as_u64());
     let want_b64 = payload.get("response_format").and_then(|r| r.as_str()) != Some("url");
     let pollinations_url = build_pollinations_url(
-        &node.endpoint_url, &prompt, model, width, height, seed,
+        base, &prompt, model, width, height, seed,
     );
-    info!("POLLINATIONS_IMAGE: {} (node {})", &pollinations_url, node.id);
+    info!("POLLINATIONS_IMAGE: {} ({})", &pollinations_url, label);
 
     let mut request = state.http_client.get(&pollinations_url);
-    if let Some(token) = &node.bearer_token {
+    if let Some(token) = bearer {
         request = request.bearer_auth(token);
     }
     match request.send().await {
