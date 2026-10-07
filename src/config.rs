@@ -75,6 +75,22 @@ pub struct AppConfig {
 
     // Media generation endpoints (fallback when no registry node is active)
     pub image_generation_url: String,
+    /// How the image route picks a backend. `CASCADE_IMAGE_MODE`:
+    ///
+    ///   `local`       — only the configured local backend. Nothing leaves the
+    ///                   host. No free-tier fallback.
+    ///   `local_free`  — local first, Pollinations free tier only if it fails.
+    ///                   (default; the owner asked for a fallback that always
+    ///                   exists)
+    ///   `free`        — Pollinations free tier first, local backend unused.
+    ///
+    /// ★ This exists because the fallback was previously unconditional and
+    /// invisible: an image prompt is USER TEXT, and it went to a third-party
+    /// API whenever the local backend hiccuped. Their terms allow processing
+    /// outside the EEA under SCCs, so "region = eu" is an EU *contract*, not a
+    /// residency guarantee — `local` is the only mode that keeps prompts here.
+    /// Set it when a deployment must not talk to anyone.
+    pub image_mode: String,
     pub video_generation_url: String,
 
     // Background health prober
@@ -262,6 +278,11 @@ impl AppConfig {
                 .unwrap_or(600),
             marker_mode: std::env::var("MARKER_MODE").unwrap_or_else(|_| "substring".to_string()),
 
+            image_mode: std::env::var("CASCADE_IMAGE_MODE")
+                .ok()
+                .map(|m| m.trim().to_lowercase())
+                .filter(|m| matches!(m.as_str(), "local" | "local_free" | "free"))
+                .unwrap_or_else(|| "local_free".to_string()),
             image_generation_url: std::env::var("IMAGE_GENERATION_URL")
                 .unwrap_or_else(|_| "http://localhost:8080/v1/images/generations".to_string()),
             video_generation_url: std::env::var("VIDEO_GENERATION_URL")

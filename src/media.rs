@@ -51,6 +51,7 @@ pub async fn image_generation_handler(
     // often absent by design (`media-gpu` off → `zimage-service` does not even
     // resolve), and until 2026-10-07 that surfaced as a bare 502 while a
     // working zero-config path sat one function away.
+    let mode = state.config.image_mode.as_str();
     let (parts, body) = req.into_parts();
     let bytes = match body.collect().await {
         Ok(b) => b.to_bytes(),
@@ -63,6 +64,17 @@ pub async fn image_generation_handler(
     };
     let payload: Option<serde_json::Value> = serde_json::from_slice(&bytes).ok();
 
+    // `free`: the free tier IS the backend — the local node is not tried.
+    if mode == "free" {
+        if let Some(payload) = payload.as_ref() {
+            info!("IMAGE_MODE=free — using the Pollinations free tier directly");
+            return pollinations_render(
+                &state, payload, POLLINATIONS_FALLBACK_BASE, None, "free-mode",
+            )
+            .await;
+        }
+    }
+
     let response = proxy_request(
         state.clone(),
         Request::from_parts(parts, Body::from(bytes.clone())),
@@ -70,10 +82,17 @@ pub async fn image_generation_handler(
     )
     .await;
 
+    // `local`: never leave the host. This is the switch for a deployment that
+    // must not talk to a third party at all — the prompt is user text.
+    if mode == "local" {
+        return response;
+    }
+
     if response.status().is_server_error() {
         if let Some(payload) = payload.as_ref() {
             warn!(
-                "IMAGE_FALLBACK: {} answered {} — retrying via Pollinations free tier",
+                "IMAGE_FALLBACK: {} answered {} — retrying via Pollinations free tier \
+                 (the prompt leaves this host; CASCADE_IMAGE_MODE=local disables this)",
                 target_url,
                 response.status()
             );
