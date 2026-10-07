@@ -81,30 +81,52 @@ impl MetricsRegistry {
         self.requests_total.with_label_values(&[backend]).inc();
     }
 
-    /// Every `selected_backend` label the router can emit.
+    /// Every `selected_backend` label this process can ACTUALLY record.
     ///
-    /// This list used to be duplicated: `init()` pre-created one set and
-    /// `handlers::dashboard_api` summed a *different*, shorter one. The two
-    /// drifting copies meant the dashboard's "Total Requests" silently omitted
-    /// every backend the router only emits under the newer paths (`main`,
-    /// `image`, `rag_worker`, `extraction`, `large_text`, `fallback`) while
-    /// listing two labels that are never recorded at all. One list, owned here.
+    /// ★ This list used to carry 14 labels, six of which no `record_request`
+    /// call site could ever reach — they were advertised as endpoints, charted
+    /// as permanent zeroes, and made one backend look like several:
+    ///
+    ///   `large`, `large_multimodal`, `large_text`, `main`  — legacy auto tiers
+    ///       and the `/v1/completions` target, all removed
+    ///   `stt_proxy`  — the chat-completions audio branch, deleted 2026-10-06
+    ///   `fallback`   — never recorded; fallbacks use `fallback_triggered`,
+    ///       a different metric with its own reasons
+    ///
+    /// `large` was the most convincing of them: `state.rs:371` does contain the
+    /// literal, but it is an `info!` log line, not a counter. A label list is
+    /// only honest if it is derived from the call sites.
+    ///
+    /// The owner's report was exactly this — "das passt nicht zusammen mit den
+    /// realen endpoints" — after a chart showed 14 rows of which 11 were 0.
     pub fn backend_labels() -> &'static [&'static str] {
         &[
-            "small",
-            "large",
-            "large_multimodal",
-            "large_text",
-            "fallback",
-            "ocr",
-            "auxiliary",
-            "inference",
-            "main",
-            "image",
-            "rag_worker",
-            "extraction",
-            "session_affinity",
-            "stt_proxy",
+            "inference",         // RouteBackend::InferenceServer
+            "auxiliary",         // RouteBackend::AuxiliaryServer
+            "small",             // legacy auto-small success path
+            "session_affinity",  // legacy auto tier with a cached target
+            "ocr",               // RouteBackend::OcrServer
+            "image",             // /v1/images/generations
+            "rag_worker",        // /v1/rag/extract
+            "extraction",        // /extraction/v1
+        ]
+    }
+
+    /// Display grouping: which real endpoint each label's traffic belongs to.
+    ///
+    /// `small` is a routing OUTCOME, not a second backend — it is recorded on
+    /// the success path that stayed on `small_mllm_url`, the same upstream
+    /// `auxiliary` resolves to. Charting them side by side made one backend
+    /// look like two, which is what prompted the cleanup.
+    pub fn endpoint_groups() -> &'static [(&'static str, &'static [&'static str])] {
+        &[
+            ("inference (main LLM)", &["inference"]),
+            ("auxiliary (aux LLM)", &["auxiliary", "small"]),
+            ("ocr (OCR node)", &["ocr"]),
+            ("image (image backend)", &["image"]),
+            ("rag_worker (/v1/rag/extract)", &["rag_worker"]),
+            ("extraction (/extraction/v1)", &["extraction"]),
+            ("session_affinity (cached target)", &["session_affinity"]),
         ]
     }
 

@@ -556,16 +556,29 @@ fn dashboard_metrics(state: &Arc<GatewayState>) -> DashboardMetrics {
     // appear. A reader then cannot tell "no traffic" from "does not exist",
     // which is exactly the question the owner asked about `small`. Zeroes are
     // now part of the answer.
+    // Report by REAL ENDPOINT, not by metric label.
+    //
+    // Several labels are routing outcomes on the same upstream (`small` and
+    // `auxiliary` both resolve to `small_mllm_url`), and six more could never
+    // be recorded at all. Charting labels made one backend look like three and
+    // filled the list with permanent zeroes — the owner's "das passt nicht
+    // zusammen mit den realen endpoints". `total_requests` still sums every
+    // label, so the KPI cannot silently lose a count.
     let mut requests_by_backend = std::collections::HashMap::new();
     let mut total_requests: u64 = 0;
-    for backend in crate::cascade_features::MetricsRegistry::backend_labels() {
-        let val = state
+    for label in crate::cascade_features::MetricsRegistry::backend_labels() {
+        total_requests += state
             .metrics
             .requests_total
-            .with_label_values(&[backend])
+            .with_label_values(&[label])
             .get() as u64;
-        total_requests += val;
-        requests_by_backend.insert(backend.to_string(), val);
+    }
+    for (endpoint, labels) in crate::cascade_features::MetricsRegistry::endpoint_groups() {
+        let sum: u64 = labels
+            .iter()
+            .map(|l| state.metrics.requests_total.with_label_values(&[l]).get() as u64)
+            .sum();
+        requests_by_backend.insert(endpoint.to_string(), sum);
     }
 
     let mut fallback_by_reason = std::collections::HashMap::new();
@@ -1873,14 +1886,37 @@ mod tests {
         ));
         let snapshot = dashboard_metrics(&state);
         assert_eq!(snapshot.requests_total, expected);
-        assert_eq!(snapshot.requests_by_backend.len(), labels.len());
-        for (i, label) in labels.iter().enumerate() {
-            assert_eq!(
-                snapshot.requests_by_backend.get(*label).copied(),
-                Some(i as u64 + 1),
-                "label {label} missing from the dashboard payload"
+
+        // ★ The chart reports by REAL ENDPOINT, so it is not one key per label
+        // any more — but the property that mattered is stronger now, and is
+        // asserted as such: every label lands in EXACTLY one group, so no
+        // counter can be dropped from the chart, and the chart's numbers must
+        // add up to the same total the KPI shows.
+        let groups = crate::cascade_features::MetricsRegistry::endpoint_groups();
+        let mut seen: Vec<&str> = Vec::new();
+        for (_endpoint, members) in groups {
+            for label in *members {
+                assert!(
+                    !seen.contains(label),
+                    "label {label} appears in more than one endpoint group — it \
+                     would be double-counted in the chart"
+                );
+                seen.push(label);
+            }
+        }
+        for label in labels {
+            assert!(
+                seen.contains(label),
+                "label {label} is recorded by the router but belongs to no \
+                 endpoint group — its traffic would vanish from the chart"
             );
         }
+
+        let charted: u64 = snapshot.requests_by_backend.values().sum();
+        assert_eq!(
+            charted, snapshot.requests_total,
+            "the chart must account for every request the KPI counts"
+        );
     }
 
     #[test]
