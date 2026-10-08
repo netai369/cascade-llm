@@ -438,6 +438,18 @@ impl UpstreamRegistry {
             }
         }
     }
+
+    /// Updates the model name of a specific node.
+    pub fn update_model(&mut self, role: &str, id: &str, model: &str) -> bool {
+        if let Some(pool) = self.roles.get_mut(role) {
+            if let Some(node) = pool.iter_mut().find(|n| n.id == id) {
+                node.model = Some(model.to_string());
+                info!("UPSTREAM_MODEL_UPDATED: role={} id={} model={}", role, id, model);
+                return true;
+            }
+        }
+        false
+    }
 }
 
 // ============================================================================

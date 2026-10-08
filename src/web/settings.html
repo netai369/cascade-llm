@@ -6,6 +6,7 @@
   <title>Cascade LLM Settings - NetAI Stack SE</title>
   <link rel="stylesheet" href="/theme/netai-theme.css">
   <script src="/theme/netai-theme.js"></script>
+  <script src="/theme/netai-lang.js"></script>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body {
@@ -78,12 +79,13 @@
 <body>
   <header>
     <div class="bar">
-    <div class="brand">
-      <a href="/menu/" title="Main menu">NetAI</a>
-      <a href="./" title="Cascade LLM"><strong>Cascade LLM</strong></a>
-    </div>
+      <a class="netai-brandmark" href="/menu/" title="Main menu">
+        <img src="/theme/NETAI_LOGO_Gold_Black_big.png" alt="NetAI logo">
+        <span class="wordmark"><strong data-i18n="menu.cascade">Cascade LLM</strong><span data-i18n="menu.subtitle">On-premise AI for your business</span></span>
+      </a>
     <a class="cog active" href="" title="Settings">&#9881;</a>
     <button data-theme-toggle class="netai-theme-toggle" aria-label="Switch theme"></button>
+    <button data-lang-toggle class="netai-lang-toggle" aria-label="Language"></button>
     </div>
     <nav>
       <a href="./">Dashboard</a>

@@ -155,10 +155,15 @@ impl GatewayState {
     ) -> Self {
         let http_client = Arc::new(
             reqwest::Client::builder()
-                .pool_max_idle_per_host(0)
+                // Keep-alive across requests: pool_max_idle_per_host(0)
+                // disabled reuse and forced a new TCP+TLS handshake per call.
+                .pool_max_idle_per_host(32)
                 .pool_idle_timeout(Duration::from_secs(90))
                 .connect_timeout(Duration::from_secs(5))
-                .timeout(Duration::from_secs(600))
+                // Total ceiling for batch calls; long SSE streams are bounded
+                // by the idle read_timeout below rather than an absolute cap.
+                .timeout(Duration::from_secs(1800))
+                .read_timeout(Duration::from_secs(180))
                 .build()
                 .expect("Failed to build reqwest client"),
         );
@@ -1019,8 +1024,12 @@ impl GatewayState {
                 Ok(parts)
             }
             Err(e) => {
-                self.circuit_breaker.record_failure(url).await;
-                self.metrics.record_fallback("backend_unavailable");
+                // Only transport failures and 5xx indicate a sick backend; a
+                // 4xx is a client error and must not open the breaker.
+                if e.unreachable || e.status >= 500 {
+                    self.circuit_breaker.record_failure(url).await;
+                    self.metrics.record_fallback("backend_unavailable");
+                }
                 if e.unreachable {
                     Err(ProxyError::unreachable(
                         StatusCode::SERVICE_UNAVAILABLE,
@@ -1052,6 +1061,24 @@ impl GatewayState {
             return (node.endpoint_url.clone(), node.bearer_token.clone(), Some(node.id));
         }
         (default_url.to_string(), self.config.llama_api_key.clone(), None)
+    }
+
+    /// Bearer + node id for an already-resolved endpoint URL. Used by the
+    /// session-affinity path, which carries a URL (not a role) forward. Falls
+    /// back to the static LLAMA_API_KEY for the configured backends.
+    async fn resolve_target(&self, url: &str) -> (Option<String>, Option<String>) {
+        {
+            let registry = self.registry.read().await;
+            for node in registry.nodes() {
+                if node.endpoint_url == url {
+                    return (node.bearer_token.clone(), Some(node.id.clone()));
+                }
+            }
+        }
+        if url == self.config.large_text_url || url == self.config.small_mllm_url {
+            return (self.config.llama_api_key.clone(), None);
+        }
+        (None, None)
     }
 
     /// Picks a node from the registry without falling back to static config.
@@ -1265,52 +1292,67 @@ impl GatewayState {
 
         if let Some(target) = target_override {
             info!("SESSION AFFINITY ROUTE: target={}", target);
-            let mut result = self.proxy_to_backend(&injected_payload, &target, None, is_streaming, origin, &mut None).await;
+            let (bearer, node) = self.resolve_target(&target).await;
+            let backend = if target == self.config.small_mllm_url {
+                RouteBackend::AuxiliaryServer
+            } else {
+                RouteBackend::InferenceServer
+            };
+            let mut payload = injected_payload.clone();
+            self.apply_node_model(&mut payload, &node).await;
+            let mut result = self
+                .private_proxy_with_bearer(
+                    &payload, &target, bearer.as_deref(), backend, is_streaming, origin,
+                    node.as_deref(),
+                )
+                .await;
             if let Ok(parts) = result.as_mut() {
                 if let Ok(v) = HeaderValue::from_str("session-affinity") {
                     parts.0.insert("x-cascade-route", v);
-                }
-            }
-            match &result {
-                Ok(_) => {
-                    self.circuit_breaker.record_success(&target).await;
-                }
-                Err(_) => {
-                    self.circuit_breaker.record_failure(&target).await;
                 }
             }
             self.metrics.record_request("session_affinity");
             return result;
         }
 
-        let (use_small, target_url) = self.pick_model(has_image, complexity_score, tier).await;
-        let target_url = target_url.to_owned();
-        info!("AUTO SELECTED_URL: {}", target_url);
+        let (use_small, static_target) = self.pick_model(has_image, complexity_score, tier).await;
+        // Resolve through the dynamic registry (weighted round-robin) and carry
+        // its bearer + circuit breaker. The static-config fallback uses
+        // LLAMA_API_KEY. Previously this path posted straight to the static
+        // URL with `bearer None`, bypassing auth and the breaker.
+        let target_role = if use_small { "auxiliary" } else { "main" };
+        let (target_url, target_bearer, target_node) =
+            self.resolve_upstream(target_role, &static_target).await;
+        let (large_url, large_bearer, large_node) =
+            self.resolve_upstream("main", &self.config.large_text_url).await;
+        info!("AUTO SELECTED_URL: {} (role={})", target_url, target_role);
 
         if !use_small {
-            let mut result = self.proxy_to_backend(&injected_payload, &target_url, None, is_streaming, origin, &mut None).await;
+            let mut payload = injected_payload.clone();
+            self.apply_node_model(&mut payload, &target_node).await;
+            let mut result = self
+                .private_proxy_with_bearer(
+                    &payload, &target_url, target_bearer.as_deref(),
+                    RouteBackend::InferenceServer, is_streaming, origin,
+                    target_node.as_deref(),
+                )
+                .await;
             if let Ok(parts) = result.as_mut() {
-                if let Ok(v) = HeaderValue::from_str(if use_small {"auto-small"} else {"auto-large"}) {
+                if let Ok(v) = HeaderValue::from_str("auto-large") {
                     parts.0.insert("x-cascade-route", v);
                 }
             }
-            match &result {
-                Ok(_) => {
-                    self.circuit_breaker.record_success(&target_url).await;
-                    if let Some(ref key) = session_key {
-                        self.session_cache.insert(key.clone(), target_url.clone()).await;
-                    }
-                }
-                Err(_) => {
-                    self.circuit_breaker.record_failure(&target_url).await;
+            if result.is_ok() {
+                if let Some(ref key) = session_key {
+                    self.session_cache.insert(key.clone(), target_url.clone()).await;
                 }
             }
-            self.metrics.record_request("large");
             return result;
         }
 
         info!("AUTO SMALL_MODEL_PATH: target_url={}", target_url);
         let mut small_payload = injected_payload.clone();
+        self.apply_node_model(&mut small_payload, &target_node).await;
         if small_payload.max_tokens.is_none() {
             small_payload.max_tokens = Some(4096);
         }
@@ -1319,24 +1361,22 @@ impl GatewayState {
         language::append_fallback_instruction(&mut small_payload);
 
         if is_streaming {
-            let mut result = self.proxy_to_backend(&small_payload, &target_url, None, true, origin, &mut None).await;
+            let mut result = self
+                .private_proxy_with_bearer(
+                    &small_payload, &target_url, target_bearer.as_deref(),
+                    RouteBackend::AuxiliaryServer, true, origin, target_node.as_deref(),
+                )
+                .await;
             if let Ok(parts) = result.as_mut() {
                 if let Ok(v) = HeaderValue::from_str("auto-small") {
                     parts.0.insert("x-cascade-route", v);
                 }
             }
-            match &result {
-                Ok(_) => {
-                    self.circuit_breaker.record_success(&target_url).await;
-                    if let Some(ref key) = session_key {
-                        self.session_cache.insert(key.clone(), target_url.clone()).await;
-                    }
-                }
-                Err(_) => {
-                    self.circuit_breaker.record_failure(&target_url).await;
+            if result.is_ok() {
+                if let Some(ref key) = session_key {
+                    self.session_cache.insert(key.clone(), target_url.clone()).await;
                 }
             }
-            self.metrics.record_request("small");
             return result;
         }
 
@@ -1346,10 +1386,11 @@ impl GatewayState {
             small_payload.max_tokens = Some(max_tokens);
         }
 
-        let backend_response = self
-            .http_client
-            .post(&target_url)
-            .json(&small_payload)
+        let mut small_request = self.http_client.post(&target_url).json(&small_payload);
+        if let Some(token) = target_bearer.as_deref() {
+            small_request = small_request.bearer_auth(token);
+        }
+        let backend_response = small_request
             .send()
             .await
             .map_err(|e| ProxyError::unreachable(StatusCode::BAD_GATEWAY, &target_url, format!("{}", e)))?;
@@ -1364,19 +1405,24 @@ impl GatewayState {
             info!("Small model returned HTTP {}, rerouting original request to large model", status);
             self.circuit_breaker.record_failure(&target_url).await;
             self.metrics.record_fallback("primary_failed");
-            let mut result = self.proxy_to_backend(&injected_payload, &large_url, None, false, origin, &mut None).await;
-        if let Ok(parts) = result.as_mut() {
-            if let Ok(v) = HeaderValue::from_str("auto-large") {
-                parts.0.insert("x-cascade-route", v);
+            let mut payload = injected_payload.clone();
+            self.apply_node_model(&mut payload, &large_node).await;
+            let mut result = self
+                .private_proxy_with_bearer(
+                    &payload, &large_url, large_bearer.as_deref(),
+                    RouteBackend::InferenceServer, false, origin, large_node.as_deref(),
+                )
+                .await;
+            if let Ok(parts) = result.as_mut() {
+                if let Ok(v) = HeaderValue::from_str("auto-large") {
+                    parts.0.insert("x-cascade-route", v);
+                }
             }
-        }
             if result.is_ok() {
-                self.circuit_breaker.record_success(&large_url).await;
                 if let Some(ref key) = session_key {
                     self.session_cache.insert(key.clone(), large_url.clone()).await;
                 }
             }
-            self.metrics.record_request("large");
             return result;
         }
 
@@ -1386,8 +1432,13 @@ impl GatewayState {
         // pre-small) payload to the large model and tags the response.
         let reroute_to_large = async {
             self.metrics.record_fallback("quality_low");
+            let mut payload = injected_payload.clone();
+            self.apply_node_model(&mut payload, &large_node).await;
             let mut result = self
-                .proxy_to_backend(&injected_payload, &large_url, None, false, origin, &mut None)
+                .private_proxy_with_bearer(
+                    &payload, &large_url, large_bearer.as_deref(),
+                    RouteBackend::InferenceServer, false, origin, large_node.as_deref(),
+                )
                 .await;
             if let Ok(parts) = result.as_mut() {
                 if let Ok(v) = HeaderValue::from_str("auto-large") {
@@ -1395,12 +1446,10 @@ impl GatewayState {
                 }
             }
             if result.is_ok() {
-                self.circuit_breaker.record_success(&large_url).await;
                 if let Some(ref key) = session_key {
                     self.session_cache.insert(key.clone(), large_url.clone()).await;
                 }
             }
-            self.metrics.record_request("large");
             result
         };
 

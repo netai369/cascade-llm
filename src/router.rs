@@ -3,17 +3,62 @@
 use crate::{cascade_features, handlers, state::GatewayState};
 use axum::{
     extract::DefaultBodyLimit,
+    middleware,
     routing::{delete, get, post, put},
     Router,
 };
 use std::sync::Arc;
 
 pub fn build_router(state: Arc<GatewayState>) -> Router {
+    // Mutating dashboard/pipeline routes: guarded by the admin key as soon as
+    // one is configured. `route_layer` runs before body extraction so an
+    // unauthenticated request cannot reach the handler at all.
+    let admin_routes = Router::new()
+        .route(
+            "/web/api/settings",
+            put(handlers::update_settings),
+        )
+        .route(
+            "/web/api/providers",
+            post(handlers::add_provider),
+        )
+        .route(
+            "/web/api/providers/:id",
+            delete(handlers::delete_provider),
+        )
+        .route(
+            "/api/providers",
+            post(handlers::add_provider),
+        )
+        .route(
+            "/api/providers/:id",
+            delete(handlers::delete_provider),
+        )
+        .route(
+            "/extraction/v1/backends",
+            post(handlers::register_extraction_backend_handler),
+        )
+        .route(
+            "/extraction/v1/backends/:id",
+            delete(handlers::remove_extraction_backend_handler),
+        )
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            handlers::require_admin,
+        ));
+
     Router::new()
+        .merge(admin_routes)
         .merge(cascade_features::build_router::<Arc<GatewayState>>())
         // OpenAI-compatible chat + model discovery
         .route("/v1/chat/completions", post(handlers::chat_completions))
         .route("/v1/completions", post(handlers::completions))
+        // Anthropic-compatible Messages API
+        .route("/v1/messages", post(crate::anthropic::messages))
+        .route(
+            "/v1/messages/count_tokens",
+            post(crate::anthropic::count_tokens),
+        )
         .route("/v1/models", get(handlers::list_models))
         .route("/models", get(handlers::list_models))
         .route("/model", get(handlers::get_model))
@@ -38,26 +83,26 @@ pub fn build_router(state: Arc<GatewayState>) -> Router {
         .route("/web/api/dashboard", get(handlers::dashboard_api))
         .route(
             "/web/api/settings",
-            get(handlers::get_settings).put(handlers::update_settings),
+            get(handlers::get_settings),
         )
         .route(
             "/web/api/providers",
-            get(handlers::list_providers).post(handlers::add_provider),
+            get(handlers::list_providers),
         )
         .route(
             "/web/api/providers/:id",
-            get(handlers::get_provider).delete(handlers::delete_provider),
+            get(handlers::get_provider),
         )
         // Aliases without the /web prefix (programmatic access)
         .route("/api/dashboard", get(handlers::dashboard_api))
         .route("/api/active-models", get(handlers::active_models))
         .route(
             "/api/providers",
-            get(handlers::list_providers).post(handlers::add_provider),
+            get(handlers::list_providers),
         )
         .route(
             "/api/providers/:id",
-            get(handlers::get_provider).delete(handlers::delete_provider),
+            get(handlers::get_provider),
         )
         // Extraction pipeline (LightRAG / knowledge-engine)
         .route(
@@ -66,12 +111,7 @@ pub fn build_router(state: Arc<GatewayState>) -> Router {
         )
         .route(
             "/extraction/v1/backends",
-            get(handlers::list_extraction_backends)
-                .post(handlers::register_extraction_backend_handler),
-        )
-        .route(
-            "/extraction/v1/backends/:id",
-            delete(handlers::remove_extraction_backend_handler),
+            get(handlers::list_extraction_backends),
         )
         // Dynamic upstream registry API
         .route("/web/api/upstreams", get(handlers::list_upstreams))
@@ -101,6 +141,10 @@ pub fn build_router(state: Arc<GatewayState>) -> Router {
             post(handlers::probe_upstreams),
         )
         .route(
+            "/web/api/v1/admin/upstreams/refresh-models",
+            post(handlers::refresh_models_upstreams),
+        )
+        .route(
             "/api/v1/inference-nodes/:id/activate",
             post(handlers::activate_node),
         )
@@ -112,6 +156,10 @@ pub fn build_router(state: Arc<GatewayState>) -> Router {
         .route(
             "/api/v1/admin/upstreams/probe",
             post(handlers::probe_upstreams),
+        )
+        .route(
+            "/api/v1/admin/upstreams/refresh-models",
+            post(handlers::refresh_models_upstreams),
         )
         .route("/settings", get(handlers::settings_redirect))
         .with_state(state)

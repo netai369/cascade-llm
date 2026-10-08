@@ -1,3 +1,6 @@
 /target
 *.rs.bk
 *.pdb
+
+# OpenCode tool state (node_modules, local index) — never source.
+.opencode/

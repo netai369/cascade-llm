@@ -13,6 +13,9 @@ client ──► /v1/chat/completions ──► inspect_route (3-condition dispa
                                      ├─ A(dynamic): doc/OCR payload + active
                                      │   ocr node registered ────────────► ocr
                                      └─ C: default ──────────────────────► main
+            /v1/messages           ──► Anthropic Messages API
+                                     (anthropic ↔ OpenAI translation, then
+                                      the same dispatcher; SSE translated back)
             /v1/images/generations ──► image role (fallback IMAGE_GENERATION_URL)
             /v1/rag/extract        ──► rag_worker pool (503 if none)
             /extraction/v1/*       ──► extraction backend registry
@@ -30,6 +33,8 @@ router assembly in `router.rs`):
 - `state.rs` — GatewayState: routing engine, circuit breaker, session cache,
   SSE normalization, complexity routing ("auto" mode).
 - `handlers.rs` — HTTP handlers incl. admin API (`x-cascade-admin-key`).
+- `anthropic.rs` — Anthropic Messages API compatibility (`/v1/messages`,
+  `/v1/messages/count_tokens`): request/response + SSE event translation.
 - `config.rs` — env config (+ optional CASCADE_CONFIG_FILE yaml seeds).
 - `embeddings.rs` — pass-through proxies for `/v1/embeddings` + `/v1/rerank`
   (OpenAI-compatible embeddings/rerank backends, `EMBEDDINGS_URL`/`RERANK_URL`).
