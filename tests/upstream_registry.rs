@@ -337,3 +337,57 @@ async fn image_generation_via_pollinations_adapter() {
         "/prompt/a%20cat?width=512&height=768&model=turbo&seed=7&nologo=true"
     );
 }
+
+
+
+/// The mutating dashboard/pipeline routes must reject requests that do not
+/// present the admin key once it is configured (they were previously open).
+#[tokio::test]
+async fn mutating_routes_require_admin_key() {
+    let base = spawn_gateway().await;
+    let client = reqwest::Client::new();
+    let url = |p: &str| format!("{}{}", base, p);
+
+    // PUT /web/api/settings
+    let res = client
+        .put(url("/web/api/settings"))
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), reqwest::StatusCode::FORBIDDEN);
+
+    // POST /web/api/providers
+    let res = client
+        .post(url("/web/api/providers"))
+        .json(&serde_json::json!({"id": "x", "use_as": "main"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), reqwest::StatusCode::FORBIDDEN);
+
+    // DELETE /web/api/providers/:id
+    let res = client
+        .delete(url("/web/api/providers/x"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), reqwest::StatusCode::FORBIDDEN);
+
+    // POST /extraction/v1/backends
+    let res = client
+        .post(url("/extraction/v1/backends"))
+        .json(&serde_json::json!({"id": "x", "url": "http://x"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), reqwest::StatusCode::FORBIDDEN);
+
+    // DELETE /extraction/v1/backends/:id
+    let res = client
+        .delete(url("/extraction/v1/backends/x"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), reqwest::StatusCode::FORBIDDEN);
+}
