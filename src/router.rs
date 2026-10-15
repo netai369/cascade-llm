@@ -62,6 +62,10 @@ pub fn build_router(state: Arc<GatewayState>) -> Router {
         // `status` is a *static* route so it wins over the wildcard below; the
         // wildcard exists because a forwarded path has several segments
         // (`inference-nodes/gpu_…/activate`), which a `:param` cannot match.
+        // Usage metering summary (see usage.rs). Admin-only: exposes per-tenant
+        // consumption, so it sits behind the same require_admin layer.
+        .route("/web/api/v1/admin/usage", get(crate::usage::admin_usage))
+        .route("/api/v1/admin/usage", get(crate::usage::admin_usage))
         .route("/web/api/provisioner/status", get(crate::provisioner::status))
         .route("/api/provisioner/status", get(crate::provisioner::status))
         .route(
@@ -117,6 +121,8 @@ pub fn build_router(state: Arc<GatewayState>) -> Router {
         // Audio / media proxies
         .route("/v1/audio/speech", post(handlers::tts))
         .route("/v1/audio/transcriptions", post(handlers::stt))
+        // OpenAI-Realtime-compatible STT WebSocket proxy (voice chat + dictation).
+        .route("/v1/realtime", get(crate::realtime::realtime_ws))
         // Speaker diarization. Same byte-proxy pattern as STT — `audio_target()`
         // strips the `/v1/audio` prefix generically, so this is one route line
         // rather than a third composition path (gotcha 80).

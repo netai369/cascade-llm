@@ -8,7 +8,11 @@ use http_body_util::BodyExt;
 use std::sync::Arc;
 use tracing::{info, warn};
 
-use crate::state::GatewayState;
+use crate::state::{passthrough_usage, GatewayState};
+use crate::usage::UsageEvent;
+use axum::http::HeaderMap;
+use serde_json::Value;
+use std::time::Instant;
 
 /// The audio path prefix every STT/TTS service in this stack exposes.
 pub const AUDIO_PREFIX: &str = "/v1/audio";
@@ -82,7 +86,7 @@ pub async fn tts_handler(
         }
     }
     info!("TTS proxy: {} -> {}", req.uri(), target_url);
-    proxy_request(state, req, &target_url).await
+    proxy_request(state, req, &target_url, "audio_speech", "tts").await
 }
 
 pub async fn stt_handler(
@@ -94,7 +98,7 @@ pub async fn stt_handler(
         req.uri().path(),
     );
     info!("STT proxy: {} -> {}", req.uri(), target_url);
-    proxy_request(state, req, &target_url).await
+    proxy_request(state, req, &target_url, "audio_transcription", "stt").await
 }
 
 /// Speaker diarization (`/v1/audio/diarize`) — identical to the STT proxy.
@@ -111,10 +115,17 @@ pub async fn stt_diarize_handler(
         req.uri().path(),
     );
     info!("STT diarize proxy: {} -> {}", req.uri(), target_url);
-    proxy_request(state, req, &target_url).await
+    proxy_request(state, req, &target_url, "audio_transcription", "stt").await
 }
 
-async fn proxy_request(state: Arc<GatewayState>, req: Request<Body>, target_url: &str) -> Response {
+async fn proxy_request(
+    state: Arc<GatewayState>,
+    req: Request<Body>,
+    target_url: &str,
+    usage_kind: &'static str,
+    usage_route: &'static str,
+) -> Response {
+    let started = Instant::now();
     let method = req.method().clone();
     let headers = req.headers().clone();
 
@@ -135,6 +146,7 @@ async fn proxy_request(state: Arc<GatewayState>, req: Request<Body>, target_url:
         }
     }
 
+    let request_bytes = body_bytes.clone();
     match proxy_req.body(body_bytes).send().await {
         Ok(resp) => {
             let status = resp.status();
@@ -148,6 +160,12 @@ async fn proxy_request(state: Arc<GatewayState>, req: Request<Body>, target_url:
                         .unwrap();
                 }
             };
+            if status.is_success() {
+                state.usage.record(meter_audio(
+                    &headers, usage_kind, usage_route, status.as_u16(),
+                    &request_bytes, &body, started,
+                ));
+            }
             let mut response = Response::new(Body::from(body));
             *response.status_mut() = status;
             for (key, value) in resp_headers.iter() {
@@ -167,4 +185,39 @@ async fn proxy_request(state: Arc<GatewayState>, req: Request<Body>, target_url:
                 .unwrap()
         }
     }
+}
+
+/// Usage for a proxied audio call. TTS (`audio_speech`) bills input characters;
+/// STT (`audio_transcription`) bills the response's `duration` in seconds.
+fn meter_audio(
+    headers: &HeaderMap,
+    kind: &str,
+    route: &str,
+    status: u16,
+    request: &[u8],
+    response: &[u8],
+    started: Instant,
+) -> UsageEvent {
+    let mut ev = passthrough_usage(headers, kind, route, status, started);
+    let req_json: Value = serde_json::from_slice(request).unwrap_or(Value::Null);
+    let resp_json: Value = serde_json::from_slice(response).unwrap_or(Value::Null);
+    ev.model = resp_json
+        .get("model")
+        .and_then(|m| m.as_str())
+        .or_else(|| req_json.get("model").and_then(|m| m.as_str()))
+        .unwrap_or_default()
+        .to_string();
+    match kind {
+        "audio_speech" => {
+            ev.characters = req_json
+                .get("input")
+                .and_then(|v| v.as_str())
+                .map(|s| s.chars().count() as u64)
+                .unwrap_or(0);
+        }
+        _ => {
+            ev.audio_seconds = resp_json.get("duration").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        }
+    }
+    ev
 }

@@ -16,7 +16,8 @@ use std::sync::Arc;
 use tracing::{info, warn};
 
 use crate::registry::UpstreamNode;
-use crate::state::GatewayState;
+use crate::state::{passthrough_usage, GatewayState};
+use std::time::Instant;
 
 const POLLINATIONS_DEFAULT_MODEL: &str = "flux";
 
@@ -25,7 +26,42 @@ const POLLINATIONS_DEFAULT_MODEL: &str = "flux";
 /// `POLLINATIONS_TOKEN` is not a reason to leave a user without an image.
 const POLLINATIONS_FALLBACK_BASE: &str = "https://image.pollinations.ai";
 
+/// Image generation entry point: dispatches (local / free tier / fallback) and
+/// meters the successful result. Images are the response's `data` length.
 pub async fn image_generation_handler(
+    State(state): State<Arc<GatewayState>>,
+    req: Request<Body>,
+) -> Response {
+    let started = Instant::now();
+    let headers = req.headers().clone();
+    let response = image_generation_dispatch(State(state.clone()), req).await;
+    if !response.status().is_success() {
+        return response;
+    }
+    let (parts, body) = response.into_parts();
+    let bytes = match body.collect().await {
+        Ok(b) => b.to_bytes(),
+        Err(_) => axum::body::Bytes::new(),
+    };
+    let json: Option<serde_json::Value> = serde_json::from_slice(&bytes).ok();
+    let mut ev = passthrough_usage(&headers, "image", "image", parts.status.as_u16(), started);
+    ev.images = json
+        .as_ref()
+        .and_then(|v| v.get("data"))
+        .and_then(|d| d.as_array())
+        .map(|a| a.len() as u64)
+        .unwrap_or(1);
+    ev.model = json
+        .as_ref()
+        .and_then(|v| v.get("model"))
+        .and_then(|m| m.as_str())
+        .unwrap_or_default()
+        .to_string();
+    state.usage.record(ev);
+    axum::response::Response::from_parts(parts, Body::from(bytes))
+}
+
+async fn image_generation_dispatch(
     State(state): State<Arc<GatewayState>>,
     req: Request<Body>,
 ) -> Response {

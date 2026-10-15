@@ -10,7 +10,11 @@ use http_body_util::BodyExt;
 use std::sync::Arc;
 use tracing::{info, warn};
 
-use crate::state::GatewayState;
+use crate::state::{passthrough_usage, GatewayState};
+use crate::usage::UsageEvent;
+use axum::http::HeaderMap;
+use serde_json::Value;
+use std::time::Instant;
 
 pub async fn embeddings_handler(
     State(state): State<Arc<GatewayState>>,
@@ -27,6 +31,7 @@ pub async fn rerank_handler(
 }
 
 async fn proxy_json_api(state: Arc<GatewayState>, req: Request<Body>, service: &str) -> Response {
+    let started = Instant::now();
     let (default_url, endpoint) = match service {
         "embeddings" => (
             state.config.embeddings_url.clone(),
@@ -75,6 +80,7 @@ async fn proxy_json_api(state: Arc<GatewayState>, req: Request<Body>, service: &
                 .unwrap()
         }
     };
+    let request_body = body.clone();
 
     let mut upstream = state.http_client.request(method, target_url);
     for (key, value) in &headers {
@@ -101,6 +107,11 @@ async fn proxy_json_api(state: Arc<GatewayState>, req: Request<Body>, service: &
                         .unwrap()
                 }
             };
+            if status.is_success() {
+                state.usage.record(meter_json_api(
+                    &headers, service, status.as_u16(), &request_body, &body, started,
+                ));
+            }
             let mut result = Response::new(Body::from(body));
             *result.status_mut() = status;
             for (key, value) in &response_headers {
@@ -121,5 +132,51 @@ async fn proxy_json_api(state: Arc<GatewayState>, req: Request<Body>, service: &
                 }}).to_string()))
                 .unwrap()
         }
+    }
+}
+
+/// Usage for a pass-through embeddings or rerank call. Embeddings count prompt
+/// tokens (upstream `usage.prompt_tokens`, else an input-length estimate); rerank
+/// is recorded as a call only.
+fn meter_json_api(
+    headers: &HeaderMap,
+    service: &str,
+    status: u16,
+    request: &[u8],
+    response: &[u8],
+    started: Instant,
+) -> UsageEvent {
+    let kind = if service == "rerank" { "rerank" } else { "embeddings" };
+    let mut ev = passthrough_usage(headers, kind, service, status, started);
+    let req_json: Value = serde_json::from_slice(request).unwrap_or(Value::Null);
+    let resp_json: Value = serde_json::from_slice(response).unwrap_or(Value::Null);
+    ev.model = resp_json
+        .get("model")
+        .and_then(|m| m.as_str())
+        .or_else(|| req_json.get("model").and_then(|m| m.as_str()))
+        .unwrap_or_default()
+        .to_string();
+    if kind == "embeddings" {
+        match resp_json.pointer("/usage/prompt_tokens").and_then(|v| v.as_u64()) {
+            Some(p) => ev.prompt_tokens = p,
+            None => {
+                ev.prompt_tokens = json_input_chars(req_json.get("input")) / 4;
+                ev.estimated = true;
+            }
+        }
+    }
+    ev
+}
+
+/// Characters in an OpenAI-style `input` (a string, or an array of strings).
+fn json_input_chars(input: Option<&Value>) -> u64 {
+    match input {
+        Some(Value::String(s)) => s.chars().count() as u64,
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(|v| v.as_str())
+            .map(|s| s.chars().count() as u64)
+            .sum(),
+        _ => 0,
     }
 }

@@ -395,6 +395,7 @@ mod tests {
             response_format: None,
             metadata: None,
             route_hint: None,
+            stream_options: None,
         };
         let result = inspect_intent(&payload);
         assert_eq!(result.intent, Intent::Planning);
@@ -426,6 +427,7 @@ mod tests {
             response_format: None,
             metadata: None,
             route_hint: None,
+            stream_options: None,
         };
         let result = inspect_intent(&payload);
         assert_eq!(result.intent, Intent::General);
@@ -514,6 +516,7 @@ mod tests {
             response_format: None,
             metadata: None,
             route_hint: None,
+            stream_options: None,
         };
         let result = inspect_intent(&payload);
         // Architecture/design intent declared in the system prompt → force large.
@@ -561,6 +564,7 @@ mod tests {
             response_format: None,
             metadata: None,
             route_hint: None,
+            stream_options: None,
         };
         let result = inspect_intent(&payload);
         // System-prompt mode + tools → direct_to_large

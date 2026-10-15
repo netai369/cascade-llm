@@ -3,6 +3,7 @@ use crate::db::Db;
 use crate::intent_routing;
 use crate::language;
 use crate::types::*;
+use crate::usage::UsageEvent;
 
 use axum::body::Body;
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
@@ -154,6 +155,9 @@ pub struct GatewayState {
     pub registry: Arc<tokio::sync::RwLock<crate::registry::UpstreamRegistry>>,
     /// Settings-page-controlled runtime values (persisted via Db).
     pub runtime: Arc<tokio::sync::RwLock<crate::types::RuntimeSettings>>,
+    /// Usage metering sink (see `usage.rs`). Disabled until `main` installs a
+    /// live recorder, so tests and library users pay nothing.
+    pub usage: Arc<crate::usage::UsageRecorder>,
 }
 
 
@@ -201,6 +205,7 @@ impl GatewayState {
             registry: Arc::new(tokio::sync::RwLock::new(
                 crate::registry::UpstreamRegistry::default(),
             )),
+            usage: crate::usage::UsageRecorder::disabled(),
             runtime: Arc::new(tokio::sync::RwLock::new(crate::types::RuntimeSettings {
                 router_threshold: config.router_threshold,
                 confidence_threshold: config.confidence_threshold,
@@ -830,13 +835,24 @@ impl GatewayState {
         url: &str,
         bearer: Option<&str>,
         is_streaming: bool,
-        _origin: &str,
+        usage_base: UsageEvent,
         header_latency_ms: &mut Option<u64>,
     ) -> Result<(HeaderMap, Body), ProxyError> {
         // Strip router-internal fields so they are never forwarded to the backend.
         let mut clean = payload.clone();
         clean.metadata = None;
         clean.route_hint = None;
+        // Usage metering (see `usage.rs`): every streamed request asks the
+        // backend for the terminal usage chunk, whether or not the client did.
+        // The SSE rewriter strips that chunk again for clients that did not
+        // opt in. Non-streamed requests never carry stream_options upstream
+        // (vLLM rejects it there).
+        clean.stream_options = if is_streaming {
+            Some(serde_json::json!({"include_usage": true}))
+        } else {
+            None
+        };
+        let client_wants_usage = payload.client_wants_stream_usage();
 
         let mut request = self.http_client.post(url).json(&clean);
         if let Some(token) = bearer {
@@ -877,7 +893,11 @@ impl GatewayState {
             headers.insert("x-model-name", hv);
         }
 
-        fn emit_complete_sse_events(buffer: &mut Vec<u8>, model_name: &str) -> Vec<u8> {
+        fn emit_complete_sse_events(
+            buffer: &mut Vec<u8>,
+            model_name: &str,
+            usage: &mut ChatUsageTracker,
+        ) -> Vec<u8> {
             info!(target: "cascade_llm::state", "EMIT: buffer_len={} first_bytes={:?}", buffer.len(), std::str::from_utf8(&buffer[..buffer.len().min(100)]).unwrap_or_default());
             let mut out = Vec::new();
             while let Some(idx) = buffer.windows(2).position(|w| w == b"\n\n") {
@@ -893,7 +913,8 @@ impl GatewayState {
                     out.extend_from_slice(b"data: [DONE]\n\n");
                     continue;
                 }
-                if let Some(normalized) = normalize_event_json(text, model_name) {
+                let Some(kept) = usage.observe_frame(text) else { continue };
+                if let Some(normalized) = normalize_event_json(&kept, model_name) {
                     out.extend_from_slice(normalized.as_bytes());
                     out.extend_from_slice(b"\n\n");
                 }
@@ -908,7 +929,8 @@ impl GatewayState {
                 if text.is_empty() || text == "[DONE]" {
                     continue;
                 }
-                if let Some(normalized) = normalize_event_json(text, model_name) {
+                let Some(kept) = usage.observe_frame(text) else { continue };
+                if let Some(normalized) = normalize_event_json(&kept, model_name) {
                     out.extend_from_slice(normalized.as_bytes());
                     out.extend_from_slice(b"\n\n");
                 }
@@ -923,6 +945,15 @@ impl GatewayState {
             let lp_monitor = std::sync::Arc::new(std::sync::Mutex::new(
                 crate::intent_routing::LogprobMonitor::new(),
             ));
+            // Owned by the stream closure: records one usage event when the
+            // stream ends or the client disconnects (Drop).
+            let mut usage = ChatUsageTracker::new(
+                self.usage.clone(),
+                usage_base.clone(),
+                payload,
+                sent_at,
+                client_wants_usage,
+            );
             let stream = backend_response.bytes_stream().map(move |item| {
                 let chunk = match item {
                     Ok(c) => c,
@@ -975,7 +1006,7 @@ impl GatewayState {
                     local.truncate(chunk_start);
                 }
 
-                let ready = emit_complete_sse_events(&mut local, &model_name);
+                let ready = emit_complete_sse_events(&mut local, &model_name, &mut usage);
                 drop(local);
 
                 if ready.is_empty() {
@@ -992,6 +1023,18 @@ impl GatewayState {
             .bytes()
             .await
             .map_err(|_| ProxyError::unreachable(StatusCode::SERVICE_UNAVAILABLE, url, "failed to read backend response"))?;
+
+        // Records once when this function returns (every branch below).
+        let mut usage = ChatUsageTracker::new(
+            self.usage.clone(),
+            usage_base.clone(),
+            payload,
+            sent_at,
+            client_wants_usage,
+        );
+        if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&body_bytes) {
+            usage.observe_value(&v);
+        }
 
         if let Ok(mut event) = serde_json::from_slice::<serde_json::Value>(&body_bytes) {
             // Unified model identity: rewrite backend model id.
@@ -1119,7 +1162,7 @@ impl GatewayState {
         is_streaming: bool,
         tier: &str,
         headers: &HeaderMap,
-        origin: &str,
+        _origin: &str,
     ) -> Result<(HeaderMap, Body), ProxyError> {
         let mut decision = self.inspect_route(&payload, headers).await;
         // Intent-based routing: planning/design/security/meta → force large model.
@@ -1150,10 +1193,10 @@ impl GatewayState {
         );
 
         match decision {
-            RouteDecision::Ocr => self.route_ocr(&payload, is_streaming, origin).await,
-            RouteDecision::Auxiliary => self.route_auxiliary(&payload, is_streaming, origin).await,
-            RouteDecision::Inference => self.route_inference(&payload, is_streaming, origin).await,
-            RouteDecision::Auto => self.route_auto(payload, is_streaming, tier, headers, origin).await,
+            RouteDecision::Ocr => self.route_ocr(&payload, is_streaming, headers).await,
+            RouteDecision::Auxiliary => self.route_auxiliary(&payload, is_streaming, headers).await,
+            RouteDecision::Inference => self.route_inference(&payload, is_streaming, headers).await,
+            RouteDecision::Auto => self.route_auto(payload, is_streaming, tier, headers).await,
         }
     }
 
@@ -1164,9 +1207,9 @@ impl GatewayState {
         url: &str,
         backend: RouteBackend,
         is_streaming: bool,
-        origin: &str,
+        headers: &HeaderMap,
     ) -> Result<(HeaderMap, Body), ProxyError> {
-        self.private_proxy_with_bearer(payload, url, None, backend, is_streaming, origin, None)
+        self.private_proxy_with_bearer(payload, url, None, backend, is_streaming, headers, None)
             .await
     }
 
@@ -1178,7 +1221,7 @@ impl GatewayState {
         bearer: Option<&str>,
         backend: RouteBackend,
         is_streaming: bool,
-        origin: &str,
+        headers: &HeaderMap,
         node_id: Option<&str>,
     ) -> Result<(HeaderMap, Body), ProxyError> {
         let backend_name = match backend {
@@ -1205,8 +1248,9 @@ impl GatewayState {
             ).with_service_action(action));
         }
 
+        let usage_base = UsageEvent::from_headers(headers, "chat", metric_name);
         let mut header_latency = None;
-        match self.proxy_to_backend(payload, url, bearer, is_streaming, origin, &mut header_latency).await {
+        match self.proxy_to_backend(payload, url, bearer, is_streaming, usage_base, &mut header_latency).await {
             Ok(mut parts) => {
                 if let Ok(v) = HeaderValue::from_str(backend_name) {
                     parts.0.insert("x-cascade-route", v);
@@ -1341,7 +1385,7 @@ impl GatewayState {
         &self,
         payload: &ChatCompletionRequest,
         is_streaming: bool,
-        origin: &str,
+        headers: &HeaderMap,
     ) -> Result<(HeaderMap, Body), ProxyError> {
         let mut payload = payload.clone();
         self.inline_all_images(&mut payload).await;
@@ -1353,7 +1397,7 @@ impl GatewayState {
             payload.messages.len()
         );
         let _ = self.extract_image_urls(&payload.messages);
-        self.private_proxy_with_bearer(&payload, &url, bearer.as_deref(), RouteBackend::OcrServer, is_streaming, origin, node.as_deref()).await
+        self.private_proxy_with_bearer(&payload, &url, bearer.as_deref(), RouteBackend::OcrServer, is_streaming, headers, node.as_deref()).await
     }
 
     /// Condition B — agent context compression / fast text (auxiliary) endpoint.
@@ -1361,7 +1405,7 @@ impl GatewayState {
         &self,
         payload: &ChatCompletionRequest,
         is_streaming: bool,
-        origin: &str,
+        headers: &HeaderMap,
     ) -> Result<(HeaderMap, Body), ProxyError> {
         let mut payload = payload.clone();
         // If a remote image slipped in, inline it before forwarding.
@@ -1374,7 +1418,7 @@ impl GatewayState {
             url,
             payload.messages.len()
         );
-        self.private_proxy_with_bearer(&payload, &url, bearer.as_deref(), RouteBackend::AuxiliaryServer, is_streaming, origin, node.as_deref()).await
+        self.private_proxy_with_bearer(&payload, &url, bearer.as_deref(), RouteBackend::AuxiliaryServer, is_streaming, headers, node.as_deref()).await
     }
 
     /// Condition C — default chat & reasoning (main inference) endpoint.
@@ -1382,13 +1426,13 @@ impl GatewayState {
         &self,
         payload: &ChatCompletionRequest,
         is_streaming: bool,
-        origin: &str,
+        headers: &HeaderMap,
     ) -> Result<(HeaderMap, Body), ProxyError> {
         if self.has_image(payload) && !self.config.large_model_multimodal {
             info!(
                 "ROUTE_C: image detected but large model is text-only -> auxiliary multimodal backend"
             );
-            return self.route_auxiliary(payload, is_streaming, origin).await;
+            return self.route_auxiliary(payload, is_streaming, headers).await;
         }
 
         let mut payload = payload.clone();
@@ -1404,7 +1448,7 @@ impl GatewayState {
             payload.messages.len(),
             lang
         );
-        self.private_proxy_with_bearer(&payload, &url, bearer.as_deref(), RouteBackend::InferenceServer, is_streaming, origin, node.as_deref()).await
+        self.private_proxy_with_bearer(&payload, &url, bearer.as_deref(), RouteBackend::InferenceServer, is_streaming, headers, node.as_deref()).await
     }
 
     // --------------------------------------------------------------------------
@@ -1417,7 +1461,6 @@ impl GatewayState {
         is_streaming: bool,
         tier: &str,
         headers: &HeaderMap,
-        origin: &str,
     ) -> Result<(HeaderMap, Body), ProxyError> {
         // Intent-based bypass: planning/design/security/meta → skip small model entirely.
         let intent = intent_routing::inspect_intent(&payload);
@@ -1432,7 +1475,7 @@ impl GatewayState {
             payload = language::inject_language_prompt(language, payload);
             let (url, bearer, node) = self.resolve_upstream("main", &self.config.large_text_url).await;
             self.apply_node_model(&mut payload, &node).await;
-            return self.private_proxy_with_bearer(&payload, &url, bearer.as_deref(), RouteBackend::InferenceServer, is_streaming, origin, node.as_deref()).await;
+            return self.private_proxy_with_bearer(&payload, &url, bearer.as_deref(), RouteBackend::InferenceServer, is_streaming, headers, node.as_deref()).await;
         }
         let has_image = self.has_image(&payload);
         let has_tools = payload.tools.is_some() || payload.functions.is_some();
@@ -1534,7 +1577,7 @@ impl GatewayState {
             self.apply_node_model(&mut payload, &node).await;
             let mut result = self
                 .private_proxy_with_bearer(
-                    &payload, &target, bearer.as_deref(), backend, is_streaming, origin,
+                    &payload, &target, bearer.as_deref(), backend, is_streaming, headers,
                     node.as_deref(),
                 )
                 .await;
@@ -1565,7 +1608,7 @@ impl GatewayState {
             let mut result = self
                 .private_proxy_with_bearer(
                     &payload, &target_url, target_bearer.as_deref(),
-                    RouteBackend::InferenceServer, is_streaming, origin,
+                    RouteBackend::InferenceServer, is_streaming, headers,
                     target_node.as_deref(),
                 )
                 .await;
@@ -1596,7 +1639,7 @@ impl GatewayState {
             let mut result = self
                 .private_proxy_with_bearer(
                     &small_payload, &target_url, target_bearer.as_deref(),
-                    RouteBackend::AuxiliaryServer, true, origin, target_node.as_deref(),
+                    RouteBackend::AuxiliaryServer, true, headers, target_node.as_deref(),
                 )
                 .await;
             if let Ok(parts) = result.as_mut() {
@@ -1642,7 +1685,7 @@ impl GatewayState {
             let mut result = self
                 .private_proxy_with_bearer(
                     &payload, &large_url, large_bearer.as_deref(),
-                    RouteBackend::InferenceServer, false, origin, large_node.as_deref(),
+                    RouteBackend::InferenceServer, false, headers, large_node.as_deref(),
                 )
                 .await;
             if let Ok(parts) = result.as_mut() {
@@ -1669,7 +1712,7 @@ impl GatewayState {
             let mut result = self
                 .private_proxy_with_bearer(
                     &payload, &large_url, large_bearer.as_deref(),
-                    RouteBackend::InferenceServer, false, origin, large_node.as_deref(),
+                    RouteBackend::InferenceServer, false, headers, large_node.as_deref(),
                 )
                 .await;
             if let Ok(parts) = result.as_mut() {
@@ -2085,6 +2128,184 @@ fn normalize_event_json(raw: &str, model_name: &str) -> Option<String> {
     Some(format!("data: {}", serde_json::to_string(&event).unwrap_or_default()))
 }
 
+/// Usage event skeleton for a non-chat call proxied by a handler (embeddings,
+/// rerank, audio, image). The caller fills the kind-specific counters.
+pub(crate) fn passthrough_usage(
+    headers: &HeaderMap,
+    kind: &str,
+    route: &str,
+    status: u16,
+    started: Instant,
+) -> UsageEvent {
+    let mut ev = UsageEvent::from_headers(headers, kind, route);
+    ev.status = status;
+    ev.latency_ms = started.elapsed().as_millis() as u64;
+    ev
+}
+
+/// Estimated characters per token for the usage fallback when the upstream
+/// returned no usage block (matches the `chars/4` rule used across the stack).
+const USAGE_CHARS_PER_TOKEN: u64 = 4;
+
+/// Characters of prompt text in a chat request: message text parts, tool-call
+/// payloads and the tool/function schemas. Used only for the estimate fallback.
+fn prompt_char_len(payload: &ChatCompletionRequest) -> u64 {
+    let mut n: u64 = 0;
+    for m in &payload.messages {
+        n += match &m.content {
+            Some(MessageContent::Text(t)) => t.chars().count() as u64,
+            Some(MessageContent::Parts(parts)) => parts
+                .iter()
+                .map(|p| match p {
+                    MessageContentPart::Text { text } => text.chars().count() as u64,
+                    _ => 0,
+                })
+                .sum(),
+            None => 0,
+        };
+        if let Some(tc) = &m.tool_calls {
+            n += tc.to_string().chars().count() as u64;
+        }
+    }
+    for schema in [&payload.tools, &payload.functions].into_iter().flatten() {
+        n += schema.to_string().chars().count() as u64;
+    }
+    n
+}
+
+/// Usage metering for one chat call (streamed or not). Captures the upstream's
+/// usage block when present, otherwise counts completion text for an estimate.
+/// Records exactly one `UsageEvent` when dropped, which for a stream is when
+/// the stream finishes or the client disconnects.
+pub(crate) struct ChatUsageTracker {
+    recorder: Arc<crate::usage::UsageRecorder>,
+    event: UsageEvent,
+    started: Instant,
+    client_wants_usage: bool,
+    prompt_chars: u64,
+    usage_prompt: Option<u64>,
+    usage_completion: Option<u64>,
+    completion_chars: u64,
+    served_model: Option<String>,
+}
+
+impl ChatUsageTracker {
+    fn new(
+        recorder: Arc<crate::usage::UsageRecorder>,
+        mut event: UsageEvent,
+        payload: &ChatCompletionRequest,
+        started: Instant,
+        client_wants_usage: bool,
+    ) -> Self {
+        event.model = payload.model.clone();
+        Self {
+            recorder,
+            event,
+            started,
+            client_wants_usage,
+            prompt_chars: prompt_char_len(payload),
+            usage_prompt: None,
+            usage_completion: None,
+            completion_chars: 0,
+            served_model: None,
+        }
+    }
+
+    /// Inspect one parsed chunk or full response body.
+    fn observe_value(&mut self, v: &serde_json::Value) {
+        if self.served_model.is_none() {
+            if let Some(m) = v.get("model").and_then(|m| m.as_str()) {
+                self.served_model = Some(m.to_string());
+            }
+        }
+        if let Some(u) = v.get("usage").filter(|u| u.is_object()) {
+            if let Some(p) = u.get("prompt_tokens").and_then(|x| x.as_u64()) {
+                self.usage_prompt = Some(p);
+            }
+            if let Some(c) = u.get("completion_tokens").and_then(|x| x.as_u64()) {
+                self.usage_completion = Some(c);
+            }
+        }
+        // Choice-less frames (the usage-only chunk) simply contribute nothing here.
+        let Some(choices) = v.get("choices").and_then(|c| c.as_array()) else {
+            return;
+        };
+        for choice in choices {
+            let Some(msg) = choice.get("delta").or_else(|| choice.get("message")) else {
+                continue;
+            };
+            for key in ["content", "reasoning_content", "reasoning"] {
+                if let Some(s) = msg.get(key).and_then(|s| s.as_str()) {
+                    self.completion_chars += s.chars().count() as u64;
+                }
+            }
+            for key in ["tool_calls", "function_call"] {
+                if let Some(tc) = msg.get(key).filter(|t| !t.is_null()) {
+                    self.completion_chars += tc.to_string().chars().count() as u64;
+                }
+            }
+        }
+    }
+
+    /// Inspect one SSE `data:` frame before it is normalized. Returns the text
+    /// to keep, or `None` to drop the frame. Frames this cannot parse pass
+    /// through unchanged (the normalizer drops non-JSON frames itself).
+    ///
+    /// Usage-only frames (`"choices": []` plus a `usage` block) are dropped for
+    /// clients that did not ask for `stream_options.include_usage`, so they see
+    /// the same stream as before. A frame that carries both content and usage
+    /// keeps its content and loses only the `usage` key.
+    fn observe_frame(&mut self, raw: &str) -> Option<String> {
+        let body = raw.trim();
+        let body = body.strip_prefix("data:").unwrap_or(body).trim();
+        if body.is_empty() || body == "[DONE]" {
+            return Some(raw.to_string());
+        }
+        let Ok(mut v) = serde_json::from_str::<serde_json::Value>(body) else {
+            return Some(raw.to_string());
+        };
+        self.observe_value(&v);
+        let usage_present = v.get("usage").map_or(false, |u| !u.is_null());
+        if !usage_present || self.client_wants_usage {
+            return Some(raw.to_string());
+        }
+        let choice_less = v
+            .get("choices")
+            .and_then(|c| c.as_array())
+            .map_or(true, |a| a.is_empty());
+        if choice_less {
+            return None;
+        }
+        if let Some(obj) = v.as_object_mut() {
+            obj.remove("usage");
+        }
+        Some(format!("data: {}", v))
+    }
+}
+
+impl Drop for ChatUsageTracker {
+    fn drop(&mut self) {
+        let (prompt_tokens, prompt_est) = match self.usage_prompt {
+            Some(p) => (p, false),
+            None => (self.prompt_chars / USAGE_CHARS_PER_TOKEN, true),
+        };
+        let (completion_tokens, completion_est) = match self.usage_completion {
+            Some(c) => (c, false),
+            None => (self.completion_chars / USAGE_CHARS_PER_TOKEN, true),
+        };
+        let mut ev = self.event.clone();
+        if let Some(m) = self.served_model.take() {
+            ev.model = m;
+        }
+        ev.prompt_tokens = prompt_tokens;
+        ev.completion_tokens = completion_tokens;
+        ev.estimated = prompt_est || completion_est;
+        ev.status = 200;
+        ev.latency_ms = self.started.elapsed().as_millis() as u64;
+        self.recorder.record(ev);
+    }
+}
+
 #[cfg(test)]
 mod normalize_tests {
     use super::normalize_event_json;
@@ -2280,5 +2501,144 @@ mod extraction_routing_tests {
         local.healthy = false;
         state.register_extraction_backend(local).await;
         assert_eq!(picks(&state, 3).await, vec!["gpu", "gpu", "gpu"]);
+    }
+}
+
+#[cfg(test)]
+mod usage_stream_tests {
+    use super::{normalize_event_json, ChatUsageTracker};
+    use crate::types::ChatCompletionRequest;
+    use crate::usage::{UsageEvent, UsageRecorder};
+    use serde_json::json;
+    use std::time::Instant;
+
+    fn payload(stream_options: Option<serde_json::Value>) -> ChatCompletionRequest {
+        let mut v = json!({
+            "model": "client-model",
+            "messages": [{"role": "user", "content": "abcdefgh"}],
+            "stream": true,
+        });
+        if let Some(o) = stream_options {
+            v["stream_options"] = o;
+        }
+        serde_json::from_value(v).unwrap()
+    }
+
+    fn tracker(
+        wants: bool,
+    ) -> (ChatUsageTracker, tokio::sync::mpsc::UnboundedReceiver<UsageEvent>) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let t = ChatUsageTracker::new(
+            UsageRecorder::with_sender(tx),
+            UsageEvent::default(),
+            &payload(None),
+            Instant::now(),
+            wants,
+        );
+        (t, rx)
+    }
+
+    const CONTENT: &str = r#"data: {"id":"c1","model":"/models/backend.gguf","choices":[{"index":0,"delta":{"content":"Hi"},"finish_reason":null}]}"#;
+    const USAGE_ONLY: &str = r#"data: {"id":"c1","model":"/models/backend.gguf","choices":[],"usage":{"prompt_tokens":12,"completion_tokens":5,"total_tokens":17}}"#;
+
+    #[test]
+    fn usage_only_frame_is_dropped_for_client_that_did_not_opt_in() {
+        let (mut t, _rx) = tracker(false);
+        assert!(t.observe_frame(CONTENT).is_some());
+        assert!(t.observe_frame(USAGE_ONLY).is_none());
+        assert_eq!(t.usage_prompt, Some(12));
+        assert_eq!(t.usage_completion, Some(5));
+    }
+
+    #[test]
+    fn usage_only_frame_is_passed_through_for_client_that_opted_in() {
+        let (mut t, _rx) = tracker(true);
+        let kept = t.observe_frame(USAGE_ONLY).expect("opted-in client keeps usage frame");
+        assert_eq!(kept, USAGE_ONLY);
+        let normalized = normalize_event_json(&kept, "cascade-hybrid-v1").unwrap();
+        assert!(normalized.contains("\"model\":\"cascade-hybrid-v1\""));
+        assert!(normalized.contains("\"prompt_tokens\":12"));
+        assert!(normalized.contains("\"choices\":[]"));
+    }
+
+    #[test]
+    fn usage_on_a_content_frame_is_stripped_but_content_kept() {
+        let frame = r#"data: {"model":"m","choices":[{"index":0,"delta":{"content":"end"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":1}}"#;
+        let (mut t, _rx) = tracker(false);
+        let kept = t.observe_frame(frame).expect("content frame must survive");
+        assert!(!kept.contains("usage"), "usage removed for old clients: {kept}");
+        assert!(kept.contains("\"content\":\"end\""));
+        assert_eq!(t.usage_completion, Some(1));
+    }
+
+    #[test]
+    fn choiceless_frame_without_usage_is_not_dropped() {
+        let (mut t, _rx) = tracker(false);
+        let frame = r#"data: {"id":"c1","choices":[]}"#;
+        assert_eq!(t.observe_frame(frame).as_deref(), Some(frame));
+    }
+
+    #[test]
+    fn malformed_and_done_frames_pass_through_unchanged() {
+        let (mut t, _rx) = tracker(false);
+        assert_eq!(t.observe_frame("data: not json at all").as_deref(), Some("data: not json at all"));
+        assert_eq!(t.observe_frame(": keepalive").as_deref(), Some(": keepalive"));
+        assert_eq!(t.observe_frame("data: [DONE]").as_deref(), Some("data: [DONE]"));
+    }
+
+    #[test]
+    fn recorded_event_uses_upstream_usage_when_present() {
+        let (t, mut rx) = tracker(false);
+        let mut t = t;
+        t.observe_frame(CONTENT);
+        t.observe_frame(USAGE_ONLY);
+        drop(t);
+        let ev = rx.try_recv().expect("one usage event on drop");
+        assert_eq!(ev.prompt_tokens, 12);
+        assert_eq!(ev.completion_tokens, 5);
+        assert!(!ev.estimated);
+        assert_eq!(ev.model, "/models/backend.gguf");
+        assert_eq!(ev.status, 200);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn recorded_event_estimates_when_upstream_sent_no_usage() {
+        let (t, mut rx) = tracker(false);
+        let mut t = t;
+        // "abcdefgh" = 8 prompt chars -> 2 tokens; "Hi" + "there" = 7 chars -> 1 token.
+        t.observe_frame(CONTENT);
+        t.observe_frame(r#"data: {"model":"m","choices":[{"index":0,"delta":{"content":"there"}}]}"#);
+        drop(t);
+        let ev = rx.try_recv().unwrap();
+        assert!(ev.estimated);
+        assert_eq!(ev.prompt_tokens, 2);
+        assert_eq!(ev.completion_tokens, 1);
+        // First served model seen wins (the first frame names the backend).
+        assert_eq!(ev.model, "/models/backend.gguf");
+    }
+
+    #[test]
+    fn non_stream_body_is_metered_from_its_usage_block() {
+        let (mut t, mut rx) = tracker(false);
+        t.observe_value(&json!({
+            "model": "m",
+            "choices": [{"message": {"role": "assistant", "content": "hello"}}],
+            "usage": {"prompt_tokens": 7, "completion_tokens": 2}
+        }));
+        drop(t);
+        let ev = rx.try_recv().unwrap();
+        assert_eq!((ev.prompt_tokens, ev.completion_tokens, ev.estimated), (7, 2, false));
+    }
+
+    #[test]
+    fn prompt_estimate_counts_text_parts_and_tools() {
+        let p: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "abcd"}, {"type": "image_url", "image_url": {"url": "x"}}]}],
+            "tools": [{"type": "function"}]
+        }))
+        .unwrap();
+        assert!(super::prompt_char_len(&p) >= 4);
     }
 }

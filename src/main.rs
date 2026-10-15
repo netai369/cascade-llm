@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use cascade_llm::{cascade_features, config, db, handlers, registry, router, state::{self, GatewayState}};
+use cascade_llm::{cascade_features, config, db, handlers, registry, router, state::{self, GatewayState}, usage};
 use tokio::net::TcpListener;
 use tracing::{info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -87,7 +87,9 @@ async fn main() {
 
     let routing_strategy = app_config.routing_strategy;
     let upstream_seeds = app_config.take_upstream_seeds();
-    let state = Arc::new(GatewayState::new(app_config, metrics, db.clone()));
+    let mut state = GatewayState::new(app_config, metrics, db.clone());
+    state.usage = usage::spawn_worker(db.clone(), state.http_client.clone());
+    let state = Arc::new(state);
 
     state.registry.write().await.set_strategy(routing_strategy);
     for seed in upstream_seeds {

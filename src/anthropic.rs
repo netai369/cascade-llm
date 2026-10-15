@@ -312,6 +312,14 @@ pub fn to_openai_request(req: &AnthropicMessagesRequest) -> ChatCompletionReques
         response_format: None,
         metadata: None,
         route_hint: None,
+        // The Anthropic stream converter reads the terminal usage chunk for
+        // `message_delta.usage`, so it always opts in upstream (the client here
+        // never sees OpenAI frames, only the translated Anthropic events).
+        stream_options: if req.stream.unwrap_or(false) {
+            Some(serde_json::json!({"include_usage": true}))
+        } else {
+            None
+        },
     }
 }
 

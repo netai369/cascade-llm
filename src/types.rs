@@ -160,6 +160,66 @@ pub struct ChatCompletionRequest {
     /// Convenience top-level route hint, e.g. `"ocr"`, `"auxiliary"`, `"inference"`.
     #[serde(default, skip_serializing_if = "Option::is_none", rename = "route")]
     pub route_hint: Option<String>,
+    /// OpenAI `stream_options` (e.g. `{"include_usage": true}`). Kept verbatim so
+    /// the client's opt-in is visible to the stream rewriter; for streamed
+    /// requests the forwarder overrides it upstream (see `state.rs`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_options: Option<Value>,
+}
+
+impl ChatCompletionRequest {
+    /// True when the client asked for the terminal usage chunk
+    /// (`stream_options.include_usage == true`).
+    pub fn client_wants_stream_usage(&self) -> bool {
+        self.stream_options
+            .as_ref()
+            .and_then(|o| o.get("include_usage"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+    }
+}
+
+#[cfg(test)]
+mod chat_request_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn stream_options_round_trips() {
+        let req: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true,
+            "stream_options": {"include_usage": true}
+        }))
+        .unwrap();
+        assert!(req.client_wants_stream_usage());
+        let out = serde_json::to_value(&req).unwrap();
+        assert_eq!(out["stream_options"], json!({"include_usage": true}));
+    }
+
+    #[test]
+    fn absent_stream_options_is_not_serialized() {
+        let req: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "m",
+            "messages": [],
+        }))
+        .unwrap();
+        assert!(!req.client_wants_stream_usage());
+        let out = serde_json::to_value(&req).unwrap();
+        assert!(out.get("stream_options").is_none());
+    }
+
+    #[test]
+    fn explicit_false_include_usage_is_not_opt_in() {
+        let req: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "m",
+            "messages": [],
+            "stream_options": {"include_usage": false}
+        }))
+        .unwrap();
+        assert!(!req.client_wants_stream_usage());
+    }
 }
 
 /// Payload inspection result: which of the three specialized backends a request

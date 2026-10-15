@@ -5,6 +5,7 @@ use tracing::info;
 
 use crate::types::ProviderConfig;
 use crate::registry::{RegisterUpstreamRequest, UpstreamNode};
+use crate::usage::UsageEvent;
 use serde::{Deserialize, Serialize};
 
 #[allow(dead_code)]
@@ -63,6 +64,28 @@ impl Db {
                 updated_at INTEGER NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_upstreams_role ON upstreams(role);
+            CREATE TABLE IF NOT EXISTS usage_events (
+                id TEXT PRIMARY KEY,
+                ts_ms INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                route TEXT NOT NULL,
+                model TEXT NOT NULL,
+                tenant_id TEXT,
+                user_id TEXT,
+                source TEXT,
+                prompt_tokens INTEGER NOT NULL DEFAULT 0,
+                completion_tokens INTEGER NOT NULL DEFAULT 0,
+                audio_seconds REAL NOT NULL DEFAULT 0,
+                characters INTEGER NOT NULL DEFAULT 0,
+                images INTEGER NOT NULL DEFAULT 0,
+                estimated INTEGER NOT NULL DEFAULT 0,
+                metered_upstream INTEGER NOT NULL DEFAULT 0,
+                status INTEGER NOT NULL DEFAULT 0,
+                latency_ms INTEGER NOT NULL DEFAULT 0,
+                delivered INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS idx_usage_ts ON usage_events(ts_ms);
+            CREATE INDEX IF NOT EXISTS idx_usage_undelivered ON usage_events(delivered, ts_ms);
             ",
         )?;
         Ok(())
@@ -217,6 +240,260 @@ impl Db {
             }
         }
         Ok(result)
+    }
+}
+
+/// Usage metering persistence (see `usage.rs`).
+#[allow(dead_code)]
+impl Db {
+    fn now_ms() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64
+    }
+
+    /// Store one usage event as undelivered. Duplicate ids are ignored.
+    pub fn insert_usage(&self, ev: &UsageEvent) -> Result<(), rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO usage_events (
+                id, ts_ms, kind, route, model, tenant_id, user_id, source,
+                prompt_tokens, completion_tokens, audio_seconds, characters, images,
+                estimated, metered_upstream, status, latency_ms, delivered
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, 0)",
+            params![
+                ev.id,
+                ev.ts_ms as i64,
+                ev.kind,
+                ev.route,
+                ev.model,
+                ev.tenant_id,
+                ev.user_id,
+                ev.source,
+                ev.prompt_tokens as i64,
+                ev.completion_tokens as i64,
+                ev.audio_seconds,
+                ev.characters as i64,
+                ev.images as i64,
+                ev.estimated as i64,
+                ev.metered_upstream as i64,
+                ev.status as i64,
+                ev.latency_ms as i64,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Oldest undelivered events first, at most `limit`.
+    pub fn undelivered_usage(&self, limit: usize) -> Result<Vec<UsageEvent>, rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, ts_ms, kind, route, model, tenant_id, user_id, source,
+                    prompt_tokens, completion_tokens, audio_seconds, characters, images,
+                    estimated, metered_upstream, status, latency_ms
+             FROM usage_events WHERE delivered = 0
+             ORDER BY ts_ms, id LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit as i64], |row| {
+            Ok(UsageEvent {
+                id: row.get(0)?,
+                ts_ms: row.get::<_, i64>(1)? as u64,
+                kind: row.get(2)?,
+                route: row.get(3)?,
+                model: row.get(4)?,
+                tenant_id: row.get(5)?,
+                user_id: row.get(6)?,
+                source: row.get(7)?,
+                prompt_tokens: row.get::<_, i64>(8)? as u64,
+                completion_tokens: row.get::<_, i64>(9)? as u64,
+                audio_seconds: row.get(10)?,
+                characters: row.get::<_, i64>(11)? as u64,
+                images: row.get::<_, i64>(12)? as u64,
+                estimated: row.get::<_, i64>(13)? != 0,
+                metered_upstream: row.get::<_, i64>(14)? != 0,
+                status: row.get::<_, i64>(15)? as u16,
+                latency_ms: row.get::<_, i64>(16)? as u64,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()
+    }
+
+    /// Number of events not yet acknowledged by the billing webhook.
+    pub fn pending_usage_count(&self) -> Result<i64, rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT COUNT(*) FROM usage_events WHERE delivered = 0",
+            [],
+            |row| row.get(0),
+        )
+    }
+
+    /// Flag events as delivered in one transaction. Returns rows updated.
+    pub fn mark_usage_delivered(&self, ids: &[String]) -> Result<usize, rusqlite::Error> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let mut updated = 0;
+        {
+            let mut stmt = tx.prepare("UPDATE usage_events SET delivered = 1 WHERE id = ?1")?;
+            for id in ids {
+                updated += stmt.execute(params![id])?;
+            }
+        }
+        tx.commit()?;
+        Ok(updated)
+    }
+
+    /// Aggregate usage since `since_ms` (epoch ms). `group_by` is one of
+    /// `tenant | model | kind | source | day`. Each row carries `key` plus
+    /// `count`, `prompt_tokens`, `completion_tokens`, `audio_seconds`,
+    /// `characters`, `images`.
+    pub fn usage_summary(
+        &self,
+        since_ms: u64,
+        group_by: &str,
+    ) -> Result<Vec<serde_json::Value>, rusqlite::Error> {
+        let key_expr = match group_by {
+            "tenant" => "COALESCE(tenant_id, '(none)')",
+            "model" => "model",
+            "kind" => "kind",
+            "source" => "COALESCE(source, '(none)')",
+            "day" => "strftime('%Y-%m-%d', ts_ms / 1000, 'unixepoch')",
+            other => {
+                return Err(rusqlite::Error::InvalidParameterName(format!(
+                    "unknown group_by '{other}'"
+                )))
+            }
+        };
+        let sql = format!(
+            "SELECT {key_expr} AS k,
+                    COUNT(*),
+                    COALESCE(SUM(prompt_tokens), 0),
+                    COALESCE(SUM(completion_tokens), 0),
+                    COALESCE(SUM(audio_seconds), 0.0),
+                    COALESCE(SUM(characters), 0),
+                    COALESCE(SUM(images), 0)
+             FROM usage_events WHERE ts_ms >= ?1
+             GROUP BY k ORDER BY k"
+        );
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params![since_ms as i64], |row| {
+            Ok(serde_json::json!({
+                "key": row.get::<_, String>(0)?,
+                "count": row.get::<_, i64>(1)?,
+                "prompt_tokens": row.get::<_, i64>(2)?,
+                "completion_tokens": row.get::<_, i64>(3)?,
+                "audio_seconds": row.get::<_, f64>(4)?,
+                "characters": row.get::<_, i64>(5)?,
+                "images": row.get::<_, i64>(6)?,
+            }))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()
+    }
+
+    /// Delete DELIVERED events older than `retention_ms`. Undelivered rows are
+    /// never removed, so nothing unbilled is lost.
+    /// `include_undelivered`: also drop rows that were never delivered (used
+    /// when no webhook is configured, so nothing will ever deliver them).
+    pub fn cleanup_usage(&self, retention_ms: u64, include_undelivered: bool) -> Result<usize, rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        let cutoff = Self::now_ms().saturating_sub(retention_ms) as i64;
+        let sql = if include_undelivered {
+            "DELETE FROM usage_events WHERE ts_ms < ?1"
+        } else {
+            "DELETE FROM usage_events WHERE delivered = 1 AND ts_ms < ?1"
+        };
+        conn.execute(sql, params![cutoff])
+    }
+}
+
+#[cfg(test)]
+mod usage_tests {
+    use super::*;
+    use crate::usage::UsageEvent;
+
+    fn event(id: &str, ts_ms: u64, tenant: Option<&str>, model: &str, kind: &str) -> UsageEvent {
+        UsageEvent {
+            id: id.into(),
+            ts_ms,
+            kind: kind.into(),
+            route: "inference".into(),
+            model: model.into(),
+            tenant_id: tenant.map(String::from),
+            prompt_tokens: 10,
+            completion_tokens: 5,
+            audio_seconds: 1.5,
+            characters: 20,
+            images: 1,
+            status: 200,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn insert_and_summary_group_by_tenant_and_model() {
+        let db = Db::new_in_memory().unwrap();
+        db.insert_usage(&event("a", 1_000, Some("acme"), "m1", "chat")).unwrap();
+        db.insert_usage(&event("b", 2_000, Some("acme"), "m2", "chat")).unwrap();
+        db.insert_usage(&event("c", 3_000, None, "m1", "embeddings")).unwrap();
+        // Duplicate id is ignored.
+        db.insert_usage(&event("a", 1_000, Some("acme"), "m1", "chat")).unwrap();
+
+        let rows = db.usage_summary(0, "tenant").unwrap();
+        assert_eq!(rows.len(), 2);
+        let acme = rows.iter().find(|r| r["key"] == "acme").unwrap();
+        assert_eq!(acme["count"], 2);
+        assert_eq!(acme["prompt_tokens"], 20);
+        assert_eq!(acme["completion_tokens"], 10);
+        assert_eq!(acme["audio_seconds"], 3.0);
+        assert_eq!(acme["characters"], 40);
+        assert_eq!(acme["images"], 2);
+        let none = rows.iter().find(|r| r["key"] == "(none)").unwrap();
+        assert_eq!(none["count"], 1);
+
+        let by_model = db.usage_summary(0, "model").unwrap();
+        assert_eq!(by_model.iter().find(|r| r["key"] == "m1").unwrap()["count"], 2);
+
+        let by_kind = db.usage_summary(0, "kind").unwrap();
+        assert_eq!(by_kind.iter().find(|r| r["key"] == "chat").unwrap()["count"], 2);
+
+        // since filter excludes older rows.
+        let recent = db.usage_summary(2_500, "tenant").unwrap();
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0]["count"], 1);
+
+        assert!(db.usage_summary(0, "bogus").is_err());
+    }
+
+    #[test]
+    fn undelivered_then_mark_delivered_then_cleanup() {
+        let db = Db::new_in_memory().unwrap();
+        db.insert_usage(&event("a", 1_000, Some("t"), "m", "chat")).unwrap();
+        db.insert_usage(&event("b", 2_000, Some("t"), "m", "chat")).unwrap();
+        db.insert_usage(&event("c", 3_000, Some("t"), "m", "chat")).unwrap();
+        assert_eq!(db.pending_usage_count().unwrap(), 3);
+
+        let batch = db.undelivered_usage(2).unwrap();
+        assert_eq!(batch.len(), 2);
+        assert_eq!(batch[0].id, "a");
+        assert_eq!(batch[0], event("a", 1_000, Some("t"), "m", "chat"));
+
+        let updated = db
+            .mark_usage_delivered(&["a".to_string(), "b".to_string()])
+            .unwrap();
+        assert_eq!(updated, 2);
+        assert_eq!(db.pending_usage_count().unwrap(), 1);
+
+        let rest = db.undelivered_usage(10).unwrap();
+        assert_eq!(rest.len(), 1);
+        assert_eq!(rest[0].id, "c");
+
+        // Cleanup only removes delivered rows; retention of 0 ages out "a" and "b".
+        let removed = db.cleanup_usage(0, false).unwrap();
+        assert_eq!(removed, 2);
+        assert_eq!(db.pending_usage_count().unwrap(), 1);
+        assert_eq!(db.usage_summary(0, "tenant").unwrap()[0]["count"], 1);
     }
 }
 
