@@ -1169,6 +1169,7 @@ pub async fn extraction_completions(
     State(state): State<Arc<GatewayState>>,
     req: Request<Body>,
 ) -> Response {
+    let request_headers = req.headers().clone();
     let body_bytes = match req.into_body().collect().await {
         Ok(b) => b.to_bytes(),
         Err(_) => {
@@ -1195,7 +1196,7 @@ pub async fn extraction_completions(
 
     let is_streaming = json.stream.unwrap_or(false);
 
-    match state.route_extraction(json, is_streaming).await {
+    match state.route_extraction(json, is_streaming, &request_headers).await {
         Ok((hdrs, body)) => {
             let mut response = Response::new(body);
             *response.headers_mut() = hdrs;
@@ -1874,24 +1875,28 @@ mod tests {
     /// exactly the sum of every counter prometheus can report.
     #[test]
     fn dashboard_total_is_the_sum_of_every_backend_counter() {
+        // The counters are process-wide statics shared by every test thread,
+        // so the KPI is asserted as a delta over a pre-record snapshot.
         let metrics = crate::cascade_features::MetricsRegistry::init();
+        let recorder = crate::cascade_features::MetricsRegistry::init();
         let labels = crate::cascade_features::MetricsRegistry::backend_labels();
-        // Record on every label, so "the total is the sum" cannot pass by
-        // accident on an empty fixture.
-        for (i, label) in labels.iter().enumerate() {
-            for _ in 0..=i {
-                metrics.record_request(label);
-            }
-        }
-        let expected: u64 = (0..labels.len() as u64).map(|i| i + 1).sum();
-
         let state = Arc::new(GatewayState::new(
             crate::config::AppConfig::from_env(),
             Arc::new(metrics),
             Arc::new(crate::db::Db::new_in_memory().unwrap()),
         ));
+        let before = dashboard_metrics(&state).requests_total;
+        // Record on every label, so "the total is the sum" cannot pass by
+        // accident on an empty fixture.
+        for (i, label) in labels.iter().enumerate() {
+            for _ in 0..=i {
+                recorder.record_request(label);
+            }
+        }
+        let expected: u64 = (0..labels.len() as u64).map(|i| i + 1).sum();
+
         let snapshot = dashboard_metrics(&state);
-        assert_eq!(snapshot.requests_total, expected);
+        assert_eq!(snapshot.requests_total - before, expected);
 
         // ★ The chart reports by REAL ENDPOINT, so it is not one key per label
         // any more — but the property that mattered is stronger now, and is

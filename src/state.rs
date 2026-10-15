@@ -1887,6 +1887,7 @@ impl GatewayState {
         &self,
         payload: ChatCompletionRequest,
         is_streaming: bool,
+        request_headers: &HeaderMap,
     ) -> Result<(HeaderMap, Body), ProxyError> {
         let backend = self
             .select_extraction_backend()
@@ -1909,6 +1910,16 @@ impl GatewayState {
         let mut clean = payload.clone();
         clean.metadata = None;
         clean.route_hint = None;
+        // Usage metering (same rule as `proxy_to_backend`): streams always ask
+        // for the terminal usage chunk; the SSE rewriter strips it again for
+        // clients that did not opt in. Non-streamed calls carry no stream_options.
+        clean.stream_options = if is_streaming {
+            Some(serde_json::json!({"include_usage": true}))
+        } else {
+            None
+        };
+        let client_wants_usage = payload.client_wants_stream_usage();
+        let usage_base = UsageEvent::from_headers(request_headers, "chat", "extraction");
 
         // Forward with API key if provided
         let mut req_builder = self.http_client.post(&url).json(&clean);
@@ -1918,6 +1929,7 @@ impl GatewayState {
             }
         }
 
+        let sent_at = Instant::now();
         let backend_response = match req_builder.send().await {
             Ok(resp) => resp,
             Err(e) => {
@@ -1960,9 +1972,30 @@ impl GatewayState {
         }
 
         if is_streaming {
-            let stream = backend_response
-                .bytes_stream()
-                .map(|item| item.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)));
+            // Owned by the stream closure: records one usage event when the
+            // stream ends or the client disconnects.
+            let mut usage = ChatUsageTracker::new(
+                self.usage.clone(),
+                usage_base,
+                &payload,
+                sent_at,
+                client_wants_usage,
+            );
+            let mut pending: Vec<u8> = Vec::new();
+            let stream = backend_response.bytes_stream().map(move |item| {
+                let chunk = item.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+                pending.extend_from_slice(&chunk);
+                let mut out: Vec<u8> = Vec::new();
+                while let Some(idx) = pending.windows(2).position(|w| w == b"\n\n") {
+                    let frame: Vec<u8> = pending.drain(..idx + 2).collect();
+                    let text = String::from_utf8_lossy(&frame);
+                    if let Some(kept) = usage.observe_frame(text.trim_end()) {
+                        out.extend_from_slice(kept.as_bytes());
+                        out.extend_from_slice(b"\n\n");
+                    }
+                }
+                Ok::<_, std::io::Error>(axum::body::Bytes::from(out))
+            });
             return Ok((headers, Body::from_stream(stream)));
         }
 
@@ -1976,6 +2009,18 @@ impl GatewayState {
                     "failed to read extraction response",
                 )
             })?;
+
+        // Records once when this function returns.
+        let mut usage = ChatUsageTracker::new(
+            self.usage.clone(),
+            usage_base,
+            &payload,
+            sent_at,
+            client_wants_usage,
+        );
+        if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&body_bytes) {
+            usage.observe_value(&v);
+        }
 
         Ok((headers, Body::from(body_bytes)))
     }
@@ -2645,5 +2690,156 @@ mod usage_stream_tests {
         }))
         .unwrap();
         assert!(super::prompt_char_len(&p) >= 4);
+    }
+}
+
+#[cfg(test)]
+mod extraction_usage_tests {
+    use super::*;
+    use crate::cascade_features::MetricsRegistry;
+    use crate::db::Db;
+    use crate::types::{ExtractionBackendType, ExtractionBackendEntry};
+    use crate::usage::{UsageEvent, UsageRecorder};
+    use axum::http::HeaderValue;
+    use axum::response::IntoResponse;
+    use axum::routing::post;
+    use axum::Json;
+    use serde_json::json;
+    use std::sync::Mutex;
+
+    const STREAM_BODY: &str = "data: {\"id\":\"c1\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hi\"},\"finish_reason\":null}]}\n\n\
+data: {\"id\":\"c1\",\"model\":\"m\",\"choices\":[],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":7,\"total_tokens\":18}}\n\n\
+data: [DONE]\n\n";
+
+    /// Mock OpenAI-compatible backend. Records the `stream_options` it received.
+    async fn spawn_backend(seen: Arc<Mutex<Vec<Option<serde_json::Value>>>>) -> String {
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            post(move |Json(body): Json<serde_json::Value>| {
+                let seen = seen.clone();
+                async move {
+                    seen.lock().unwrap().push(body.get("stream_options").cloned());
+                    if body.get("stream").and_then(|s| s.as_bool()).unwrap_or(false) {
+                        ([("content-type", "text/event-stream")], STREAM_BODY.to_string()).into_response()
+                    } else {
+                        Json(json!({
+                            "id": "c2", "model": "m", "object": "chat.completion",
+                            "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+                            "usage": {"prompt_tokens": 11, "completion_tokens": 7, "total_tokens": 18}
+                        }))
+                        .into_response()
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    async fn state_with_backend(url: String) -> (GatewayState, tokio::sync::mpsc::UnboundedReceiver<UsageEvent>) {
+        let mut cfg = AppConfig::from_env();
+        cfg.extraction_strategy = ExtractionStrategy::Priority;
+        let mut state = GatewayState::new(
+            cfg,
+            Arc::new(MetricsRegistry::init()),
+            Arc::new(Db::new_in_memory().unwrap()),
+        );
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        state.usage = UsageRecorder::with_sender(tx);
+        state
+            .register_extraction_backend(ExtractionBackendEntry {
+                id: "mock-extract".to_string(),
+                backend_type: ExtractionBackendType::Local,
+                name: "mock".to_string(),
+                url,
+                model: None,
+                api_key: None,
+                enabled: true,
+                priority: 1,
+                weight: 1,
+                max_cost_per_hour: None,
+                last_validated: None,
+                healthy: true,
+            })
+            .await;
+        (state, rx)
+    }
+
+    fn billing_headers() -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert("x-billing-user-id", HeaderValue::from_static("user-42"));
+        h.insert("x-billing-tenant", HeaderValue::from_static("tenant-a"));
+        h.insert("x-billing-source", HeaderValue::from_static("knowledge-engine"));
+        h
+    }
+
+    fn request(stream: bool) -> ChatCompletionRequest {
+        serde_json::from_value(json!({
+            "model": "extract-model",
+            "messages": [{"role": "user", "content": "extract entities"}],
+            "stream": stream,
+        }))
+        .unwrap()
+    }
+
+    fn assert_attribution(ev: &UsageEvent) {
+        assert_eq!(ev.kind, "chat");
+        assert_eq!(ev.route, "extraction");
+        assert_eq!(ev.user_id.as_deref(), Some("user-42"));
+        assert_eq!(ev.tenant_id.as_deref(), Some("tenant-a"));
+        assert_eq!(ev.source.as_deref(), Some("knowledge-engine"));
+        assert_eq!(ev.prompt_tokens, 11);
+        assert_eq!(ev.completion_tokens, 7);
+        assert!(!ev.estimated);
+        assert_eq!(ev.status, 200);
+    }
+
+    #[tokio::test]
+    async fn non_stream_extraction_emits_exactly_one_usage_event() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let (state, mut rx) = state_with_backend(spawn_backend(seen.clone()).await).await;
+
+        let (_hdrs, body) = state
+            .route_extraction(request(false), false, &billing_headers())
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        assert!(!bytes.is_empty());
+
+        let ev = rx.recv().await.expect("one usage event");
+        assert_attribution(&ev);
+        assert!(rx.try_recv().is_err(), "exactly one event");
+        assert_eq!(seen.lock().unwrap().as_slice(), &[None], "no stream_options on non-stream");
+    }
+
+    #[tokio::test]
+    async fn stream_extraction_forces_usage_and_emits_exactly_one_event() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let (state, mut rx) = state_with_backend(spawn_backend(seen.clone()).await).await;
+
+        let (_hdrs, body) = state
+            .route_extraction(request(true), true, &billing_headers())
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let out = String::from_utf8(bytes.to_vec()).unwrap();
+
+        // Client did not opt in: the usage-only chunk is stripped, content and DONE kept.
+        assert!(out.contains("\"content\":\"Hi\""), "{out}");
+        assert!(out.contains("[DONE]"), "{out}");
+        assert!(!out.contains("prompt_tokens"), "usage chunk must be stripped: {out}");
+
+        let ev = rx.recv().await.expect("one usage event");
+        assert_attribution(&ev);
+        assert!(rx.try_recv().is_err(), "exactly one event");
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            &[Some(json!({"include_usage": true}))],
+            "stream must force include_usage upstream"
+        );
     }
 }
