@@ -764,6 +764,11 @@ pub async fn messages(State(state): State<Arc<GatewayState>>, req: Request<Body>
         .and_then(|v| v.to_str().ok())
         .unwrap_or("standard");
 
+    let permit = match state.tenant_limiter.acquire(&headers).await {
+        Ok(permit) => permit,
+        Err(rej) => return crate::tenant_limit::rejection_response(rej),
+    };
+
     let is_streaming = areq.stream.unwrap_or(false);
     let requested_model = areq.model.clone();
     let message_id = new_message_id();
@@ -781,6 +786,7 @@ pub async fn messages(State(state): State<Arc<GatewayState>>, req: Request<Body>
         .await
     {
         Ok((hdrs, body)) => {
+            let body = crate::tenant_limit::guard_response_body(body, permit);
             if is_streaming {
                 let mut response_headers = HeaderMap::new();
                 response_headers.insert(

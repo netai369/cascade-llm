@@ -19,5 +19,6 @@ pub mod realtime;
 pub mod registry;
 pub mod router;
 pub mod state;
+pub mod tenant_limit;
 pub mod types;
 pub mod usage;

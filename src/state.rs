@@ -158,6 +158,8 @@ pub struct GatewayState {
     /// Usage metering sink (see `usage.rs`). Disabled until `main` installs a
     /// live recorder, so tests and library users pay nothing.
     pub usage: Arc<crate::usage::UsageRecorder>,
+    /// Per-tenant fair-share concurrency gate for LLM generation routes.
+    pub tenant_limiter: Arc<crate::tenant_limit::TenantLimiter>,
 }
 
 
@@ -206,6 +208,9 @@ impl GatewayState {
                 crate::registry::UpstreamRegistry::default(),
             )),
             usage: crate::usage::UsageRecorder::disabled(),
+            tenant_limiter: Arc::new(crate::tenant_limit::TenantLimiter::new(
+                crate::tenant_limit::TenantLimitConfig::from_env(),
+            )),
             runtime: Arc::new(tokio::sync::RwLock::new(crate::types::RuntimeSettings {
                 router_threshold: config.router_threshold,
                 confidence_threshold: config.confidence_threshold,

@@ -81,11 +81,17 @@ pub async fn chat_completions(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("standard");
 
+    let permit = match state.tenant_limiter.acquire(&headers).await {
+        Ok(permit) => permit,
+        Err(rej) => return crate::tenant_limit::rejection_response(rej),
+    };
+
     match state
         .route_request_with_fallback(json, is_streaming, tier, &headers, origin)
         .await
     {
         Ok((hdrs, res_body)) => {
+            let res_body = crate::tenant_limit::guard_response_body(res_body, permit);
             let mut response = Response::new(res_body);
             *response.headers_mut() = hdrs;
             response
