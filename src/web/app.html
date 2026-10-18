@@ -484,14 +484,15 @@
             </label>
           </div>
           <div class="f-row">
-            <label class="f"><span>Models (comma separated)</span><input type="text" id="pe-models" placeholder="gpt-4o, gpt-4o-mini">
-              <span class="h">The first entry is tested and forced onto requests routed here.</span>
+            <label class="f"><span>Model</span>
+              <div class="row" style="gap:.4rem;align-items:center">
+                <select id="pe-model" style="flex:1;min-width:0"><option value="">— load models first —</option></select>
+                <button type="button" class="btn sm" id="pe-load-models">Load models</button>
+              </div>
+              <span class="h" id="pe-model-hint">The chosen model is tested and forced onto requests routed here. Discovery uses the base URL above; for a keyed provider type the key first, because the stored key is not sent for discovery.</span>
             </label>
             <label class="f"><span>Use as</span>
-              <select id="pe-use-as">
-                <option value="main">main — complex chat</option>
-                <option value="auxiliary">auxiliary — fast / compression</option>
-              </select>
+              <select id="pe-use-as"></select>
             </label>
             <label class="f"><span>State</span>
               <select id="pe-enabled"><option value="true">Enabled — in the pool</option><option value="false">Disabled — keep config, serve no traffic</option></select>
@@ -562,23 +563,7 @@
           <div class="btn-row"><button class="btn primary" id="st-save">Save routing settings</button><span class="small faint" id="st-note"></span></div>
         </div>
 
-        <div class="panel">
-          <h2>Chat upstream overrides</h2>
-          <p class="small muted" style="margin-bottom:.8rem">
-            Point a chat role at any OpenAI-compatible endpoint. An override creates a registry node
-            (<code>manual-main</code> / <code>manual-auxiliary</code>) and is shown on the
-            <a href="#" data-goto="backends">Backends</a> page. Clearing the field removes it again.
-          </p>
-          <div class="f-row">
-            <label class="f"><span>Inference URL (main chat)</span><input type="text" id="st-large-url" placeholder="(env default)"></label>
-            <label class="f"><span>Auxiliary URL (fast / compression)</span><input type="text" id="st-small-url" placeholder="(env default)"></label>
-          </div>
-          <div class="f-row">
-            <label class="f"><span>TTS URL</span><input type="text" id="st-tts" placeholder="http://speech-tts:8800/v1/audio"></label>
-            <label class="f"><span>STT URL</span><input type="text" id="st-stt" placeholder="http://speech-stt:5092/v1/audio"></label>
-          </div>
-          <div class="btn-row"><button class="btn primary" id="st-endpoints-save">Save endpoints</button></div>
-        </div>
+        <p class="small muted" style="margin:0 0 1rem">Upstream endpoints (main, auxiliary, speech, transcription, …) are registered under <a href="#" data-goto="providers">Providers → Register an API</a>.</p>
 
         <div class="panel">
           <h2>Reference</h2>
@@ -865,6 +850,23 @@ const PALETTE = ["#3b82f6", "#a78bfa", "#ec4899", "#34d399", "#f59e0b", "#22d3ee
 
 /** Horizontal bars. Labelled values, because an unlabelled axis in a console is
  *  decoration; this is meant to be read, not admired. */
+/* The gateway's metric keys are endpoint groups (cascade_features::endpoint_groups).
+ * Each one is shown with the real path clients call; the group name is kept as a
+ * muted sub-label and in the tooltip, so nothing is truncated away. */
+const ENDPOINT_PATHS = {
+  "inference (main LLM)": "/v1/chat/completions",
+  "auxiliary (aux LLM)": "/v1/chat/completions",
+  "session_affinity (cached target)": "/v1/chat/completions",
+  "ocr (OCR node)": "/ocr/v1/chat/completions",
+  "image (image backend)": "/v1/images/generations",
+  "rag_worker (/v1/rag/extract)": "/v1/rag/extract",
+  "extraction (/extraction/v1)": "/extraction/v1/chat/completions",
+};
+function endpointRow(key, value) {
+  const path = ENDPOINT_PATHS[key] || key;
+  return { label: path, sub: key, title: path + "  —  " + key, value };
+}
+
 function barChart(entries, { unit = "", height = 20, gap = 6, includeZero = false } = {}) {
   // `includeZero` exists for the endpoint inventory: an endpoint with 0
   // requests must still be visible, otherwise "no traffic" and "does not
@@ -876,8 +878,9 @@ function barChart(entries, { unit = "", height = 20, gap = 6, includeZero = fals
   rows.forEach((r, i) => {
     const pct = max ? Math.max(2, (r.value / max) * 100) : 2;
     wrap.append(el("div", {}, [
-      el("div", { class: "row", style: { justifyContent: "space-between", gap: ".4rem" } }, [
-        el("span", { class: "small mono", text: r.label }),
+      el("div", { class: "row", style: { justifyContent: "space-between", gap: ".4rem", flexWrap: "wrap" } }, [
+        el("span", { class: "small mono", text: r.label, attrs: { title: r.title || r.label } },
+          r.sub ? [el("span", { class: "small faint", text: "  " + r.sub })] : []),
         el("span", { class: "small muted nowrap", text: fmtInt(r.value) + unit }),
       ]),
       el("div", { class: "bar-meter", style: { height: height / 2 + "px" } }, [
@@ -1023,7 +1026,7 @@ async function refreshOverview() {
 
   clear($("#ov-chart")).append(barChart(
     Object.entries(d.metrics.requests_by_backend)
-      .map(([k, v]) => ({ label: k, value: v }))
+      .map(([k, v]) => endpointRow(k, v))
       .sort((a, b) => b.value - a.value || a.label.localeCompare(b.label)),
     { includeZero: true }));
 
@@ -1718,6 +1721,42 @@ async function refreshProviders() {
 /* ---- Register an API ------------------------------------------------------ */
 let raModels = [];
 let raCatalog = null;
+let roleCatalog = null; // gateway role_catalog: [{role, path, kinds}], from the admin upstreams listing
+
+async function loadRoleCatalog() {
+  try {
+    const d = cache.upstreams || await api("/web/api/v1/admin/upstreams");
+    roleCatalog = d.role_catalog || [];
+  } catch (err) {
+    roleCatalog = null;
+    toast("Role catalog unavailable: " + err.message, "err", 8000);
+  }
+}
+
+/* Fill a role <select> from the catalog. `allowed` narrows it (e.g. Pollinations). */
+function fillRoleSelect(sel, allowed) {
+  const s = typeof sel === "string" ? $(sel) : sel;
+  const cur = s.value; clear(s);
+  const roles = (roleCatalog || []).filter((r) => !allowed || allowed.includes(r.role));
+  if (!roles.length) {
+    s.append(el("option", { attrs: { value: "" }, text: roleCatalog ? "no roles" : "role catalog unavailable" }));
+    s.disabled = true; return;
+  }
+  s.disabled = false;
+  roles.forEach((r) => s.append(el("option", { attrs: { value: r.role }, text: r.role + " — " + r.path })));
+  s.value = roles.some((r) => r.role === cur) ? cur : roles[0].role;
+}
+
+/* Split models by whether their kind fits the role. Unknown kinds (null) are kept, flagged. */
+function modelsForRole(models, role) {
+  const r = (roleCatalog || []).find((x) => x.role === role);
+  const kinds = r ? (r.kinds || []) : [];
+  return {
+    matching: models.filter((m) => m.kind && kinds.includes(m.kind)),
+    unknown: models.filter((m) => !m.kind),
+    hidden: models.filter((m) => m.kind && !kinds.includes(m.kind)).length,
+  };
+}
 const raProvider = () => $("#ra-provider").value;
 const raEntry = () => (raCatalog && raCatalog.providers || []).find((p) => p.id === raProvider()) || null;
 
@@ -1746,6 +1785,7 @@ function priceSource(m) {
 }
 
 async function raLoadCatalog() {
+  await loadRoleCatalog();
   try {
     raCatalog = await prov("provider-catalog", { timeout: 15000 });
   } catch (err) {
@@ -1767,18 +1807,29 @@ async function raLoadCatalog() {
 
 function fillModelSelect() {
   const sel = $("#ra-model"); clear(sel);
-  if (!raModels.length) {
-    sel.append(el("option", { attrs: { value: "" }, text: "— load models first —" }));
-    sel.disabled = true;
-  } else {
-    sel.disabled = false;
-    raModels.forEach((m) => sel.append(el("option", {
-      attrs: { value: m.id },
-      text: m.id + (m.kind === "image" ? " (image)" : "") + " — " + fmtCtx(m.context_length) + " — " + fmtPrice(m),
-    })));
+  const role = $("#ra-role").value;
+  const { matching, unknown, hidden } = modelsForRole(raModels, role);
+  sel.append(el("option", { attrs: { value: "" }, text: raModels.length ? "— choose a model —" : "— load models first —" }));
+  const label = (m) => m.id + " — " + fmtCtx(m.context_length) + " — " + fmtPrice(m);
+  if (matching.length) {
+    const og = el("optgroup", { attrs: { label: "kind fits " + role } });
+    matching.forEach((m) => og.append(el("option", { attrs: { value: m.id }, text: label(m) })));
+    sel.append(og);
   }
-  $("#ra-model-count").textContent = raModels.length ? raModels.length + " model(s) · prices per 1M tokens" : "";
+  if (unknown.length) {
+    const og = el("optgroup", { attrs: { label: "kind unknown — check before registering" } });
+    unknown.forEach((m) => og.append(el("option", { attrs: { value: m.id }, text: label(m) })));
+    sel.append(og);
+  }
+  sel.disabled = !raModels.length;
+  $("#ra-model-count").textContent = !raModels.length ? "" :
+    matching.length + " fitting · " + unknown.length + " kind unknown" + (hidden ? " · " + hidden + " other-kind hidden" : "") + " · prices per 1M tokens";
   raSyncModel();
+}
+
+function raRoleHint() {
+  const r = (roleCatalog || []).find((x) => x.role === $("#ra-role").value);
+  $("#ra-role-hint").textContent = r ? "Serves model kind: " + (r.kinds || []).join(", ") + ". Path " + r.path : "";
 }
 
 function raSyncForm() {
@@ -1799,14 +1850,8 @@ function raSyncForm() {
   const docs = entry && entry.docs_url;
   $("#ra-docs-wrap").style.display = docs ? "" : "none";
   if (docs) { const a = $("#ra-docs"); a.href = docs; a.textContent = docs; }
-  const roles = [["main", "main — complex chat"], ["auxiliary", "auxiliary — fast / compression"]];
-  if (pol) roles.push(["image", "image — generation"]);
-  const sel = $("#ra-role"); const cur = sel.value; clear(sel);
-  roles.forEach(([v, t]) => sel.append(el("option", { attrs: { value: v }, text: t })));
-  sel.value = roles.some((r) => r[0] === cur) ? cur : "main";
-  $("#ra-role-hint").textContent = pol
-    ? "Image models register under image; text models under main or auxiliary."
-    : "External APIs serve main or auxiliary. Image generation comes from Pollinations or registered image nodes.";
+  fillRoleSelect("#ra-role", pol ? ["main", "auxiliary", "image"] : null);
+  raRoleHint();
   raModels = [];
   fillModelSelect();
 }
@@ -1815,14 +1860,11 @@ function raSyncModel() {
   const m = raModels.find((x) => x.id === $("#ra-model").value);
   $("#ra-register").disabled = !m;
   if (!m) { $("#ra-price").textContent = ""; return; }
-  if (raProvider() === "pollinations") {
-    const sel = $("#ra-role");
-    if (m.kind === "image") sel.value = "image"; else if (sel.value === "image") sel.value = "main";
-  }
   $("#ra-price").textContent = "Context: " + fmtCtx(m.context_length) + " · Price: " + fmtPrice(m) + " — " + priceSource(m);
 }
 
 $("#ra-provider").addEventListener("change", raSyncForm);
+$("#ra-role").addEventListener("change", () => { raRoleHint(); fillModelSelect(); });
 $("#ra-model").addEventListener("change", raSyncModel);
 
 $("#ra-load").addEventListener("click", async (e) => {
@@ -1878,14 +1920,59 @@ $("#ra-register").addEventListener("click", async (e) => {
 
 raLoadCatalog();
 
+let peModels = []; // discovered rows for the provider being edited: [{id, kind, ...}]
+
+/* Model select for the edit form: fitting kinds first, unknown kinds flagged, the
+ * currently stored model always present so an edit never silently drops it. */
+function fillPeModels(selected) {
+  const sel = $("#pe-model"); clear(sel);
+  const role = $("#pe-use-as").value;
+  const { matching, unknown } = modelsForRole(peModels, role);
+  const shown = new Set([...matching, ...unknown].map((m) => m.id));
+  if (selected && !shown.has(selected)) {
+    sel.append(el("optgroup", { attrs: { label: "current" } }, [el("option", { attrs: { value: selected }, text: selected })]));
+  }
+  if (!matching.length && !unknown.length && !selected) {
+    sel.append(el("option", { attrs: { value: "" }, text: "— load models first —" }));
+  }
+  if (matching.length) {
+    sel.append(el("optgroup", { attrs: { label: "kind fits " + role } }, matching.map((m) => el("option", { attrs: { value: m.id }, text: m.id + " — " + fmtCtx(m.context_length) + " — " + fmtPrice(m) }))));
+  }
+  if (unknown.length) {
+    sel.append(el("optgroup", { attrs: { label: "kind unknown — check before saving" } }, unknown.map((m) => el("option", { attrs: { value: m.id }, text: m.id + " — " + fmtCtx(m.context_length) + " — " + fmtPrice(m) }))));
+  }
+  if (selected) sel.value = selected;
+}
+
+$("#pe-use-as").addEventListener("change", () => fillPeModels($("#pe-model").value));
+
+$("#pe-load-models").addEventListener("click", async (e) => {
+  const btn = e.currentTarget;
+  const base = $("#pe-url").value.trim();
+  if (!base.startsWith("http")) { toast("Base URL must start with http:// or https://", "err", 6000); return; }
+  btn.disabled = true; btn.textContent = "Loading…";
+  try {
+    const d = await prov("external-llms/discover", { method: "POST", timeout: 30000,
+      body: { base_url: base, api_key: $("#pe-key").value.trim() || null } });
+    if (!d.ok) throw new Error(d.error || "no models returned");
+    peModels = d.models || [];
+    fillPeModels($("#pe-model").value);
+    toast(peModels.length + " model(s) loaded.");
+  } catch (err) {
+    toast("Load models failed: " + err.message, "err", 8000);
+  } finally { btn.disabled = false; btn.textContent = "Load models"; }
+});
+
 function editProvider(p) {
   editingProvider = p;
   $("#pv-editor-title").textContent = "Edit provider: " + p.name;
   $("#pe-name").value = p.name;
   $("#pe-type").value = (p.provider_type && p.provider_type.type) || p.provider_type || "custom";
   $("#pe-url").value = p.base_url;
-  $("#pe-models").value = (p.models || []).join(", ");
+  peModels = [];
+  fillRoleSelect("#pe-use-as", ["main", "auxiliary"]);
   $("#pe-use-as").value = p.use_as || "main";
+  fillPeModels((p.models || [])[0] || "");
   $("#pe-enabled").value = p.enabled ? "true" : "false";
   $("#pe-key").value = "";
   $("#pe-key-hint").textContent = p.has_key ? "Key " + (p.key_masked || "set") + " is stored. Leave blank to keep it; a new value replaces it." : "No key stored.";
@@ -1898,9 +1985,12 @@ function resetProviderForm() {
   editingProvider = null;
   $("#pv-editor-title").textContent = "Edit gateway provider";
   $("#pv-editor").style.display = "none";
-  ["pe-name", "pe-url", "pe-key", "pe-models"].forEach((i) => { $("#" + i).value = ""; });
+  ["pe-name", "pe-url", "pe-key"].forEach((i) => { $("#" + i).value = ""; });
   $("#pe-type").value = "custom";
+  peModels = [];
+  fillRoleSelect("#pe-use-as", ["main", "auxiliary"]);
   $("#pe-use-as").value = "main";
+  fillPeModels("");
   $("#pe-enabled").value = "true";
   $("#pe-key-hint").textContent = "";
   $("#pe-reset").style.display = "none";
@@ -1908,7 +1998,7 @@ function resetProviderForm() {
 $("#pe-reset").addEventListener("click", resetProviderForm);
 
 function providerPayload() {
-  const models = $("#pe-models").value.split(",").map((s) => s.trim()).filter(Boolean);
+  const models = [$("#pe-model").value].filter(Boolean);
   if (!$("#pe-name").value.trim()) throw new Error("name is required");
   if (!$("#pe-url").value.trim()) throw new Error("base URL is required");
   if (!models.length) throw new Error("at least one model is required");
@@ -2061,10 +2151,6 @@ async function refreshSettings() {
   setField($("#st-hybrid"), r.hybrid_auto ? "true" : "false");
   setField($("#st-hybrid-chars"), r.hybrid_aux_max_chars ?? 600);
   setField($("#st-marker"), r.marker_mode || "substring");
-  setField($("#st-large-url"), s.large_text_url || "");
-  setField($("#st-small-url"), s.small_mllm_url || "");
-  setField($("#st-tts"), s.audio?.tts_url || "");
-  setField($("#st-stt"), s.audio?.stt_url || "");
 }
 
 async function saveRouting() {
@@ -2090,21 +2176,6 @@ async function saveRouting() {
   finally { btn.disabled = false; }
 }
 $("#st-save").addEventListener("click", saveRouting);
-
-$("#st-endpoints-save").addEventListener("click", async () => {
-  const body = {
-    audio: { tts_url: $("#st-tts").value.trim() || null, stt_url: $("#st-stt").value.trim() || null },
-    large_mllm_url: $("#st-large-url").value.trim() || null,
-    small_mllm_url: $("#st-small-url").value.trim() || null,
-  };
-  const btn = $("#st-endpoints-save"); btn.disabled = true;
-  try {
-    await api("/web/api/settings", { method: "PUT", body });
-    toast("Endpoints saved.");
-    await refreshSettings();
-  } catch (e) { toast("Save failed: " + e.message, "err"); }
-  finally { btn.disabled = false; }
-});
 
 async function openDoc(name) {
   try {
