@@ -60,6 +60,7 @@ fn allowed(method: &str, path: &str) -> bool {
         | ("GET", "flavors")
         | ("GET", "model-catalog")
         | ("GET", "external-llms")
+        | ("GET", "provider-catalog")
         | ("GET", "pollinations/models") => true,
 
         // --- fleet lifecycle ---------------------------------------------
@@ -284,6 +285,15 @@ mod tests {
         assert!(allowed("PUT", "external-llms/ext-1a2b3c4d"));
         assert!(allowed("DELETE", "external-llms/ext-1a2b3c4d"));
         assert!(allowed("POST", "external-llms/ext-1a2b3c4d/test"));
+    }
+
+    #[test]
+    fn provider_catalog_read_is_allowed_and_only_as_get() {
+        assert!(allowed("GET", "provider-catalog"));
+        assert!(allowed("POST", "external-llms/discover"));
+        assert!(!allowed("POST", "provider-catalog"));
+        assert!(!allowed("PUT", "provider-catalog"));
+        assert!(!allowed("GET", "provider-catalog/../budget"));
     }
 
     #[test]
