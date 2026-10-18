@@ -58,7 +58,9 @@ fn allowed(method: &str, path: &str) -> bool {
         | ("GET", "providers")
         | ("GET", "settings")
         | ("GET", "flavors")
-        | ("GET", "model-catalog") => true,
+        | ("GET", "model-catalog")
+        | ("GET", "external-llms")
+        | ("GET", "pollinations/models") => true,
 
         // --- fleet lifecycle ---------------------------------------------
         ("POST", "instances")
@@ -67,7 +69,14 @@ fn allowed(method: &str, path: &str) -> bool {
         | ("POST", "cloud-toggle")
         | ("POST", "reconcile")
         | ("PUT", "budget")
-        | ("PUT", "settings") => true,
+        | ("PUT", "settings")
+        | ("POST", "external-llms")
+        | ("POST", "external-llms/discover")
+        | ("POST", "external-llms/reconcile") => true,
+
+        // --- generic OpenAI-compatible endpoints (per entry) --------------
+        // PUT/DELETE `external-llms/{id}` and POST `external-llms/{id}/test`.
+        ("PUT" | "DELETE" | "POST", p) if external_entry_path(method, p) => true,
 
         // --- per-instance / per-node ------------------------------------
         // GET/POST/DELETE on `/inference-nodes/{id}[/{verb}]`. A create call
@@ -89,6 +98,22 @@ fn allowed(method: &str, path: &str) -> bool {
                 })
         }
 
+        _ => false,
+    }
+}
+
+/// `external-llms/{id}` (PUT, DELETE) and `external-llms/{id}/test` (POST).
+/// The id must be a plain slug, same rule as inference-node ids.
+fn external_entry_path(method: &str, p: &str) -> bool {
+    let segs: Vec<&str> = p.split('/').collect();
+    if segs.first() != Some(&"external-llms") || segs.len() < 2 || segs.len() > 3 {
+        return false;
+    }
+    let id_ok = segs[1].chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        && !segs[1].is_empty();
+    match (method, segs.len()) {
+        ("PUT" | "DELETE", 2) => id_ok,
+        ("POST", 3) => id_ok && segs[2] == "test",
         _ => false,
     }
 }
@@ -243,4 +268,32 @@ fn json(body: serde_json::Value, status: StatusCode) -> Response {
         HeaderValue::from_static("application/json"),
     );
     resp
+}
+
+#[cfg(test)]
+mod tests {
+    use super::allowed;
+
+    #[test]
+    fn external_llm_lifecycle_is_allowed() {
+        assert!(allowed("GET", "external-llms"));
+        assert!(allowed("POST", "external-llms"));
+        assert!(allowed("POST", "external-llms/discover"));
+        assert!(allowed("POST", "external-llms/reconcile"));
+        assert!(allowed("GET", "pollinations/models"));
+        assert!(allowed("PUT", "external-llms/ext-1a2b3c4d"));
+        assert!(allowed("DELETE", "external-llms/ext-1a2b3c4d"));
+        assert!(allowed("POST", "external-llms/ext-1a2b3c4d/test"));
+    }
+
+    #[test]
+    fn external_llm_rejects_traversal_and_wrong_verbs() {
+        assert!(!allowed("POST", "external-llms/ext-1/../../budget"));
+        assert!(!allowed("PUT", "external-llms/ext-1/test"));
+        assert!(!allowed("POST", "external-llms/ext-1"));
+        assert!(!allowed("DELETE", "external-llms/ext-1/test"));
+        assert!(!allowed("PUT", "external-llms"));
+        assert!(!allowed("POST", "external-llms/ext%2F1/test"));
+        assert!(!allowed("POST", "external-llms/ext?x=1/test"));
+    }
 }
