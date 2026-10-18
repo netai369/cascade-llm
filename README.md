@@ -80,6 +80,21 @@ self-hosted platform, but it runs standalone and has no NetAI-specific requireme
   scoring. Any other value, including the default `standard`, uses normal complexity routing. See
   [X-Tier](#x-tier-header) below.
 
+**Role table** (registry-first; the static URL is the fallback when no active node exists; full details in `docs/dynamic-upstreams.md`):
+
+| Role | Endpoint(s) | Upstream path | Static fallback |
+|---|---|---|---|
+| `main` | `/v1/chat/completions`, `/v1/messages` | `/chat/completions` | `LARGE_TEXT_URL` |
+| `auxiliary` | aux/compression routing | `/chat/completions` | `SMALL_MLLM_URL` |
+| `ocr` | vision / document parsing | `/chat/completions` | `OCR_URL` |
+| `extraction` | `/extraction/v1/chat/completions` | `/chat/completions` | extraction backends |
+| `rag_worker` | `/v1/rag/extract` | `/chat/completions` | 503 when absent |
+| `embeddings` | `/v1/embeddings` | `/embeddings` | `EMBEDDINGS_URL` |
+| `rerank` | `/v1/rerank` | `/rerank` | `RERANK_URL` |
+| `transcription` | `/v1/audio/transcriptions` | `/audio/transcriptions` | `STT_URL` |
+| `speech` | `/v1/audio/speech` | `/audio/speech` | `TTS_URL` |
+| `image` | `/v1/images/generations` | `/images/generations` | `IMAGE_GENERATION_URL` |
+
 ### Metering and billing hooks
 - **One usage event per billable call**: chat, completions, embeddings, audio, images, video and realtime
   voice sessions are recorded in the local SQLite ledger.

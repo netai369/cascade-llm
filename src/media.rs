@@ -88,8 +88,8 @@ async fn image_generation_dispatch(
     // resolve), and until 2026-10-07 that surfaced as a bare 502 while a
     // working zero-config path sat one function away.
     let mode = state.config.image_mode.as_str();
-    let (parts, body) = req.into_parts();
-    let bytes = match body.collect().await {
+    let (mut parts, body) = req.into_parts();
+    let mut bytes = match body.collect().await {
         Ok(b) => b.to_bytes(),
         Err(_) => {
             return json_response(
@@ -99,6 +99,20 @@ async fn image_generation_dispatch(
         }
     };
     let payload: Option<serde_json::Value> = serde_json::from_slice(&bytes).ok();
+    // Registry node: its bearer authenticates the call and its model alias
+    // replaces the client's model name (same contract as chat/embeddings).
+    if let Some(node) = &node {
+        if let Some(token) = node.bearer_token.as_deref().filter(|t| !t.is_empty()) {
+            if let Ok(value) = axum::http::HeaderValue::from_str(&format!("Bearer {}", token)) {
+                parts.headers.insert(axum::http::header::AUTHORIZATION, value);
+            }
+        }
+        if let Some(model) = node.model.as_deref().filter(|m| !m.is_empty()) {
+            if let Some(rewritten) = crate::registry::force_model_json(&bytes, model) {
+                bytes = axum::body::Bytes::from(rewritten);
+            }
+        }
+    }
 
     // `free`: the free tier IS the backend — the local node is not tried.
     if mode == "free" {
@@ -381,7 +395,8 @@ async fn proxy_request(state: Arc<GatewayState>, req: Request<Body>, target_url:
 
     let mut proxy_req = state.http_client.request(method, target_url);
     for (key, value) in headers.iter() {
-        if key != "host" {
+        // reqwest recomputes content-length; a model rewrite changes the body size.
+        if key != "host" && key != "content-length" {
             proxy_req = proxy_req.header(key.clone(), value.clone());
         }
     }

@@ -10,6 +10,7 @@ use http_body_util::BodyExt;
 use std::sync::Arc;
 use tracing::{info, warn};
 
+use crate::registry;
 use crate::state::{passthrough_usage, GatewayState};
 use crate::usage::UsageEvent;
 use axum::http::HeaderMap;
@@ -55,6 +56,7 @@ async fn proxy_json_api(state: Arc<GatewayState>, req: Request<Body>, service: &
             .header("content-type", "application/json")
             .body(Body::from(body.to_string())).unwrap();
     }
+    let node_model = node.as_ref().and_then(|n| n.model.clone()).filter(|m| !m.is_empty());
     let (target_url, bearer, node_id) = if let Some(node) = node {
         let base = node.endpoint_url.trim_end_matches('/');
         let target = if base.ends_with(endpoint) {
@@ -82,10 +84,18 @@ async fn proxy_json_api(state: Arc<GatewayState>, req: Request<Body>, service: &
         }
     };
     let request_body = body.clone();
+    // Per-node model alias (hosted APIs): rewrite the JSON body's `model`.
+    let send_body = match node_model.as_deref() {
+        Some(model) => registry::force_model_json(&body, model)
+            .map(axum::body::Bytes::from)
+            .unwrap_or_else(|| body.clone()),
+        None => body,
+    };
 
+    // reqwest recomputes content-length; the rewritten body may differ in size.
     let mut upstream = state.http_client.request(method, target_url);
     for (key, value) in &headers {
-        if key != "host" && key != "authorization" {
+        if key != "host" && key != "authorization" && key != "content-length" {
             upstream = upstream.header(key, value);
         }
     }
@@ -95,7 +105,7 @@ async fn proxy_json_api(state: Arc<GatewayState>, req: Request<Body>, service: &
         upstream = upstream.header("authorization", value);
     }
 
-    match upstream.body(body).send().await {
+    match upstream.body(send_body).send().await {
         Ok(response) => {
             let status = response.status();
             let response_headers = response.headers().clone();

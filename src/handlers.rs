@@ -734,6 +734,21 @@ pub async fn update_settings(
             }
         }
     }
+    // TTS/STT overrides are registry nodes too (`manual-speech` /
+    // `manual-transcription`), so a changed URL takes effect without a restart.
+    // An explicit empty value drops the node and falls back to the static URL.
+    for (role, base) in [("speech", &settings.audio.tts_url), ("transcription", &settings.audio.stt_url)] {
+        let Some(base) = base else { continue };
+        match crate::registry::audio_override_request(role, base) {
+            Some((_, req)) => {
+                state.registry.write().await.upsert(role, req);
+            }
+            None => {
+                let id = if role == "speech" { "manual-speech" } else { "manual-transcription" };
+                state.registry.write().await.remove_id(id);
+            }
+        }
+    }
     // Persist only the runtime-owned subset. Sending the whole `Settings`
     // back would overwrite the stored providers list with the settings page's
     // *redacted* copy (api_key: null), i.e. a read would silently delete every
@@ -1925,7 +1940,14 @@ mod tests {
             );
         }
 
-        let charted: u64 = snapshot.requests_by_backend.values().sum();
+        // Route groups account for the KPI; endpoint-hit groups (keyed by path)
+        // are reported beside it and are not part of the KPI total.
+        let charted: u64 = snapshot
+            .requests_by_backend
+            .iter()
+            .filter(|(k, _)| !k.starts_with("/v1/"))
+            .map(|(_, v)| *v)
+            .sum();
         assert_eq!(
             charted, snapshot.requests_total,
             "the chart must account for every request the KPI counts"

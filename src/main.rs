@@ -19,6 +19,10 @@ async fn main() {
     info!("cascade-llm v{}", env!("CARGO_PKG_VERSION"));
 
     let mut app_config = config::AppConfig::from_env();
+    // Saved TTS/STT URL overrides (console "Chat upstream overrides" era),
+    // migrated into registry nodes below.
+    let mut saved_tts_url: Option<String> = None;
+    let mut saved_stt_url: Option<String> = None;
 
     let large_model_multimodal = match std::env::var("LARGE_MODEL_MULTIMODAL") {
         Ok(v) => v.eq_ignore_ascii_case("true"),
@@ -78,8 +82,14 @@ async fn main() {
                 if let Some(v) = saved.routing.hybrid_auto { app_config.hybrid_auto = v; }
                 if let Some(n) = saved.routing.hybrid_aux_max_chars { app_config.hybrid_aux_max_chars = n; }
                 app_config.marker_mode = saved.routing.marker_mode.clone();
-                if let Some(u) = &saved.audio.tts_url { app_config.tts_url = migrate_tts_url(u); }
-                if let Some(u) = &saved.audio.stt_url { app_config.stt_url = u.clone(); }
+                if let Some(u) = &saved.audio.tts_url {
+                    app_config.tts_url = migrate_tts_url(u);
+                    saved_tts_url = Some(app_config.tts_url.clone());
+                }
+                if let Some(u) = &saved.audio.stt_url {
+                    app_config.stt_url = u.clone();
+                    saved_stt_url = Some(u.clone());
+                }
             }
             Err(e) => warn!("Persisted settings unreadable: {}", e),
         }
@@ -116,6 +126,20 @@ async fn main() {
             }
         }
         Err(e) => warn!("Cannot restore persisted upstreams: {}", e),
+    }
+
+    // Saved TTS/STT URLs become `manual-speech` / `manual-transcription` nodes.
+    // Idempotent (fixed node ids); the static TTS_URL / STT_URL stay the fallback.
+    {
+        let mut registry = state.registry.write().await;
+        let migrated = registry::migrate_audio_overrides(
+            &mut registry,
+            saved_tts_url.as_deref(),
+            saved_stt_url.as_deref(),
+        );
+        if migrated > 0 {
+            info!("Migrated {} saved TTS/STT URL override(s) into registry nodes", migrated);
+        }
     }
 
     // Providers saved earlier re-enter the runtime registry here.

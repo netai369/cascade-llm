@@ -6,16 +6,53 @@ the admin API is disabled).
 
 ## Roles
 
-| Role        | Purpose                                            | Static fallback (env)      |
-|-------------|----------------------------------------------------|----------------------------|
-| `main`      | Default chat & reasoning                           | `LARGE_TEXT_URL`           |
-| `auxiliary` | Compression / summarization / fast text            | `SMALL_MLLM_URL`           |
-| `ocr`       | Vision / document parsing                          | `OCR_URL`                  |
-| `image`     | Image generation (SDXL/Flux/zimage)                | `IMAGE_GENERATION_URL`     |
-| `rag_worker`| Heavy LightRAG graph-extraction jobs               | none (503 when absent)     |
+Every endpoint that serves traffic routes to a registered node of its role
+first. The static config URL is the fallback used only while no active,
+healthy node is registered for that role.
 
-Legacy alias: role path `inference` maps to `main` (backward compatibility with
-existing provisioners).
+| Role            | Endpoint(s) served                          | Upstream path on the node         | Static fallback (env)                          | Probe            |
+|-----------------|---------------------------------------------|-----------------------------------|------------------------------------------------|------------------|
+| `main`          | `/v1/chat/completions`, `/v1/messages`, LLM | `/chat/completions`               | `LARGE_TEXT_URL`                               | `/health`        |
+| `auxiliary`     | compression / fast text, chat aux routing   | `/chat/completions`               | `SMALL_MLLM_URL`                               | `/health`        |
+| `ocr`           | document / vision parsing                   | `/chat/completions`               | `OCR_URL`                                      | `/health`        |
+| `extraction`    | `/extraction/v1/chat/completions`           | `/chat/completions`               | configured extraction backends (`/extraction/v1/backends`) | `/health`   |
+| `rag_worker`    | `/v1/rag/extract`                           | `/chat/completions`               | none (503 when absent)                         | `/health`        |
+| `embeddings`    | `/v1/embeddings`                            | `/embeddings`                     | `EMBEDDINGS_URL`                               | `/v1/models`     |
+| `rerank`        | `/v1/rerank`                                | `/rerank`                         | `RERANK_URL`                                   | `/v1/models`     |
+| `transcription` | `/v1/audio/transcriptions` (multipart)      | `/audio/transcriptions`           | `STT_URL` (`/v1/audio/diarize` stays on it)    | `/v1/models`     |
+| `speech`        | `/v1/audio/speech` (streamed audio)         | `/audio/speech`                   | `TTS_URL`                                      | `/v1/models`     |
+| `image`         | `/v1/images/generations`                    | `/images/generations`             | `IMAGE_GENERATION_URL` (+ Pollinations fallback) | `/v1/models`   |
+
+Aliases accepted on the admin API: `inference` → `main`, `aux` → `auxiliary`,
+`vision` → `ocr`, `stt` → `transcription`, `tts` → `speech`, `reranker` →
+`rerank`, `embedding` → `embeddings`, `img` → `image`, `rag` → `rag_worker`.
+The role catalog (path and model kind per role) is served on the upstream
+listings as `role_catalog`.
+
+Node selection, health and metering are the same for every role: weighted
+round-robin or least-latency over active + healthy nodes, a per-node `model`
+alias rewrites the outgoing request (JSON `model`, or the multipart `model`
+field for transcription), a per-node `bearer_token` authenticates it, and each
+successful call records exactly one usage event (`chat` for extraction,
+`embeddings`, `rerank`, `audio_transcription` by duration, `audio_speech` by
+input characters, `image` by image count).
+
+### Migration of the saved TTS / STT URLs
+
+The console's "Chat upstream overrides" no longer edit chat URLs as the only
+override path. Saved TTS and STT URLs (`settings.audio.tts_url` /
+`stt_url`) are converted at startup into registry nodes:
+
+* `tts_url` → node of role `speech`, id and label `manual-speech`, endpoint
+  `<base>/v1/audio/speech`
+* `stt_url` → node of role `transcription`, id and label `manual-transcription`,
+  endpoint `<base>/v1/audio/transcriptions`
+
+Both base forms (`http://host:port` and `http://host:port/v1/audio`) are
+accepted. The migration is idempotent (fixed node ids), runs on every start and
+also when settings are saved, where an empty value removes the node again. The
+`manual-main` / `manual-auxiliary` chat nodes are unchanged. The static
+`TTS_URL` / `STT_URL` remain the fallback whenever no node is active.
 
 ## REST API
 
@@ -86,14 +123,33 @@ GET  /web/api/upstreams                # legacy-compatible list view
 
 ## Health checks
 
-A background prober hits `<origin>/health` on every registered node every
-`HEALTH_CHECK_INTERVAL_SECS` (default 30). Any HTTP response below 500 counts
-as alive (minimal workers without a `/health` route — 404/405 — stay in the
-pool); 5xx and connection failures count as failed. After
-`HEALTH_CHECK_FAILURE_THRESHOLD` consecutive failures (default 2) a node is
-demoted (unhealthy) and stops receiving traffic; a later successful probe
-promotes it again automatically. Latency-to-first-byte of successful probes
-and of real proxied requests (EMA) is tracked per node.
+A background prober checks every registered node every
+`HEALTH_CHECK_INTERVAL_SECS` (default 30). The probe depends on the role:
+
+* Chat-style roles (`main`, `auxiliary`, `ocr`, `extraction`, `rag_worker`)
+  GET `<origin>/health`.
+* Embeddings, rerank, transcription, speech and image nodes GET
+  `<origin>/v1/models`. They never receive a chat-style probe, and a failing
+  chat endpoint cannot demote them.
+* A 404 or 405 on the primary probe falls back to the other one. Any 2xx or
+  3xx response counts as alive; everything else, and connection errors, count as
+  failed. An explicit `health_url` on a node overrides the primary probe.
+
+After `HEALTH_CHECK_FAILURE_THRESHOLD` consecutive failures (default 2) a node is
+demoted and stops receiving traffic; a later successful probe promotes it again.
+Latency-to-first-byte of probes and of proxied requests (EMA) is tracked per
+node.
+
+## Endpoint request counters (overview)
+
+The overview's "Requests by endpoint" lists the route groups (`inference (main
+LLM)`, `auxiliary (aux LLM)`, `ocr`, `image`, `rag_worker`, `extraction`,
+`session_affinity`) plus one group per endpoint, keyed by its full path:
+`/v1/messages`, `/v1/realtime`, `/v1/embeddings`, `/v1/rerank`,
+`/v1/audio/transcriptions`, `/v1/audio/speech`, `/v1/audio/diarize`,
+`/v1/video/generations`, `/v1/models`. Idle endpoints show 0. Path counters are
+endpoint hits and are not part of the `requests_total` KPI, because a
+`/v1/messages` call is also counted through its route group.
 
 ## Routing strategies
 

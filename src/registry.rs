@@ -217,6 +217,25 @@ pub struct UpstreamNode {
     pub registered_at: String,
 }
 
+/// How a role's node is probed. Chat-style roles keep the historical
+/// `/health` probe; the non-chat roles (embeddings, rerank, audio, image) use
+/// a cheap model-listing GET instead, so their health never depends on a chat
+/// completion and a failing chat endpoint cannot demote them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbeKind {
+    /// `<origin>/health`, falling back to `<origin>/v1/models` on 404/405.
+    Health,
+    /// `<origin>/v1/models`, falling back to `<origin>/health` on 404/405.
+    Models,
+}
+
+pub fn probe_kind(role: &str) -> ProbeKind {
+    match role {
+        "embeddings" | "rerank" | "transcription" | "speech" | "image" => ProbeKind::Models,
+        _ => ProbeKind::Health,
+    }
+}
+
 impl UpstreamNode {
     /// Health probe target: explicit override or `<origin>/health`.
     pub fn probe_url(&self) -> String {
@@ -225,6 +244,141 @@ impl UpstreamNode {
         }
         format!("{}/health", origin_of(&self.endpoint_url))
     }
+
+    /// `(primary, fallback)` probe URLs for this node's role. An explicit
+    /// `health_url` always wins as the primary target.
+    pub fn probe_targets(&self) -> (String, String) {
+        let origin = origin_of(&self.endpoint_url);
+        let health = format!("{}/health", origin);
+        let models = format!("{}/v1/models", origin);
+        let (kind_primary, kind_fallback) = match probe_kind(&self.role) {
+            ProbeKind::Health => (health.clone(), models.clone()),
+            ProbeKind::Models => (models, health),
+        };
+        match &self.health_url {
+            Some(explicit) => (explicit.clone(), kind_fallback),
+            None => (kind_primary, kind_fallback),
+        }
+    }
+}
+
+/// Forces `model` onto a JSON request body (`{"model": ...}`). Returns `None`
+/// when the body is not a JSON object or already names that model, so the
+/// caller keeps the original bytes.
+pub fn force_model_json(body: &[u8], model: &str) -> Option<Vec<u8>> {
+    let mut value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let obj = value.as_object_mut()?;
+    if obj.get("model").and_then(|m| m.as_str()) == Some(model) {
+        return None;
+    }
+    obj.insert("model".to_string(), serde_json::Value::String(model.to_string()));
+    serde_json::to_vec(&value).ok()
+}
+
+/// Forces `model` onto a `multipart/form-data` body (the OpenAI transcription
+/// `model` form field). Only the value of the `name="model"` part changes;
+/// every other byte, including binary audio parts, is copied verbatim.
+pub fn force_model_multipart(body: &[u8], content_type: &str, model: &str) -> Option<Vec<u8>> {
+    let boundary = content_type
+        .split(';')
+        .map(str::trim)
+        .find_map(|p| p.strip_prefix("boundary="))?
+        .trim_matches('"');
+    let delim = format!("--{}", boundary);
+    let delim = delim.as_bytes();
+    let parts = split_bytes(body, delim);
+    let mut changed = false;
+    let rewritten: Vec<Vec<u8>> = parts
+        .iter()
+        .map(|part| {
+            let Some(head_end) = find_bytes(part, b"\r\n\r\n") else {
+                return part.to_vec();
+            };
+            let headers = String::from_utf8_lossy(&part[..head_end]);
+            if !headers.contains("name=\"model\"") {
+                return part.to_vec();
+            }
+            let value = &part[head_end + 4..];
+            let trailer: &[u8] = if value.ends_with(b"\r\n") { b"\r\n" } else { b"" };
+            let mut out = part[..head_end + 4].to_vec();
+            out.extend_from_slice(model.as_bytes());
+            out.extend_from_slice(trailer);
+            if out.as_slice() != *part {
+                changed = true;
+            }
+            out
+        })
+        .collect();
+    if !changed {
+        return None;
+    }
+    let mut out = Vec::with_capacity(body.len());
+    for (i, part) in rewritten.iter().enumerate() {
+        if i > 0 {
+            out.extend_from_slice(delim);
+        }
+        out.extend_from_slice(part);
+    }
+    Some(out)
+}
+
+fn find_bytes(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    hay.windows(needle.len()).position(|w| w == needle)
+}
+
+fn split_bytes<'a>(hay: &'a [u8], delim: &[u8]) -> Vec<&'a [u8]> {
+    let mut out = Vec::new();
+    let mut rest = hay;
+    while let Some(pos) = find_bytes(rest, delim) {
+        out.push(&rest[..pos]);
+        rest = &rest[pos + delim.len()..];
+    }
+    out.push(rest);
+    out
+}
+
+/// Registration payload for a saved TTS/STT override: a `speech` or
+/// `transcription` node with a fixed id, so re-applying it is idempotent.
+/// `base` may carry the trailing `/v1/audio` (both forms are accepted).
+pub fn audio_override_request(role: &str, base: &str) -> Option<(String, RegisterUpstreamRequest)> {
+    let (id, path) = match role {
+        "speech" => ("manual-speech", "/v1/audio/speech"),
+        "transcription" => ("manual-transcription", "/v1/audio/transcriptions"),
+        _ => return None,
+    };
+    let base = base.trim();
+    if base.is_empty() || !base.starts_with("http") {
+        return None;
+    }
+    let endpoint = crate::audio::audio_target(base, path);
+    Some((
+        id.to_string(),
+        RegisterUpstreamRequest {
+            endpoint_url: Some(endpoint),
+            id: Some(id.to_string()),
+            label: Some(id.to_string()),
+            ..Default::default()
+        },
+    ))
+}
+
+/// Startup migration for the retired console "Chat upstream overrides" TTS/STT
+/// fields: a saved `tts_url` / `stt_url` becomes a `manual-speech` /
+/// `manual-transcription` node in the registry. Idempotent (explicit node ids),
+/// so it can run on every start. The static config URLs stay the fallback.
+pub fn migrate_audio_overrides(
+    registry: &mut UpstreamRegistry,
+    tts_url: Option<&str>,
+    stt_url: Option<&str>,
+) -> usize {
+    let mut migrated = 0;
+    for (role, base) in [("speech", tts_url), ("transcription", stt_url)] {
+        if let Some((_, req)) = base.and_then(|b| audio_override_request(role, b)) {
+            registry.upsert(role, req);
+            migrated += 1;
+        }
+    }
+    migrated
 }
 
 /// Strips any known API path suffix, leaving `scheme://host[:port]`.
@@ -236,6 +390,8 @@ pub(crate) fn origin_of(url: &str) -> String {
         "/v1/video/generations",
         "/v1/audio/speech",
         "/v1/audio/transcriptions",
+        "/v1/embeddings",
+        "/v1/rerank",
         "/chat/completions",
         "/v1",
     ];
@@ -582,19 +738,40 @@ pub fn spawn_health_prober(state: std::sync::Arc<crate::state::GatewayState>) {
     });
 }
 
+/// One GET probe. `None` means the endpoint does not exist on that server
+/// (404/405) and the caller should try its fallback; `Some(alive)` otherwise.
+/// Nodes behind an API key answer 401 without the bearer, so it is attached.
+async fn probe_once(client: &reqwest::Client, url: &str, bearer: Option<&str>) -> Option<bool> {
+    let mut req = client.get(url);
+    if let Some(token) = bearer.filter(|t| !t.is_empty()) {
+        req = req.bearer_auth(token);
+    }
+    match req.send().await {
+        Ok(r) if matches!(r.status().as_u16(), 404 | 405) => None,
+        Ok(r) => Some(r.status().is_success() || r.status().is_redirection()),
+        Err(_) => Some(false),
+    }
+}
+
 /// One full probe pass over all registered nodes (bounded concurrency).
 /// Also triggered manually via `POST /api/v1/admin/upstreams/probe`.
 pub async fn run_health_sweep(
     state: &std::sync::Arc<crate::state::GatewayState>,
     client: &reqwest::Client,
 ) {
-    let targets: Vec<(String, String, Option<String>)> = state
+    // (id, primary probe, fallback probe, bearer) per node; the probe kind is
+    // role-specific (see `probe_kind`), so audio/image/embedding nodes never
+    // receive a chat-style probe.
+    let targets: Vec<(String, String, String, Option<String>)> = state
         .registry
         .read()
         .await
         .nodes()
         .iter()
-        .map(|n| (n.id.clone(), n.probe_url(), n.bearer_token.clone()))
+        .map(|n| {
+            let (primary, fallback) = n.probe_targets();
+            (n.id.clone(), primary, fallback, n.bearer_token.clone())
+        })
         .collect();
     if targets.is_empty() {
         return;
@@ -602,31 +779,12 @@ pub async fn run_health_sweep(
 
     let threshold = state.config.health_failure_threshold;
     let results = futures_util::stream::iter(targets)
-        .map(|(id, url, bearer)| async move {
+        .map(|(id, primary, fallback, bearer)| async move {
             let start = Instant::now();
-            // Nodes behind an API key answer 401 without the bearer, so attach
-            // the registered token when present. Missing `/health` falls back
-            // to OpenAI model discovery below.
-            let mut req = client.get(&url);
-            if let Some(token) = &bearer {
-                if !token.is_empty() {
-                    req = req.bearer_auth(token);
-                }
-            }
-            let ok = match req.send().await {
-                Ok(response) if response.status().is_success() || response.status().is_redirection() => true,
-                // Some OpenAI-compatible servers have no `/health`. Probe the
-                // discovery endpoint instead of treating an arbitrary 404 as
-                // healthy (a restarted native Mac process should demote/recover).
-                Ok(response) if matches!(response.status().as_u16(), 404 | 405) => {
-                    let models_url = format!("{}/v1/models", origin_of(&url));
-                    let mut fallback = client.get(models_url);
-                    if let Some(token) = &bearer {
-                        if !token.is_empty() { fallback = fallback.bearer_auth(token); }
-                    }
-                    fallback.send().await.map(|r| r.status().is_success() || r.status().is_redirection()).unwrap_or(false)
-                }
-                Ok(_) | Err(_) => false,
+            let ok = match probe_once(client, &primary, bearer.as_deref()).await {
+                Some(alive) => alive,
+                // Endpoint missing on this server (404/405): try the other probe.
+                None => probe_once(client, &fallback, bearer.as_deref()).await.unwrap_or(false),
             };
             (id, ok, start.elapsed().as_millis() as u64)
         })
@@ -801,6 +959,88 @@ mod tests {
         assert_eq!(node.probe_url(), "http://zimage:1234/health");
         let node = reg_node("https://api.example.com/v1");
         assert_eq!(node.probe_url(), "https://api.example.com/health");
+    }
+
+    #[test]
+    fn probe_kind_is_role_specific() {
+        assert_eq!(probe_kind("main"), ProbeKind::Health);
+        assert_eq!(probe_kind("extraction"), ProbeKind::Health);
+        for role in ["embeddings", "rerank", "transcription", "speech", "image"] {
+            assert_eq!(probe_kind(role), ProbeKind::Models, "{role}");
+        }
+    }
+
+    #[test]
+    fn probe_targets_follow_role_kind() {
+        let mut reg = UpstreamRegistry::default();
+        let speech = reg.upsert("speech", req("http://tts:8800/v1/audio/speech")).node;
+        assert_eq!(
+            speech.probe_targets(),
+            ("http://tts:8800/v1/models".to_string(), "http://tts:8800/health".to_string())
+        );
+        let embed = reg.upsert("embeddings", req("http://emb:8801/v1/embeddings")).node;
+        assert_eq!(embed.probe_targets().0, "http://emb:8801/v1/models");
+        let chat = reg.upsert("main", req("http://llm:8000/v1/chat/completions")).node;
+        assert_eq!(
+            chat.probe_targets(),
+            ("http://llm:8000/health".to_string(), "http://llm:8000/v1/models".to_string())
+        );
+        let mut explicit = req("http://tts:8800/v1/audio/speech");
+        explicit.health_url = Some("http://tts:9000/ready".to_string());
+        let custom = reg.upsert("speech", explicit).node;
+        assert_eq!(custom.probe_targets().0, "http://tts:9000/ready");
+    }
+
+    #[test]
+    fn origin_strips_embeddings_and_rerank_paths() {
+        assert_eq!(origin_of("http://emb:8801/v1/embeddings"), "http://emb:8801");
+        assert_eq!(origin_of("http://emb:8801/v1/rerank"), "http://emb:8801");
+    }
+
+    #[test]
+    fn force_model_json_rewrites_only_when_different() {
+        let out = force_model_json(br#"{"model":"a","input":"x"}"#, "b").unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["model"], "b");
+        assert_eq!(v["input"], "x");
+        assert!(force_model_json(br#"{"model":"b"}"#, "b").is_none());
+        assert!(force_model_json(b"not json", "b").is_none());
+    }
+
+    #[test]
+    fn force_model_multipart_touches_only_the_model_part() {
+        let body = b"--XB\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nold\r\n--XB\r\nContent-Disposition: form-data; name=\"file\"\r\n\r\nAUDIO\r\n--XB--\r\n";
+        let out = force_model_multipart(body, "multipart/form-data; boundary=XB", "new-model").unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("name=\"model\"\r\n\r\nnew-model\r\n--XB"));
+        assert!(text.contains("AUDIO\r\n--XB--"));
+        assert!(force_model_multipart(body, "multipart/form-data; boundary=XB", "old").is_none());
+        assert!(force_model_multipart(body, "application/json", "x").is_none());
+    }
+
+    #[test]
+    fn audio_overrides_migrate_idempotently_to_speech_and_transcription_nodes() {
+        let mut reg = UpstreamRegistry::default();
+        // Both base forms are accepted and normalize to the same endpoints.
+        let n = migrate_audio_overrides(&mut reg, Some("http://speech-tts:8800"), Some("http://stt:5092/v1/audio"));
+        assert_eq!(n, 2);
+        assert_eq!(migrate_audio_overrides(&mut reg, Some("http://speech-tts:8800"), Some("http://stt:5092/v1/audio")), 2);
+        assert_eq!(reg.nodes().len(), 2, "re-running the migration must not duplicate nodes");
+        let speech = reg.pick("speech").unwrap();
+        assert_eq!(speech.endpoint_url, "http://speech-tts:8800/v1/audio/speech");
+        assert_eq!(speech.id, "manual-speech");
+        assert_eq!(speech.label.as_deref(), Some("manual-speech"));
+        let stt = reg.pick("transcription").unwrap();
+        assert_eq!(stt.endpoint_url, "http://stt:5092/v1/audio/transcriptions");
+        assert_eq!(stt.label.as_deref(), Some("manual-transcription"));
+
+        // A changed URL updates the same node instead of adding one.
+        migrate_audio_overrides(&mut reg, Some("http://tts-new:8800"), None);
+        assert_eq!(reg.pick("speech").unwrap().endpoint_url, "http://tts-new:8800/v1/audio/speech");
+        assert_eq!(reg.nodes().len(), 2);
+
+        // Empty or non-http values migrate nothing.
+        assert_eq!(migrate_audio_overrides(&mut UpstreamRegistry::default(), Some(""), Some("ws://x")), 0);
     }
 
     fn reg_node(url: &str) -> UpstreamNode {

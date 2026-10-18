@@ -253,6 +253,20 @@ pub fn build_router(state: Arc<GatewayState>) -> Router {
             put(handlers::put_upstream).delete(handlers::delete_upstream),
         )
         .route("/settings", get(handlers::settings_redirect))
+        .layer(middleware::from_fn_with_state(state.clone(), count_endpoint_hit))
         .with_state(state)
         .layer(DefaultBodyLimit::disable())
+}
+
+/// Counts one hit per request on the endpoints listed in
+/// `MetricsRegistry::endpoint_path_labels`, for the overview's per-endpoint chart.
+async fn count_endpoint_hit(
+    axum::extract::State(state): axum::extract::State<Arc<GatewayState>>,
+    req: axum::extract::Request,
+    next: middleware::Next,
+) -> axum::response::Response {
+    if let Some(label) = cascade_features::MetricsRegistry::endpoint_path_label(req.uri().path()) {
+        state.metrics.record_request(label);
+    }
+    next.run(req).await
 }

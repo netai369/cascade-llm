@@ -1889,27 +1889,41 @@ impl GatewayState {
         is_streaming: bool,
         request_headers: &HeaderMap,
     ) -> Result<(HeaderMap, Body), ProxyError> {
-        let backend = self
-            .select_extraction_backend()
-            .await
-            .ok_or_else(|| {
-                ProxyError::unreachable(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "extraction",
-                    "no healthy extraction backend available",
-                )
-            })?;
-
-        let url = backend.completions_url();
-        info!(
-            "EXTRACT_ROUTE: backend='{}' type={:?} url={}",
-            backend.id, backend.backend_type, url
-        );
+        // Registry-first: an active `extraction` node wins; otherwise the
+        // configured extraction backends (unchanged fallback).
+        let (node_id, url, api_key, node_model) = match self.pick_node("extraction").await {
+            Some(node) => {
+                info!("EXTRACT_ROUTE: registry node '{}' url={}", node.id, node.endpoint_url);
+                (node.id, node.endpoint_url, node.bearer_token, node.model)
+            }
+            None => {
+                let backend = self
+                    .select_extraction_backend()
+                    .await
+                    .ok_or_else(|| {
+                        ProxyError::unreachable(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "extraction",
+                            "no healthy extraction backend available",
+                        )
+                    })?;
+                let url = backend.completions_url();
+                info!(
+                    "EXTRACT_ROUTE: backend='{}' type={:?} url={}",
+                    backend.id, backend.backend_type, url
+                );
+                (backend.id, url, backend.api_key, None)
+            }
+        };
+        let backend = ExtractTarget { id: node_id };
 
         // Strip internal fields before forwarding
         let mut clean = payload.clone();
         clean.metadata = None;
         clean.route_hint = None;
+        if let Some(model) = node_model.filter(|m| !m.is_empty()) {
+            clean.model = model;
+        }
         // Usage metering (same rule as `proxy_to_backend`): streams always ask
         // for the terminal usage chunk; the SSE rewriter strips it again for
         // clients that did not opt in. Non-streamed calls carry no stream_options.
@@ -1923,7 +1937,7 @@ impl GatewayState {
 
         // Forward with API key if provided
         let mut req_builder = self.http_client.post(&url).json(&clean);
-        if let Some(api_key) = &backend.api_key {
+        if let Some(api_key) = &api_key {
             if !api_key.is_empty() {
                 req_builder = req_builder.header("Authorization", format!("Bearer {}", api_key));
             }
@@ -1977,7 +1991,7 @@ impl GatewayState {
             let mut usage = ChatUsageTracker::new(
                 self.usage.clone(),
                 usage_base,
-                &payload,
+                &clean,
                 sent_at,
                 client_wants_usage,
             );
@@ -2014,7 +2028,7 @@ impl GatewayState {
         let mut usage = ChatUsageTracker::new(
             self.usage.clone(),
             usage_base,
-            &payload,
+            &clean,
             sent_at,
             client_wants_usage,
         );
@@ -2176,6 +2190,11 @@ fn normalize_event_json(raw: &str, model_name: &str) -> Option<String> {
     // (show_reasoning).  Merging here leaks the whole CoT into the visible
     // answer (regression 2026-09-10: Hermes "Opencode ssh" session).
     Some(format!("data: {}", serde_json::to_string(&event).unwrap_or_default()))
+}
+
+/// Identity of the extraction target used for error attribution.
+struct ExtractTarget {
+    id: String,
 }
 
 /// Usage event skeleton for a non-chat call proxied by a handler (embeddings,

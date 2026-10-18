@@ -127,7 +127,45 @@ impl MetricsRegistry {
             ("rag_worker (/v1/rag/extract)", &["rag_worker"]),
             ("extraction (/extraction/v1)", &["extraction"]),
             ("session_affinity (cached target)", &["session_affinity"]),
+            // Per-endpoint hit counters: keyed by the full path, so the overview
+            // shows the real endpoint without a hand-kept mapping. Idle routes
+            // report 0. These are endpoint hits, not route outcomes, and are kept
+            // out of the KPI total (see `endpoint_path_labels`).
+            ("/v1/messages", &["/v1/messages"]),
+            ("/v1/realtime", &["/v1/realtime"]),
+            ("/v1/embeddings", &["/v1/embeddings"]),
+            ("/v1/rerank", &["/v1/rerank"]),
+            ("/v1/audio/transcriptions", &["/v1/audio/transcriptions"]),
+            ("/v1/audio/speech", &["/v1/audio/speech"]),
+            ("/v1/audio/diarize", &["/v1/audio/diarize"]),
+            ("/v1/video/generations", &["/v1/video/generations"]),
+            ("/v1/models", &["/v1/models"]),
         ]
+    }
+
+    /// Endpoint-hit labels. Counted once per request by the router middleware,
+    /// NOT part of `backend_labels`: a `/v1/messages` call is also routed (and
+    /// counted) as an inference request, so adding it to the KPI would count
+    /// it twice. `/v1/chat/completions`, `/v1/images/generations` and
+    /// `/v1/rag/extract` are already counted by their route labels and are
+    /// deliberately absent here.
+    pub fn endpoint_path_labels() -> &'static [&'static str] {
+        &[
+            "/v1/messages",
+            "/v1/realtime",
+            "/v1/embeddings",
+            "/v1/rerank",
+            "/v1/audio/transcriptions",
+            "/v1/audio/speech",
+            "/v1/audio/diarize",
+            "/v1/video/generations",
+            "/v1/models",
+        ]
+    }
+
+    /// The endpoint-hit label for a request path, if the path is counted.
+    pub fn endpoint_path_label(path: &str) -> Option<&'static str> {
+        Self::endpoint_path_labels().iter().copied().find(|l| *l == path)
     }
 
     pub fn fallback_reasons() -> &'static [&'static str] {
