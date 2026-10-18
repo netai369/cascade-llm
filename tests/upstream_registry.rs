@@ -23,8 +23,13 @@ fn admin_headers() -> reqwest::header::HeaderMap {
 
 /// Boots a gateway on an ephemeral port; returns its base URL.
 async fn spawn_gateway() -> String {
+    spawn_gateway_with(|_| {}).await
+}
+
+async fn spawn_gateway_with(tweak: impl FnOnce(&mut AppConfig)) -> String {
     let mut cfg = AppConfig::from_env();
     cfg.admin_key = Some(ADMIN_KEY.to_string());
+    tweak(&mut cfg);
     let state = Arc::new(GatewayState::new(
         cfg,
         Arc::new(MetricsRegistry::init()),
@@ -214,7 +219,7 @@ async fn native_engine_base_urls_and_embeddings_role_are_supported() {
     assert_eq!(response.status(), reqwest::StatusCode::CREATED);
     let body: serde_json::Value = response.json().await.unwrap();
     assert_eq!(body["role"], "embeddings");
-    assert_eq!(body["node"]["endpoint_url"], "http://localhost:8081/v1");
+    assert_eq!(body["node"]["endpoint_url"], "http://localhost:8081/v1/embeddings");
 
     // User-facing `vision` is an alias for the existing `ocr` router role.
     let response = client
@@ -390,4 +395,96 @@ async fn mutating_routes_require_admin_key() {
         .await
         .unwrap();
     assert_eq!(res.status(), reqwest::StatusCode::FORBIDDEN);
+}
+
+/// Echo stub for an OpenAI-style audio/rerank/embeddings upstream: reports the
+/// path it was called on and the bearer it received.
+async fn echo_upstream(
+    axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
+    headers: axum::http::HeaderMap,
+) -> axum::Json<serde_json::Value> {
+    let auth = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    axum::Json(serde_json::json!({"path": uri.path(), "auth": auth}))
+}
+
+async fn spawn_echo() -> String {
+    let app = Router::new()
+        .route("/v1/rerank", post(echo_upstream))
+        .route("/v1/embeddings", post(echo_upstream));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    format!("http://{}", addr)
+}
+
+#[tokio::test]
+async fn rerank_routes_to_registered_rerank_node_with_auth() {
+    let upstream = spawn_echo().await;
+    let base = spawn_gateway().await;
+    let client = reqwest::Client::new();
+    let res = client
+        .put(format!("{}/web/api/upstreams/rerank", base))
+        .headers(admin_headers())
+        .json(&serde_json::json!({
+            "endpoint_url": format!("{}/v1/rerank", upstream),
+            "bearer_token": "node-token"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(res.status().is_success(), "register failed: {}", res.status());
+
+    let res = client
+        .post(format!("{}/v1/rerank", base))
+        .json(&serde_json::json!({"query": "q", "documents": ["a"]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = res.json().await.unwrap();
+    assert_eq!(body["path"], "/v1/rerank");
+    assert_eq!(body["auth"], "Bearer node-token");
+}
+
+#[tokio::test]
+async fn rerank_falls_back_to_static_url_without_node() {
+    let upstream = spawn_echo().await;
+    let rerank_url = upstream.clone();
+    let base = spawn_gateway_with(|cfg| cfg.rerank_url = rerank_url.clone()).await;
+    let client = reqwest::Client::new();
+    let res = client
+        .post(format!("{}/v1/rerank", base))
+        .json(&serde_json::json!({"query": "q", "documents": ["a"]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = res.json().await.unwrap();
+    assert_eq!(body["path"], "/v1/rerank");
+    assert_eq!(body["auth"], "");
+}
+
+#[tokio::test]
+async fn role_catalog_lists_every_role_with_path_and_kind() {
+    let base = spawn_gateway().await;
+    let client = reqwest::Client::new();
+    let res = client
+        .get(format!("{}/web/api/v1/admin/upstreams", base))
+        .headers(admin_headers())
+        .send()
+        .await
+        .unwrap();
+    let body: serde_json::Value = res.json().await.unwrap();
+    let catalog = body["role_catalog"].as_array().expect("role_catalog");
+    let find = |role: &str| catalog.iter().find(|r| r["role"] == role).cloned().unwrap_or_default();
+    assert_eq!(find("transcription")["path"], "/audio/transcriptions");
+    assert_eq!(find("transcription")["kinds"][0], "audio-stt");
+    assert_eq!(find("speech")["path"], "/audio/speech");
+    assert_eq!(find("rerank")["path"], "/rerank");
+    assert_eq!(find("embeddings")["path"], "/embeddings");
+    assert!(body["roles"].as_array().unwrap().iter().any(|r| r == "extraction"));
 }

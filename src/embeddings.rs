@@ -40,15 +40,16 @@ async fn proxy_json_api(state: Arc<GatewayState>, req: Request<Body>, service: &
         "rerank" => (state.config.rerank_url.clone(), "/v1/rerank"),
         _ => unreachable!("unsupported embedding service"),
     };
+    let role = service;
     let (node, had_registered_pool) = {
         let registry = state.registry.read().await;
-        let had_pool = registry.nodes().iter().any(|n| n.role == "embeddings");
-        (registry.pick("embeddings"), had_pool)
+        let had_pool = registry.nodes().iter().any(|n| n.role == role);
+        (registry.pick(role), had_pool)
     };
     if had_registered_pool && node.is_none() {
         let body = serde_json::json!({"error": {
-            "message": format!("No healthy embeddings backend is available for {service}; start the configured native/container service and check its health."),
-            "type": "cascade_backend_unavailable", "backend": "embeddings", "code": 503
+            "message": format!("No healthy {role} backend is available; start the configured native/container service and check its health."),
+            "type": "cascade_backend_unavailable", "backend": role, "code": 503
         }});
         return Response::builder().status(StatusCode::SERVICE_UNAVAILABLE)
             .header("content-type", "application/json")
@@ -127,8 +128,8 @@ async fn proxy_json_api(state: Arc<GatewayState>, req: Request<Body>, service: &
                 .status(StatusCode::SERVICE_UNAVAILABLE)
                 .header("content-type", "application/json")
                 .body(Body::from(serde_json::json!({"error": {
-                    "message": format!("{} backend {} is unreachable: {}. Start or restart that native/container service, then retry.", service, node_id.as_deref().unwrap_or("default"), error),
-                    "type": "cascade_backend_unavailable", "backend": "embeddings", "code": 503
+                    "message": format!("{} backend {} is unreachable: {}. Start or restart that native/container service, then retry.", role, node_id.as_deref().unwrap_or("default"), error),
+                    "type": "cascade_backend_unavailable", "backend": role, "code": 503
                 }}).to_string()))
                 .unwrap()
         }

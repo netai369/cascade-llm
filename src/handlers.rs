@@ -1327,6 +1327,7 @@ pub async fn list_upstreams(
     json_response(
         serde_json::json!({
             "roles": crate::registry::ROLES,
+            "role_catalog": crate::registry::role_catalog(),
             "overrides": overrides,
             "nodes": registry.nodes().iter().map(|n| node_view(n)).collect::<Vec<_>>(),
             "strategy": registry.strategy(),
@@ -1508,6 +1509,7 @@ pub async fn admin_upstreams(
     json_response(
         serde_json::json!({
             "roles": crate::registry::ROLES,
+            "role_catalog": crate::registry::role_catalog(),
             "active_roles": active_roles,
             "strategy": registry.strategy(),
             "nodes": registry.nodes().iter().map(|n| node_view(n)).collect::<Vec<_>>(),

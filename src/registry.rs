@@ -14,7 +14,44 @@ use tracing::{info, warn};
 use futures_util::StreamExt;
 
 /// Canonical upstream roles managed by the registry.
-pub const ROLES: &[&str] = &["main", "auxiliary", "ocr", "image", "embeddings", "rag_worker"];
+pub const ROLES: &[&str] = &[
+    "main", "auxiliary", "ocr", "image", "embeddings", "rerank", "extraction",
+    "transcription", "speech", "rag_worker",
+];
+
+/// Upstream path a role's node is called on (appended to the node's `/v1` base).
+/// Single source for registration (`normalize_endpoint_url`) and the console.
+pub fn role_path(role: &str) -> &'static str {
+    match role {
+        "main" | "auxiliary" | "ocr" | "extraction" | "rag_worker" => "/chat/completions",
+        "image" => "/images/generations",
+        "embeddings" => "/embeddings",
+        "rerank" => "/rerank",
+        "transcription" => "/audio/transcriptions",
+        "speech" => "/audio/speech",
+        _ => "/chat/completions",
+    }
+}
+
+/// Model kinds a role serves; the console filters a provider's models by these.
+pub fn role_kinds(role: &str) -> &'static [&'static str] {
+    match role {
+        "embeddings" => &["embedding"],
+        "rerank" => &["rerank"],
+        "transcription" => &["audio-stt"],
+        "speech" => &["audio-tts"],
+        "image" => &["image"],
+        _ => &["chat"],
+    }
+}
+
+/// Role catalog served to the consoles, so no UI hard-codes role names.
+pub fn role_catalog() -> Vec<serde_json::Value> {
+    ROLES
+        .iter()
+        .map(|r| serde_json::json!({"role": r, "path": role_path(r), "kinds": role_kinds(r)}))
+        .collect()
+}
 
 /// Node selection strategy across a role's pool (LiteLLM-inspired).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -55,6 +92,10 @@ pub fn canonical_role(role: &str) -> Option<&'static str> {
         "ocr" | "vision" => Some("ocr"),
         "image" | "img" => Some("image"),
         "embeddings" | "embedding" => Some("embeddings"),
+        "rerank" | "reranker" => Some("rerank"),
+        "extraction" => Some("extraction"),
+        "transcription" | "stt" => Some("transcription"),
+        "speech" | "tts" => Some("speech"),
         "rag_worker" | "rag" => Some("rag_worker"),
         _ => None,
     }
@@ -83,14 +124,7 @@ pub fn normalize_endpoint_url(role: &str, url: &str) -> String {
     if !trimmed.ends_with("/v1") {
         return trimmed.to_string();
     }
-    let suffix = match role {
-        "main" | "auxiliary" | "ocr" => "/chat/completions",
-        "image" => "/images/generations",
-        // The embedding proxy selects /v1/embeddings or /v1/rerank per route.
-        "embeddings" | "rag_worker" => return trimmed.to_string(),
-        _ => return trimmed.to_string(),
-    };
-    format!("{}{}", trimmed, suffix)
+    format!("{}{}", trimmed, role_path(role))
 }
 
 /// Payload for `PUT /web/api/upstreams/{role}`. Accepts both the current field
@@ -646,6 +680,9 @@ mod tests {
         assert_eq!(canonical_role("rag"), Some("rag_worker"));
         assert_eq!(canonical_role("embedding"), Some("embeddings"));
         assert_eq!(canonical_role("vision"), Some("ocr"));
+        assert_eq!(canonical_role("tts"), Some("speech"));
+        assert_eq!(canonical_role("stt"), Some("transcription"));
+        assert_eq!(canonical_role("reranker"), Some("rerank"));
         assert_eq!(canonical_role("nope"), None);
     }
 
@@ -662,7 +699,9 @@ mod tests {
         assert_eq!(normalize_endpoint_url("main", "http://localhost:8080/v1"), "http://localhost:8080/v1/chat/completions");
         assert_eq!(normalize_endpoint_url("ocr", "http://localhost:8081/v1/"), "http://localhost:8081/v1/chat/completions");
         assert_eq!(normalize_endpoint_url("image", "http://localhost:8082/v1"), "http://localhost:8082/v1/images/generations");
-        assert_eq!(normalize_endpoint_url("embeddings", "http://localhost:8801/v1"), "http://localhost:8801/v1");
+        assert_eq!(normalize_endpoint_url("embeddings", "http://localhost:8801/v1"), "http://localhost:8801/v1/embeddings");
+        assert_eq!(normalize_endpoint_url("rerank", "http://localhost:8801/v1"), "http://localhost:8801/v1/rerank");
+        assert_eq!(normalize_endpoint_url("speech", "http://localhost:8800/v1"), "http://localhost:8800/v1/audio/speech");
     }
 
     #[test]
