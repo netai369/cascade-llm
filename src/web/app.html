@@ -203,6 +203,14 @@
     .bar-meter > i { display: block; height: 100%; background: var(--accent); }
     .bar-meter > i.warn { background: var(--running); }
     .bar-meter > i.err { background: var(--error); }
+    /* Gateway status cards: six in one row on >=1600px, wrapping below that. */
+    .gw-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: .5rem; align-items: stretch; }
+    .gw-cards > * { min-width: 0; }
+    .gw-cards .stat { padding: .5rem .6rem; }
+    .gw-cards .stat .k { font-size: .6rem; letter-spacing: .04em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .gw-cards .stat .v { font-size: .95rem; margin-top: .1rem; }
+    .gw-cards .stat .s { font-size: .66rem; }
+    @media (min-width: 1600px) { .gw-cards { grid-template-columns: repeat(6, minmax(0, 1fr)); } }
     footer.page { text-align: center; padding: 1.5rem; color: var(--text-faint); font-size: .78rem; }
 
     @media (max-width: 900px) {
@@ -257,7 +265,7 @@
 
         <div class="panel">
           <h2>Gateway <span class="spacer"></span><span class="hint" id="ov-prov-note"></span></h2>
-          <div id="ov-stats" class="grid3"><div class="state loading">Loading gateway status…</div></div>
+          <div id="ov-stats" class="gw-cards"><div class="state loading">Loading gateway status…</div></div>
         </div>
 
         <div class="panel">
@@ -362,44 +370,6 @@
           <div id="img-out" style="margin-top:.8rem"></div>
         </div>
 
-        <div class="panel">
-          <h2>Register a node</h2>
-          <details class="form">
-            <summary>Add / update an upstream endpoint</summary>
-            <div class="f-row">
-              <label class="f"><span>Role</span>
-                <select id="nf-role">
-                  <option value="main">main — complex chat</option>
-                  <option value="auxiliary">auxiliary — fast / compression</option>
-                  <option value="ocr">ocr — vision / document</option>
-                  <option value="image">image — image generation</option>
-                  <option value="rag_worker">rag_worker — heavy extraction</option>
-                </select>
-              </label>
-              <label class="f"><span>Endpoint URL</span><input type="text" id="nf-url" placeholder="http://host:port/v1/chat/completions">
-                <span class="h">The exact URL requests are forwarded to.</span>
-              </label>
-            </div>
-            <div class="f-row">
-              <label class="f"><span>Label</span><input type="text" id="nf-label" placeholder="Vast.ai RTX 4070"></label>
-              <label class="f"><span>Model name</span><input type="text" id="nf-model" placeholder="netai-hybrid">
-                <span class="h">Forced onto requests routed here. Leave empty to forward the client's name.</span>
-              </label>
-              <label class="f"><span>Weight</span><input type="number" id="nf-weight" min="1" max="64" value="1"></label>
-              <label class="f"><span>Max context</span><input type="number" id="nf-ctx" placeholder="131072"></label>
-            </div>
-            <div class="f-row">
-              <label class="f"><span>Provider</span><input type="text" id="nf-provider" placeholder="vast.ai"></label>
-              <label class="f"><span>Cost / hour (USD)</span><input type="number" id="nf-cost" step="0.001" placeholder="0.09"></label>
-              <label class="f"><span>Bearer token</span><input type="password" id="nf-bearer" placeholder="(optional)" autocomplete="off"></label>
-              <label class="f"><span>Health URL override</span><input type="text" id="nf-health" placeholder="(origin)/health"></label>
-            </div>
-            <div class="btn-row">
-              <button class="btn primary" id="nf-submit">Register node</button>
-              <span class="small faint">Re-registering the same URL updates the existing node instead of adding a second one.</span>
-            </div>
-          </details>
-        </div>
       </section>
 
       <!-- ============================== FLEET ============================= -->
@@ -439,50 +409,60 @@
 
         <div class="grid2">
           <div class="panel">
-            <h2>Cloud providers <span class="spacer"></span>
-              <button class="btn sm" id="fl-cloud-toggle">Toggle cloud</button>
-            </h2>
-            <div id="fl-providers"><div class="state loading">Loading providers…</div></div>
-          </div>
-          <div class="panel">
             <h2>GPU admission rules</h2>
             <div id="fl-rules"><div class="state loading">Loading rules…</div></div>
           </div>
         </div>
 
-        <div class="panel">
-          <h2>Register a hosted API node</h2>
-          <p class="small muted" style="margin-bottom:.8rem">
-            A zero-cost hosted model (Pollinations) registered straight into a cascade role. No machine is rented
-            and nothing bills, but the node is a real registry entry like any other.
-          </p>
-          <div class="f-row">
-            <label class="f"><span>Role</span>
-              <select id="pl-role"><option value="image">image</option><option value="auxiliary">auxiliary</option><option value="main">main</option></select>
-            </label>
-            <label class="f"><span>Model</span><input type="text" id="pl-model" value="openai"></label>
-          </div>
-          <div class="btn-row">
-            <button class="btn primary" id="pl-submit">Register hosted node</button>
-            <span class="small faint">Renting a GPU stays in the provisioner UI: offer selection, region rules and VRAM estimation live there.</span>
-          </div>
-        </div>
       </section>
 
       <!-- ============================ PROVIDERS ============================ -->
       <section class="view" id="view-providers">
         <h1>Providers</h1>
-        <p class="sub">External APIs behind the main or auxiliary chat role. A provider is only useful if it is in the pool, so every edit here re-registers or withdraws its registry node.</p>
+        <p class="sub">Every provider the stack routes to: external APIs, the Pollinations hosted tier, gateway-managed providers and GPU cloud providers. New APIs are saved in the GPU provisioner through “Register an API”; this page shows and manages what is registered.</p>
 
         <div class="panel">
-          <h2>Registered providers <span class="spacer"></span><span class="hint">keys are never displayed, only their state</span></h2>
+          <h2>All providers <span class="spacer"></span><span class="hint">keys are never displayed, only their state</span></h2>
           <div id="pv-list"><div class="state loading">Loading providers…</div></div>
         </div>
 
         <div class="panel">
-          <h2 id="pv-editor-title">Add a provider</h2>
+          <h2>Register an API</h2>
           <p class="small muted" style="margin-bottom:.8rem">
-            The key is tested with a real chat request before it is stored. A provider that cannot answer is
+            Pick a provider, load its model list from the service, then choose a model and a role. Prices come from the
+            provider's own model list when it publishes them, otherwise from the NetAI billing price table. “—” means no price is known.
+          </p>
+          <div class="f-row">
+            <label class="f"><span>Provider</span>
+              <select id="ra-provider">
+                <option value="pollinations">Pollinations — hosted, zero cost</option>
+                <option value="openai-compatible">OpenAI-compatible endpoint</option>
+              </select>
+            </label>
+            <label class="f" id="ra-url-wrap"><span>Base URL</span><input type="text" id="ra-url" placeholder="https://api.example.com/v1"></label>
+            <label class="f" id="ra-key-wrap"><span>API key</span><input type="password" id="ra-key" placeholder="(empty for open endpoints)" autocomplete="off">
+              <span class="h">Write-only. Sent to the provisioner for storage; never displayed again.</span>
+            </label>
+          </div>
+          <div class="btn-row"><button class="btn" id="ra-load">Load models</button><span class="small faint" id="ra-load-state"></span></div>
+          <div class="f-row" style="margin-top:.8rem">
+            <label class="f"><span>Model</span><select id="ra-model" disabled><option value="">— load models first —</option></select></label>
+            <label class="f"><span>Role</span><select id="ra-role"></select><span class="h" id="ra-role-hint"></span></label>
+            <label class="f" id="ra-name-wrap"><span>Name</span><input type="text" id="ra-name" placeholder="e.g. Mistral EU"></label>
+          </div>
+          <div id="ra-price" class="small muted" style="margin-bottom:.8rem"></div>
+          <div class="btn-row"><button class="btn primary" id="ra-register" disabled>Register</button><span class="small faint" id="ra-note"></span></div>
+        </div>
+
+        <div class="panel">
+          <h2>Cloud GPU providers <span class="spacer"></span><button class="btn sm" id="fl-cloud-toggle">Toggle cloud</button></h2>
+          <div id="fl-providers"><div class="state loading">Loading providers…</div></div>
+        </div>
+
+<div class="panel" id="pv-editor" style="display:none">
+          <h2 id="pv-editor-title">Edit gateway provider</h2>
+          <p class="small muted" style="margin-bottom:.8rem">
+            Gateway-managed providers are edited here only. New APIs are registered with “Register an API” above. The key is tested with a real chat request before it is stored. A provider that cannot answer is
             never registered, because an unreachable pool entry is a silent failure for every user routed to it.
           </p>
           <div class="f-row">
@@ -1090,7 +1070,7 @@ async function refreshBackends() {
   const nodes = d.nodes || [];
   if (!nodes.length) {
     emptyState(host, "No dynamic nodes registered",
-      "Every role is using its static default URL. Nodes appear here once the GPU provisioner registers one, or when you add one below.");
+      "No external node is registered. Nodes appear here once a provider is registered on the Providers page or the GPU provisioner registers one.");
   } else {
     const t = el("table", {}, [el("thead", {}, [el("tr", {}, [
       el("th", { text: "" }), el("th", { text: "Role" }), el("th", { text: "Label / model" }),
@@ -1120,8 +1100,6 @@ async function refreshBackends() {
         el("td", { class: "num small", text: n.cost_per_hour != null ? "$" + n.cost_per_hour + "/h" : "—" }),
         el("td", { class: "small" }, [n.bearer_set ? badge("set", "ok") : badge("none", "idle")]),
         el("td", { class: "nowrap" }, [
-          el("button", { class: "btn sm", text: "Edit", on: { click: () => prefillNodeForm(n) } }),
-          " ",
           el("button", { class: "btn sm danger", text: "Remove", on: { click: () => nodeAction(n.id, "delete", null, n.role) } }),
         ]),
       ]));
@@ -1131,25 +1109,21 @@ async function refreshBackends() {
   }
   $("#bk-count").textContent = `${nodes.length} node(s)`;
 
-  clear(defs).append(el("dl", { class: "kv" }, Object.entries(d.defaults || {}).flatMap(([role, url]) => [
-    el("dt", {}, [el("code", { text: role })]),
-    el("dd", { class: "small mono", text: url || "— none —" }),
-  ])));
-}
-
-function prefillNodeForm(n) {
-  $("#nf-role").value = n.role;
-  $("#nf-url").value = n.endpoint_url;
-  $("#nf-label").value = n.label || "";
-  $("#nf-model").value = n.model || "";
-  $("#nf-weight").value = n.weight;
-  $("#nf-ctx").value = n.max_context_length || "";
-  $("#nf-provider").value = n.provider || "";
-  $("#nf-cost").value = n.cost_per_hour ?? "";
-  $("#nf-bearer").value = "";
-  $("#nf-health").value = n.health_url || "";
-  $("details.form").open = true;
-  $("details.form").scrollIntoView({ behavior: "smooth", block: "center" });
+  const servedBy = (role) => nodes.filter((n) => n.role === role && n.active)
+    .map((n) => (n.label || n.id) + (n.healthy ? "" : " (unhealthy)"));
+  clear(defs).append(
+    el("p", { class: "small muted", style: "margin-bottom:.6rem",
+      text: "Static defaults are fallback URLs from the stack configuration. “— none —” means no local engine serves that role: image, main and auxiliary are served only by registered external nodes, listed per role." }),
+    el("dl", { class: "kv" }, Object.entries(d.defaults || {}).flatMap(([role, url]) => {
+      const s = servedBy(role);
+      return [
+        el("dt", {}, [el("code", { text: role })]),
+        el("dd", {}, [
+          el("div", { class: "small mono", text: url || "— none (no local engine) —" }),
+          el("div", { class: "small muted", text: s.length ? "Served by: " + s.join(", ") : "Served by: no registered node" }),
+        ]),
+      ];
+    })));
 }
 
 async function nodeAction(id, action, inputEl, role) {
@@ -1184,30 +1158,6 @@ async function nodeUpdate(node, fields) {
     await refreshBackends();
   } catch (e) { toast("Update failed: " + e.message, "err"); }
 }
-
-$("#nf-submit").addEventListener("click", async () => {
-  const role = $("#nf-role").value;
-  const url = $("#nf-url").value.trim();
-  if (!url.startsWith("http")) { toast("Endpoint URL must start with http:// or https://", "err"); return; }
-  const payload = { endpoint_url: url };
-  const add = (k, v) => { if (v !== "" && v != null) payload[k] = v; };
-  add("label", $("#nf-label").value.trim());
-  add("model", $("#nf-model").value.trim());
-  add("provider", $("#nf-provider").value.trim());
-  add("health_url", $("#nf-health").value.trim());
-  add("bearer_token", $("#nf-bearer").value);
-  const w = parseInt($("#nf-weight").value || "1", 10); if (w > 0) payload.weight = w;
-  const ctx = parseInt($("#nf-ctx").value || "0", 10); if (ctx > 0) payload.max_context_length = ctx;
-  const cost = parseFloat($("#nf-cost").value || "0"); if (cost > 0) payload.cost_per_hour = cost;
-  const btn = $("#nf-submit"); btn.disabled = true;
-  try {
-    await api("/web/api/upstreams/" + encodeURIComponent(role), { method: "PUT", body: payload });
-    toast("Node registered.");
-    ["nf-url", "nf-label", "nf-model", "nf-provider", "nf-bearer", "nf-health", "nf-cost", "nf-ctx"].forEach((i) => { $("#" + i).value = ""; });
-    await refreshBackends();
-  } catch (e) { toast("Register failed: " + e.message, "err", 7000); }
-  finally { btn.disabled = false; }
-});
 
 $("#btn-probe").addEventListener("click", async (e) => {
   const btn = e.currentTarget; btn.disabled = true; btn.textContent = "Probing…";
@@ -1392,7 +1342,7 @@ async function renderFleetNodes() {
   let d; try { d = await prov("inference-nodes"); } catch (e) { errorState(host, e); return; }
   const rows = d.nodes || [];
   $("#cnt-fleet").textContent = rows.filter((n) => n.state === "running").length;
-  if (!rows.length) { emptyState(host, "No inference nodes", "Rent one in the provisioner UI, or register a hosted API node below."); return; }
+  if (!rows.length) { emptyState(host, "No inference nodes", "Rent one in the provisioner UI, or register a hosted API on the Providers page."); return; }
 
   const registry = cache.upstreams && cache.upstreams.nodes ? cache.upstreams.nodes : null;
   const inRegistry = (id) => (registry || []).find((n) => n.id === id);
@@ -1563,16 +1513,6 @@ $("#fl-cloud-toggle").addEventListener("click", async () => {
   } catch (e) { toast("Toggle failed: " + e.message, "err"); }
 });
 
-$("#pl-submit").addEventListener("click", async (e) => {
-  const btn = e.currentTarget; btn.disabled = true;
-  try {
-    await prov("inference-nodes/pollinations", { method: "POST", body: { role: $("#pl-role").value, model: $("#pl-model").value.trim() || "openai", activate_on_ready: true }, timeout: 60000 });
-    toast("Hosted node registered.");
-    await refreshFleet();
-  } catch (err) { toast("Registration failed: " + err.message, "err", 8000); }
-  finally { btn.disabled = false; }
-});
-
 async function openProv(path) {
   try { showModal(path, JSON.stringify(await prov(path), null, 2)); }
   catch (e) { showModal(path, "ERROR: " + e.message); }
@@ -1598,46 +1538,237 @@ async function registryNodes() {
   catch { return []; }
 }
 
+function actBtn(label, fn, cls) {
+  return el("button", { class: "btn sm" + (cls ? " " + cls : ""), text: label, on: { click: fn } });
+}
+
+function providerRow(badges, metaLines, actions) {
+  return el("div", { style: { padding: ".7rem 0", borderBottom: "1px solid var(--table-row-border)" } }, [
+    el("div", { class: "row", style: { marginBottom: ".35rem" } }, badges),
+    el("div", { class: "small muted" }, metaLines),
+    el("div", { class: "btn-row", style: { marginTop: ".5rem" } }, actions),
+  ]);
+}
+
+/**
+ * One list over every provider source: gateway-managed providers (this service's
+ * own store), external APIs (GPU provisioner external-LLM store), Pollinations
+ * hosted nodes (provisioner inference nodes) and the GPU cloud list below.
+ */
 async function refreshProviders() {
   const host = $("#pv-list");
   loading(host, "Loading providers");
-  let d; try { d = await api("/web/api/providers"); } catch (e) { errorState(host, e); return; }
-  providerCache = Array.isArray(d) ? d : [];
-  $("#cnt-providers").textContent = providerCache.length;
+  const [gw, ext, inst, nodes] = await Promise.all([
+    api("/web/api/providers").catch((e) => ({ error: e })),
+    prov("external-llms").catch((e) => ({ error: e })),
+    prov("inference-nodes").catch((e) => ({ error: e })),
+    registryNodes(),
+  ]);
+  const gwRows = Array.isArray(gw) ? gw : [];
+  providerCache = gwRows;
+  const rows = [];
+  if (gw && gw.error) rows.push(el("div", { class: "state error", text: "Gateway providers unavailable: " + gw.error.message }));
 
-  if (!providerCache.length) {
-    emptyState(host, "No external providers", "Chat traffic goes to the configured local backends. Add a provider below to put a hosted API into the main or auxiliary pool.");
-    return;
-  }
-  const nodes = await registryNodes();
-  clear(host);
-  providerCache.forEach((p) => {
-    const nodeId = "provider-" + p.id;
-    const node = nodes.find((n) => n.id === nodeId);
-    const inPool = p.enabled && node && node.active;
-    const head = el("div", { class: "row", style: { marginBottom: ".35rem" } }, [
+  gwRows.forEach((p) => {
+    const node = nodes.find((n) => n.id === "provider-" + p.id);
+    const pType = (p.provider_type && p.provider_type.type) || p.provider_type || "custom";
+    rows.push(providerRow([
       el("strong", { text: p.name }),
-      badge((p.provider_type && p.provider_type.type) || p.provider_type || "custom", "info"),
+      badge("Gateway · " + pType, "info"),
       badge(p.use_as ? "used as " + p.use_as : "not routed", p.use_as ? "ok" : "idle"),
       p.enabled ? null : badge("disabled", "warn"),
       p.has_key ? badge("key set", "ok") : badge("no key", "warn"),
       node ? (node.active ? badge("in pool", "ok") : badge("out of pool", "idle")) : badge("no registry node", "err"),
-      el("span", { class: "spacer", style: { marginLeft: "auto" } }),
-    ]);
-    const meta = el("div", { class: "small muted" }, [
+    ], [
       el("div", { class: "mono", text: p.base_url }),
-      el("div", { text: "models: " + ((p.models || []).join(", ") || "none") + (p.key_masked ? "  ·  key " + p.key_masked : "") }),
-      node ? el("div", { class: "small faint", text: "registry node " + node.id + " → " + node.endpoint_url }) : null,
-    ]);
-    const actions = el("div", { class: "btn-row", style: { marginTop: ".5rem" } }, [
-      el("button", { class: "btn sm", text: "Edit", on: { click: () => editProvider(p) } }),
-      el("button", { class: "btn sm", text: "Test", on: { click: (ev) => testProvider(p, ev.currentTarget) } }),
-      el("button", { class: "btn sm", text: p.enabled ? "Disable" : "Enable", on: { click: () => patchProvider(p, { enabled: !p.enabled }) } }),
-      el("button", { class: "btn sm danger", text: "Remove", on: { click: () => removeProvider(p) } }),
-    ]);
-    host.append(el("div", { style: { padding: ".7rem 0", borderBottom: "1px solid var(--table-row-border)" } }, [head, meta, actions]));
+      el("div", { text: "models: " + ((p.models || []).join(", ") || "none") }),
+    ], [
+      actBtn("Edit", () => editProvider(p)),
+      actBtn("Test", (ev) => testProvider(p, ev.currentTarget)),
+      actBtn(p.enabled ? "Disable" : "Enable", () => patchProvider(p, { enabled: !p.enabled })),
+      actBtn("Remove", () => removeProvider(p), "danger"),
+    ]));
   });
+
+  if (ext && ext.error) rows.push(el("div", { class: "state error", text: "External APIs unavailable: " + ext.error.message }));
+  else (ext.entries || []).forEach((e) => {
+    const regs = nodes.filter((n) => String(n.id || "").startsWith("ext-api-" + e.id + "-"));
+    const serving = regs.filter((n) => n.active && n.healthy).length;
+    rows.push(providerRow([
+      el("strong", { text: e.name || e.id }),
+      badge("External API", "info"),
+      badge("roles: " + ((e.roles || []).join(", ") || "none"), "info"),
+      e.enabled === false ? badge("disabled", "warn") : null,
+      e.has_key ? badge("key …" + (e.key_last4 || "set"), "ok") : badge("no key", "idle"),
+      regs.length ? (serving ? badge("serving " + serving + "/" + regs.length + " healthy", "ok") : badge("not healthy", "err")) : badge("not in routing", "idle"),
+    ], [
+      el("div", { class: "mono", text: e.base_url || "" }),
+      el("div", { text: "model: " + (e.model || "(endpoint default)") }),
+    ], [
+      actBtn("Test", async (ev) => {
+        const btn = ev.currentTarget; btn.disabled = true;
+        try {
+          const r = await prov("external-llms/" + encodeURIComponent(e.id) + "/test", { method: "POST", timeout: 60000 });
+          toast(r.ok ? "Reachable — " + (r.latency_ms ?? "?") + " ms" : "Test failed: " + (r.error || "HTTP " + r.chat_status), r.ok ? "ok" : "err", 8000);
+        } catch (err) { toast("Test failed: " + err.message, "err", 8000); }
+        finally { btn.disabled = false; await refreshProviders().catch(() => {}); }
+      }),
+      actBtn(e.enabled === false ? "Enable" : "Disable", async () => {
+        try { await prov("external-llms/" + encodeURIComponent(e.id), { method: "PUT", body: { enabled: e.enabled === false } }); }
+        catch (err) { toast("Update failed: " + err.message, "err"); }
+        await refreshProviders().catch(() => {});
+      }),
+      actBtn("Remove", async () => {
+        if (!confirm("Remove this API? Its registry nodes are withdrawn.")) return;
+        try { await prov("external-llms/" + encodeURIComponent(e.id), { method: "DELETE" }); toast("API removed."); }
+        catch (err) { toast("Remove failed: " + err.message, "err"); }
+        await refreshProviders().catch(() => {});
+      }, "danger"),
+    ]));
+  });
+
+  if (inst && inst.error) rows.push(el("div", { class: "state error", text: "Hosted nodes unavailable: " + inst.error.message }));
+  else (inst.nodes || []).filter((n) => n.provider === "pollinations").forEach((n) => {
+    const md = n.metadata || {};
+    const rid = md.cascade_backend_id || n.instance_id;
+    const reg = nodes.find((x) => x.id === rid);
+    rows.push(providerRow([
+      el("strong", { text: "Pollinations · " + (md.model || "?") }),
+      badge("Pollinations (hosted)", "info"),
+      badge("role: " + (md.role || "?"), "info"),
+      badge(n.state || "unknown", ["running", "ready", "serving"].includes(n.state) ? "ok" : "idle"),
+      reg ? (reg.active ? badge(reg.healthy ? "in routing · healthy" : "in routing · unhealthy", reg.healthy ? "ok" : "err") : badge("deactivated", "idle")) : badge("not in registry", "warn"),
+    ], [
+      el("div", { text: "zero-cost hosted tier · no key" }),
+    ], [
+      actBtn("Remove", () => provAction("inference-nodes/" + encodeURIComponent(n.instance_id) + "/terminate", "POST", "Remove this hosted node from routing?"), "danger"),
+    ]));
+  });
+
+  clear(host);
+  if (!rows.length) emptyState(host, "No providers", "Register an API below to put an external model or Pollinations into routing.");
+  else rows.forEach((r) => host.append(r));
+  $("#cnt-providers").textContent = gwRows.length + ((ext.entries || []).length || 0) + ((inst.nodes || []).filter((n) => n.provider === "pollinations").length || 0);
+  if (typeof renderProvProviders === "function") renderProvProviders().catch(() => {});
 }
+
+/* ---- Register an API ------------------------------------------------------ */
+let raModels = [];
+const raProvider = () => $("#ra-provider").value;
+
+function fmtMoney(v, cur) {
+  const sym = cur === "EUR" ? "€" : cur === "USD" ? "$" : (cur ? cur + " " : "");
+  return sym + (v < 0.01 && v > 0 ? v.toFixed(4) : v.toFixed(2));
+}
+
+function fmtPrice(price) {
+  if (!price) return "—";
+  if (price.per_image != null) return fmtMoney(price.per_image, price.currency) + " / image";
+  const parts = [];
+  if (price.input_per_mtok != null) parts.push("in " + fmtMoney(price.input_per_mtok, price.currency));
+  if (price.output_per_mtok != null) parts.push("out " + fmtMoney(price.output_per_mtok, price.currency));
+  return parts.length ? parts.join(" · ") + " per 1M tokens" : "—";
+}
+
+function priceSource(price) {
+  if (!price) return "no price known";
+  return price.source === "provider" ? "source: provider model list" : "source: NetAI billing price table";
+}
+
+function fillModelSelect() {
+  const sel = $("#ra-model"); clear(sel);
+  if (!raModels.length) {
+    sel.append(el("option", { attrs: { value: "" }, text: "— load models first —" }));
+    sel.disabled = true;
+  } else {
+    sel.disabled = false;
+    raModels.forEach((m) => sel.append(el("option", {
+      attrs: { value: m.id },
+      text: m.id + (m.kind === "image" ? " (image)" : "") + " — " + fmtPrice(m.price),
+    })));
+  }
+  raSyncModel();
+}
+
+function raSyncForm() {
+  const pol = raProvider() === "pollinations";
+  $("#ra-url-wrap").style.display = pol ? "none" : "";
+  $("#ra-key-wrap").style.display = pol ? "none" : "";
+  $("#ra-name-wrap").style.display = pol ? "none" : "";
+  const roles = [["main", "main — complex chat"], ["auxiliary", "auxiliary — fast / compression"]];
+  if (pol) roles.push(["image", "image — generation"]);
+  const sel = $("#ra-role"); const cur = sel.value; clear(sel);
+  roles.forEach(([v, t]) => sel.append(el("option", { attrs: { value: v }, text: t })));
+  sel.value = roles.some((r) => r[0] === cur) ? cur : "main";
+  $("#ra-role-hint").textContent = pol
+    ? "Image models register under image; text models under main or auxiliary."
+    : "External APIs serve main or auxiliary. Image generation comes from Pollinations or registered image nodes.";
+  raModels = [];
+  fillModelSelect();
+}
+
+function raSyncModel() {
+  const m = raModels.find((x) => x.id === $("#ra-model").value);
+  $("#ra-register").disabled = !m;
+  if (!m) { $("#ra-price").textContent = ""; return; }
+  if (raProvider() === "pollinations") {
+    const sel = $("#ra-role");
+    if (m.kind === "image") sel.value = "image"; else if (sel.value === "image") sel.value = "main";
+  }
+  $("#ra-price").textContent = "Price: " + fmtPrice(m.price) + " — " + priceSource(m.price);
+}
+
+$("#ra-provider").addEventListener("change", raSyncForm);
+$("#ra-model").addEventListener("change", raSyncModel);
+
+$("#ra-load").addEventListener("click", async (e) => {
+  const btn = e.currentTarget; btn.disabled = true;
+  const st = $("#ra-load-state"); st.textContent = "Loading models…";
+  try {
+    let d;
+    if (raProvider() === "pollinations") {
+      d = await prov("pollinations/models", { timeout: 30000 });
+    } else {
+      const base = $("#ra-url").value.trim();
+      if (!base.startsWith("http")) throw new Error("Base URL must start with http:// or https://");
+      d = await prov("external-llms/discover", { method: "POST", timeout: 30000,
+        body: { base_url: base, api_key: $("#ra-key").value.trim() || null } });
+    }
+    if (!d.ok) throw new Error(d.error || "no models returned");
+    raModels = d.models || [];
+    st.textContent = raModels.length + " model(s)";
+    fillModelSelect();
+  } catch (err) {
+    raModels = []; fillModelSelect(); st.textContent = "";
+    toast("Load models failed: " + err.message, "err", 8000);
+  } finally { btn.disabled = false; }
+});
+
+$("#ra-register").addEventListener("click", async (e) => {
+  const btn = e.currentTarget;
+  const m = raModels.find((x) => x.id === $("#ra-model").value);
+  if (!m) return;
+  const role = $("#ra-role").value;
+  btn.disabled = true;
+  try {
+    if (raProvider() === "pollinations") {
+      if ((m.kind === "image") !== (role === "image")) throw new Error("image models register under the image role; text models under main or auxiliary");
+      await prov("inference-nodes/pollinations", { method: "POST", timeout: 60000,
+        body: { role, model: m.id, activate_on_ready: true } });
+      toast("Pollinations node registered.");
+    } else {
+      const base = $("#ra-url").value.trim();
+      await prov("external-llms", { method: "POST", timeout: 30000,
+        body: { name: $("#ra-name").value.trim() || m.id, base_url: base,
+          api_key: $("#ra-key").value.trim() || null, roles: [role], model: m.id, enabled: true, tls_verify: true } });
+      toast("API saved to the GPU provisioner; routing is being reconciled.");
+    }
+    $("#ra-key").value = "";
+    cache.upstreams = null;
+    await refreshProviders();
+  } catch (err) { toast("Registration failed: " + err.message, "err", 9000); }
+  finally { btn.disabled = false; }
+});
 
 function editProvider(p) {
   editingProvider = p;
@@ -1651,11 +1782,14 @@ function editProvider(p) {
   $("#pe-key").value = "";
   $("#pe-key-hint").textContent = p.has_key ? "Key " + (p.key_masked || "set") + " is stored. Leave blank to keep it; a new value replaces it." : "No key stored.";
   $("#pe-reset").style.display = "";
+  $("#pv-editor").style.display = "";
+  $("#pv-editor").scrollIntoView({ behavior: "smooth", block: "center" });
 }
 
 function resetProviderForm() {
   editingProvider = null;
-  $("#pv-editor-title").textContent = "Add a provider";
+  $("#pv-editor-title").textContent = "Edit gateway provider";
+  $("#pv-editor").style.display = "none";
   ["pe-name", "pe-url", "pe-key", "pe-models"].forEach((i) => { $("#" + i).value = ""; });
   $("#pe-type").value = "custom";
   $("#pe-use-as").value = "main";
@@ -1710,9 +1844,7 @@ $("#pe-save").addEventListener("click", async (e) => {
       await api("/web/api/providers/" + encodeURIComponent(editingProvider.id), { method: "PUT", body: payload });
       toast("Provider updated and the pool reconciled.");
     } else {
-      if (!payload.api_key) payload.api_key = null;
-      await api("/web/api/providers", { method: "POST", body: Object.assign({ id: "p_" + Date.now(), priority: 10, capabilities: { chat: true, streaming: true } }, payload), timeout: 90000 });
-      toast("Provider tested, stored and registered.");
+      throw new Error("new APIs are registered with “Register an API” above");
     }
     resetProviderForm();
     cache.upstreams = null;
