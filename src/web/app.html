@@ -434,19 +434,18 @@
           </p>
           <div class="f-row">
             <label class="f"><span>Provider</span>
-              <select id="ra-provider">
-                <option value="pollinations">Pollinations — hosted, zero cost</option>
-                <option value="openai-compatible">OpenAI-compatible endpoint</option>
-              </select>
+              <select id="ra-provider"><option value="">Loading providers…</option></select>
+              <span class="h" id="ra-docs-wrap" style="display:none">Docs: <a id="ra-docs" href="#" target="_blank" rel="noopener">—</a></span>
             </label>
-            <label class="f" id="ra-url-wrap"><span>Base URL</span><input type="text" id="ra-url" placeholder="https://api.example.com/v1"></label>
+            <label class="f" id="ra-url-wrap"><span>Base URL</span><input type="text" id="ra-url" placeholder="https://api.example.com/v1"><span class="h" id="ra-url-hint"></span></label>
             <label class="f" id="ra-key-wrap"><span>API key</span><input type="password" id="ra-key" placeholder="(empty for open endpoints)" autocomplete="off">
               <span class="h">Write-only. Sent to the provisioner for storage; never displayed again.</span>
             </label>
           </div>
           <div class="btn-row"><button class="btn" id="ra-load">Load models</button><span class="small faint" id="ra-load-state"></span></div>
           <div class="f-row" style="margin-top:.8rem">
-            <label class="f"><span>Model</span><select id="ra-model" disabled><option value="">— load models first —</option></select></label>
+            <label class="f"><span>Model</span><select id="ra-model" disabled><option value="">— load models first —</option></select>
+              <span class="h" id="ra-model-count"></span></label>
             <label class="f"><span>Role</span><select id="ra-role"></select><span class="h" id="ra-role-hint"></span></label>
             <label class="f" id="ra-name-wrap"><span>Name</span><input type="text" id="ra-name" placeholder="e.g. Mistral EU"></label>
           </div>
@@ -1654,25 +1653,52 @@ async function refreshProviders() {
 
 /* ---- Register an API ------------------------------------------------------ */
 let raModels = [];
+let raCatalog = null;
 const raProvider = () => $("#ra-provider").value;
+const raEntry = () => (raCatalog && raCatalog.providers || []).find((p) => p.id === raProvider()) || null;
 
 function fmtMoney(v, cur) {
   const sym = cur === "EUR" ? "€" : cur === "USD" ? "$" : (cur ? cur + " " : "");
   return sym + (v < 0.01 && v > 0 ? v.toFixed(4) : v.toFixed(2));
 }
 
-function fmtPrice(price) {
-  if (!price) return "—";
-  if (price.per_image != null) return fmtMoney(price.per_image, price.currency) + " / image";
-  const parts = [];
-  if (price.input_per_mtok != null) parts.push("in " + fmtMoney(price.input_per_mtok, price.currency));
-  if (price.output_per_mtok != null) parts.push("out " + fmtMoney(price.output_per_mtok, price.currency));
-  return parts.length ? parts.join(" · ") + " per 1M tokens" : "—";
+function fmtCtx(n) {
+  if (!n) return "ctx ?";
+  return n >= 1000 ? Math.round(n / 1000) + "k ctx" : n + " ctx";
 }
 
-function priceSource(price) {
-  if (!price) return "no price known";
-  return price.source === "provider" ? "source: provider model list" : "source: NetAI billing price table";
+/* Flat row from /external-llms/discover: input/output per 1M tokens, or per image. */
+function fmtPrice(m) {
+  if (m.input_price_per_1m == null && m.output_price_per_1m == null) return "no price";
+  const parts = [];
+  if (m.input_price_per_1m != null) parts.push("in " + fmtMoney(m.input_price_per_1m, m.currency));
+  if (m.output_price_per_1m != null) parts.push("out " + fmtMoney(m.output_price_per_1m, m.currency));
+  return parts.join(" · ") + " /1M";
+}
+
+function priceSource(m) {
+  if (m.input_price_per_1m == null && m.output_price_per_1m == null) return "no price known";
+  return m.price_source === "provider" ? "source: provider model list" : "source: NetAI billing price table";
+}
+
+async function raLoadCatalog() {
+  try {
+    raCatalog = await prov("provider-catalog", { timeout: 15000 });
+  } catch (err) {
+    raCatalog = { providers: [] };
+    toast("Provider catalog unavailable: " + err.message, "err", 8000);
+  }
+  const sel = $("#ra-provider"); const prev = sel.value; clear(sel);
+  const groups = [["hosted", "Hosted APIs"], ["pollinations", "Pollinations"], ["custom", "Custom"]];
+  groups.forEach(([g, label]) => {
+    const items = (raCatalog.providers || []).filter((p) => p.group === g);
+    if (!items.length) return;
+    const og = el("optgroup", { attrs: { label } });
+    items.forEach((p) => og.append(el("option", { attrs: { value: p.id }, text: p.name })));
+    sel.append(og);
+  });
+  if (prev && [...sel.options].some((o) => o.value === prev)) sel.value = prev;
+  raSyncForm();
 }
 
 function fillModelSelect() {
@@ -1684,17 +1710,31 @@ function fillModelSelect() {
     sel.disabled = false;
     raModels.forEach((m) => sel.append(el("option", {
       attrs: { value: m.id },
-      text: m.id + (m.kind === "image" ? " (image)" : "") + " — " + fmtPrice(m.price),
+      text: m.id + (m.kind === "image" ? " (image)" : "") + " — " + fmtCtx(m.context_length) + " — " + fmtPrice(m),
     })));
   }
+  $("#ra-model-count").textContent = raModels.length ? raModels.length + " model(s) · prices per 1M tokens" : "";
   raSyncModel();
 }
 
 function raSyncForm() {
+  const entry = raEntry();
   const pol = raProvider() === "pollinations";
+  const custom = !!(entry && entry.editable_base);
   $("#ra-url-wrap").style.display = pol ? "none" : "";
   $("#ra-key-wrap").style.display = pol ? "none" : "";
   $("#ra-name-wrap").style.display = pol ? "none" : "";
+  const url = $("#ra-url");
+  url.readOnly = !custom;
+  if (!custom && entry) url.value = entry.base_url;
+  if (!custom && !entry) url.value = "";
+  url.placeholder = custom ? "https://api.example.com/v1" : "";
+  $("#ra-url-hint").textContent = custom
+    ? "Any OpenAI-compatible server. A pasted /chat/completions suffix is removed."
+    : (entry && entry.base_url ? "Fixed by the catalog for this provider." : "");
+  const docs = entry && entry.docs_url;
+  $("#ra-docs-wrap").style.display = docs ? "" : "none";
+  if (docs) { const a = $("#ra-docs"); a.href = docs; a.textContent = docs; }
   const roles = [["main", "main — complex chat"], ["auxiliary", "auxiliary — fast / compression"]];
   if (pol) roles.push(["image", "image — generation"]);
   const sel = $("#ra-role"); const cur = sel.value; clear(sel);
@@ -1715,7 +1755,7 @@ function raSyncModel() {
     const sel = $("#ra-role");
     if (m.kind === "image") sel.value = "image"; else if (sel.value === "image") sel.value = "main";
   }
-  $("#ra-price").textContent = "Price: " + fmtPrice(m.price) + " — " + priceSource(m.price);
+  $("#ra-price").textContent = "Context: " + fmtCtx(m.context_length) + " · Price: " + fmtPrice(m) + " — " + priceSource(m);
 }
 
 $("#ra-provider").addEventListener("change", raSyncForm);
@@ -1725,17 +1765,18 @@ $("#ra-load").addEventListener("click", async (e) => {
   const btn = e.currentTarget; btn.disabled = true;
   const st = $("#ra-load-state"); st.textContent = "Loading models…";
   try {
-    let d;
-    if (raProvider() === "pollinations") {
-      d = await prov("pollinations/models", { timeout: 30000 });
-    } else {
+    const entry = raEntry();
+    if (!entry) throw new Error("choose a provider first");
+    const body = { catalog_id: entry.id, api_key: $("#ra-key").value.trim() || null };
+    if (entry.editable_base) {
       const base = $("#ra-url").value.trim();
       if (!base.startsWith("http")) throw new Error("Base URL must start with http:// or https://");
-      d = await prov("external-llms/discover", { method: "POST", timeout: 30000,
-        body: { base_url: base, api_key: $("#ra-key").value.trim() || null } });
+      body.base_url = base;
     }
+    const d = await prov("external-llms/discover", { method: "POST", timeout: 30000, body });
     if (!d.ok) throw new Error(d.error || "no models returned");
     raModels = d.models || [];
+    if (d.base_url && entry.editable_base) $("#ra-url").value = d.base_url;
     st.textContent = raModels.length + " model(s)";
     fillModelSelect();
   } catch (err) {
@@ -1747,19 +1788,20 @@ $("#ra-load").addEventListener("click", async (e) => {
 $("#ra-register").addEventListener("click", async (e) => {
   const btn = e.currentTarget;
   const m = raModels.find((x) => x.id === $("#ra-model").value);
-  if (!m) return;
+  const entry = raEntry();
+  if (!m || !entry) return;
   const role = $("#ra-role").value;
   btn.disabled = true;
   try {
-    if (raProvider() === "pollinations") {
+    if (entry.id === "pollinations") {
       if ((m.kind === "image") !== (role === "image")) throw new Error("image models register under the image role; text models under main or auxiliary");
       await prov("inference-nodes/pollinations", { method: "POST", timeout: 60000,
         body: { role, model: m.id, activate_on_ready: true } });
       toast("Pollinations node registered.");
     } else {
-      const base = $("#ra-url").value.trim();
       await prov("external-llms", { method: "POST", timeout: 30000,
-        body: { name: $("#ra-name").value.trim() || m.id, base_url: base,
+        body: { name: $("#ra-name").value.trim() || m.id, catalog_id: entry.id,
+          base_url: $("#ra-url").value.trim(),
           api_key: $("#ra-key").value.trim() || null, roles: [role], model: m.id, enabled: true, tls_verify: true } });
       toast("API saved to the GPU provisioner; routing is being reconciled.");
     }
@@ -1769,6 +1811,8 @@ $("#ra-register").addEventListener("click", async (e) => {
   } catch (err) { toast("Registration failed: " + err.message, "err", 9000); }
   finally { btn.disabled = false; }
 });
+
+raLoadCatalog();
 
 function editProvider(p) {
   editingProvider = p;
