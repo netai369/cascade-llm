@@ -1,0 +1,63 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 400" width="1280" height="400" role="img" aria-labelledby="t d">
+  <title id="t">Cascade LLM</title>
+  <desc id="d">Clients (OpenAI and Anthropic SDKs, voice and realtime, agents) send requests to the Cascade gateway, which routes them to local engines and hosted APIs.</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#5eead4"/>
+    </marker>
+    <style>
+      text { font-family: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+    </style>
+  </defs>
+
+  <!-- solid background: readable on GitHub light and dark -->
+  <rect x="0" y="0" width="1280" height="400" fill="#0f172a"/>
+
+  <!-- header -->
+  <text x="60" y="104" font-size="56" font-weight="700" fill="#f8fafc">Cascade LLM</text>
+  <text x="60" y="150" font-size="22" fill="#cbd5e1">One OpenAI- and Anthropic-compatible endpoint in front of</text>
+  <text x="60" y="180" font-size="22" fill="#cbd5e1">your local engines and hosted APIs.</text>
+
+  <!-- clients -->
+  <rect x="40" y="226" width="250" height="152" rx="14" fill="#1e293b" stroke="#334155" stroke-width="2"/>
+  <text x="62" y="258" font-size="20" font-weight="600" fill="#f8fafc">Clients</text>
+  <text x="62" y="290" font-size="15" fill="#94a3b8">OpenAI SDK</text>
+  <text x="62" y="314" font-size="15" fill="#94a3b8">Anthropic SDK</text>
+  <text x="62" y="338" font-size="15" fill="#94a3b8">Voice / realtime</text>
+  <text x="62" y="362" font-size="15" fill="#94a3b8">Agents and apps</text>
+
+  <!-- arrow clients -> cascade -->
+  <line x1="296" y1="300" x2="388" y2="300" stroke="#5eead4" stroke-width="3" marker-end="url(#arrow)"/>
+  <text x="342" y="288" font-size="13" text-anchor="middle" fill="#94a3b8">/v1/*</text>
+
+  <!-- cascade gateway -->
+  <rect x="396" y="212" width="484" height="176" rx="16" fill="#134e4a" stroke="#2dd4bf" stroke-width="2.5"/>
+  <text x="418" y="246" font-size="20" font-weight="700" fill="#f0fdfa">Cascade gateway</text>
+  <rect x="418" y="262" width="216" height="52" rx="10" fill="#0f766e"/>
+  <text x="526" y="284" font-size="15" font-weight="600" text-anchor="middle" fill="#f0fdfa">Router</text>
+  <text x="526" y="303" font-size="12" text-anchor="middle" fill="#ccfbf1">role-based dispatch</text>
+  <rect x="646" y="262" width="216" height="52" rx="10" fill="#0f766e"/>
+  <text x="754" y="284" font-size="15" font-weight="600" text-anchor="middle" fill="#f0fdfa">Registry + prober</text>
+  <text x="754" y="303" font-size="12" text-anchor="middle" fill="#ccfbf1">health and load selection</text>
+  <rect x="418" y="326" width="216" height="46" rx="10" fill="#0f766e"/>
+  <text x="526" y="348" font-size="15" font-weight="600" text-anchor="middle" fill="#f0fdfa">Usage meter</text>
+  <text x="526" y="364" font-size="12" text-anchor="middle" fill="#ccfbf1">every billable call</text>
+  <rect x="646" y="326" width="216" height="46" rx="10" fill="#0f766e"/>
+  <text x="754" y="348" font-size="15" font-weight="600" text-anchor="middle" fill="#f0fdfa">Fair-share gate</text>
+  <text x="754" y="364" font-size="12" text-anchor="middle" fill="#ccfbf1">per-tenant concurrency</text>
+
+  <!-- arrow cascade -> upstreams -->
+  <line x1="884" y1="300" x2="972" y2="300" stroke="#5eead4" stroke-width="3" marker-end="url(#arrow)"/>
+  <text x="928" y="288" font-size="13" text-anchor="middle" fill="#94a3b8">per role</text>
+
+  <!-- upstreams -->
+  <rect x="980" y="226" width="260" height="152" rx="14" fill="#1e293b" stroke="#334155" stroke-width="2"/>
+  <text x="1002" y="258" font-size="20" font-weight="600" fill="#f8fafc">Upstreams</text>
+  <text x="1002" y="290" font-size="15" fill="#94a3b8">Local: vLLM, OVMS, llama.cpp</text>
+  <text x="1002" y="314" font-size="15" fill="#94a3b8">Hosted APIs</text>
+  <text x="1002" y="338" font-size="15" fill="#94a3b8">Pollinations (free tier)</text>
+  <text x="1002" y="362" font-size="15" fill="#94a3b8">Audio, image, embeddings</text>
+
+  <!-- footer -->
+  <text x="640" y="36" font-size="15" text-anchor="middle" fill="#64748b">Single Rust binary  ·  SQLite  ·  /v1/chat/completions, /v1/messages, /v1/realtime</text>
+</svg>
