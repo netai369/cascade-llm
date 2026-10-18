@@ -700,10 +700,65 @@ function el(tag, opts = {}, children = []) {
   for (const c of [].concat(children)) if (c != null) node.append(c);
   return node;
 }
-const clear = (node) => { while (node.firstChild) node.removeChild(node.firstChild); return node; };
+// clear() marks the region as rendered: from then on a poll never paints a
+// "Loading…" placeholder over it (that placeholder was the periodic flash).
+const clear = (node) => { while (node.firstChild) node.removeChild(node.firstChild); if (node.dataset) node.dataset.ready = "1"; return node; };
 
 /* --- small shared vocabulary ------------------------------------------- */
-function loading(host, what = "Loading") { clear(host).append(el("div", { class: "state loading", text: what + "…" })); }
+// Placeholder only before the first render of a region; a refresh never blanks
+// an already-populated region while it waits for the network.
+function loading(host, what = "Loading") {
+  if (host.dataset.ready === "1") return;
+  host.replaceChildren(el("div", { class: "state loading", text: what + "…" }));
+}
+
+/* --- dirty forms ---------------------------------------------------------
+ * A panel (card) becomes dirty on the first input/change inside it. Dirty panels
+ * and a focused text field/select/textarea pause the poll loop and stop refreshes
+ * from overwriting what the user is typing. A panel is released after submit or
+ * cancel (clearDirty), or when focus has left it and it has been idle for 3 s. */
+const dirtyPanels = new Set();
+const dirtyIdle = new Map();
+function panelOf(node) { return node && node.closest ? node.closest(".panel") : null; }
+function markDirty(e) {
+  const p = panelOf(e.target);
+  if (!p) return;
+  dirtyPanels.add(p);
+  dirtyIdle.set(p, Date.now());
+}
+document.addEventListener("input", markDirty, true);
+document.addEventListener("change", markDirty, true);
+document.addEventListener("focusout", (e) => {
+  const p = panelOf(e.target);
+  if (!p || !dirtyPanels.has(p)) return;
+  const release = () => {
+    if (!dirtyPanels.has(p)) return;
+    if (p.contains(document.activeElement)) return;   // still focused: stay dirty
+    if (Date.now() - (dirtyIdle.get(p) || 0) >= 3000) clearDirty(p);
+    else setTimeout(release, 3100 - (Date.now() - (dirtyIdle.get(p) || 0)));
+  };
+  setTimeout(release, 3100);
+}, true);
+// A button press inside a panel is its submit or cancel: release the panel.
+document.addEventListener("click", (e) => {
+  const b = e.target.closest && e.target.closest("button");
+  if (b) clearDirty(panelOf(b));
+}, true);
+function clearDirty(panel) { if (panel) { dirtyPanels.delete(panel); dirtyIdle.delete(panel); } }
+function isEditing() {
+  const m = $("#modal");
+  if (m && m.open) return true;
+  const a = document.activeElement;
+  if (a && /^(INPUT|SELECT|TEXTAREA)$/.test(a.tagName) && panelOf(a)) return true;
+  return dirtyPanels.size > 0;
+}
+// Assign a form value unless the user is in that field or its panel is dirty.
+function setField(field, value) {
+  if (!field) return;
+  const p = panelOf(field);
+  if (field === document.activeElement || (p && dirtyPanels.has(p))) return;
+  if (field.value !== String(value)) field.value = value;
+}
 function emptyState(host, title, hint) {
   clear(host).append(el("div", { class: "empty" }, [el("strong", { text: title }), hint ? el("div", { text: hint }) : null]));
 }
@@ -909,7 +964,8 @@ const POLL_MS = 8000;
 function startPolling() {
   if (pollTimer) return;
   const tick = async () => {
-    if (!refreshing && !document.hidden) { refreshing = true; try { await refreshView(activeView); } finally { refreshing = false; } }
+    // Skip (don't queue) the refresh while the user is editing or a dialog is open.
+    if (!refreshing && !document.hidden && !isEditing()) { refreshing = true; try { await refreshView(activeView); } finally { refreshing = false; } }
     pollTimer = setTimeout(tick, POLL_MS);
   };
   pollTimer = setTimeout(tick, POLL_MS);
@@ -1063,7 +1119,7 @@ async function refreshBackends() {
     el("dt", { text: "Nodes" }), el("dd", { text: `${(d.nodes || []).length} registered, ${(d.nodes || []).filter((n) => n.active && n.healthy).length} serving` }),
     el("dt", { text: "Prober" }), el("dd", { text: `every ${d.health.interval_secs}s · demote after ${d.health.failure_threshold} failures · ${d.health.timeout_secs}s timeout` }),
   ]));
-  $("#bk-strategy").value = d.strategy === "least_latency" ? "least_latency" : "round_robin";
+  setField($("#bk-strategy"), d.strategy === "least_latency" ? "least_latency" : "round_robin");
   updateImageStatus();
 
   const nodes = d.nodes || [];
@@ -1407,7 +1463,7 @@ async function renderBudget() {
     el("option", { text: "Yes", attrs: { value: "true" } }),
     el("option", { text: "No", attrs: { value: "false" } }),
   ]);
-  budgetEnabled.value = d.enabled ? "true" : "false";
+  setField(budgetEnabled, d.enabled ? "true" : "false");
   host.append(
     el("div", { class: "row", style: { marginBottom: ".8rem" } }, [d.enabled ? badge("budget enforced", "ok") : badge("budget disabled — unbounded spend", "warn")]),
     meter("Weekly", d.weekly_cap_usd, d.weekly_spend_usd),
@@ -1449,6 +1505,9 @@ async function renderProvProviders() {
   loading(host, "Loading providers");
   let d; try { d = await prov("providers"); } catch (e) { errorState(host, e); return; }
   const rows = d.providers || [];
+  const sig = JSON.stringify(rows);
+  if (host._sig === sig && host.dataset.ready === "1") return;
+  host._sig = sig;
   if (!rows.length) { emptyState(host, "No GPU providers", "The provisioner exposes none."); return; }
   const t = el("table", {}, [el("thead", {}, [el("tr", {}, [
     el("th", { text: "Provider" }), el("th", { text: "Kind" }), el("th", { text: "Credential" }),
@@ -1563,8 +1622,13 @@ async function refreshProviders() {
     prov("inference-nodes").catch((e) => ({ error: e })),
     registryNodes(),
   ]);
+  // Build only when the data changed; an identical poll leaves the DOM untouched.
+  const norm = (x) => (x && x.error ? { error: x.error.message } : x);
+  const sig = JSON.stringify([norm(gw), norm(ext), norm(inst), nodes]);
   const gwRows = Array.isArray(gw) ? gw : [];
   providerCache = gwRows;
+  if (host._sig === sig && host.dataset.ready === "1") return;
+  host._sig = sig;
   const rows = [];
   if (gw && gw.error) rows.push(el("div", { class: "state error", text: "Gateway providers unavailable: " + gw.error.message }));
 
@@ -1990,17 +2054,17 @@ async function refreshSettings() {
   catch (e) { errorState($("#st-note"), e); return; }
   $("#st-note").textContent = "";
   const r = s.routing || {};
-  $("#st-router").value = r.router_threshold ?? 0.5;
-  $("#st-confidence").value = r.confidence_threshold ?? 0.7;
-  $("#st-tools").value = r.route_tools_to_large ? "true" : "false";
-  $("#st-default").value = r.default_route || "";
-  $("#st-hybrid").value = r.hybrid_auto ? "true" : "false";
-  $("#st-hybrid-chars").value = r.hybrid_aux_max_chars ?? 600;
-  $("#st-marker").value = r.marker_mode || "substring";
-  $("#st-large-url").value = s.large_text_url || "";
-  $("#st-small-url").value = s.small_mllm_url || "";
-  $("#st-tts").value = s.audio?.tts_url || "";
-  $("#st-stt").value = s.audio?.stt_url || "";
+  setField($("#st-router"), r.router_threshold ?? 0.5);
+  setField($("#st-confidence"), r.confidence_threshold ?? 0.7);
+  setField($("#st-tools"), r.route_tools_to_large ? "true" : "false");
+  setField($("#st-default"), r.default_route || "");
+  setField($("#st-hybrid"), r.hybrid_auto ? "true" : "false");
+  setField($("#st-hybrid-chars"), r.hybrid_aux_max_chars ?? 600);
+  setField($("#st-marker"), r.marker_mode || "substring");
+  setField($("#st-large-url"), s.large_text_url || "");
+  setField($("#st-small-url"), s.small_mllm_url || "");
+  setField($("#st-tts"), s.audio?.tts_url || "");
+  setField($("#st-stt"), s.audio?.stt_url || "");
 }
 
 async function saveRouting() {
