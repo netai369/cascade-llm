@@ -37,8 +37,14 @@ pub struct AppConfig {
     /// asymmetry is why one half of the audio proxy worked and hid the other.
     pub tts_api_key: Option<String>,
     pub stt_url: String,
+    /// Service key for the static STT fallback (STT_API_KEY); unset = none.
+    pub stt_api_key: Option<String>,
     pub embeddings_url: String,
+    /// Service keys for the static embeddings / rerank fallback
+    /// (EMBEDDINGS_API_KEY / RERANK_API_KEY); unset = no Authorization.
+    pub embeddings_api_key: Option<String>,
     pub rerank_url: String,
+    pub rerank_api_key: Option<String>,
 
     // Extraction endpoint
     pub extract_cloud_url: Option<String>,
@@ -243,10 +249,13 @@ impl AppConfig {
                 .filter(|k| !k.trim().is_empty()),
             stt_url: std::env::var("STT_URL")
                 .unwrap_or_else(|_| "http://speech-stt:5092/v1/audio".to_string()),
+            stt_api_key: std::env::var("STT_API_KEY").ok().filter(|k| !k.trim().is_empty()),
             embeddings_url: std::env::var("EMBEDDINGS_URL")
                 .unwrap_or_else(|_| "http://embeddings:8801".to_string()),
+            embeddings_api_key: std::env::var("EMBEDDINGS_API_KEY").ok().filter(|k| !k.trim().is_empty()),
             rerank_url: std::env::var("RERANK_URL")
                 .unwrap_or_else(|_| "http://embeddings:8801".to_string()),
+            rerank_api_key: std::env::var("RERANK_API_KEY").ok().filter(|k| !k.trim().is_empty()),
 
             extract_cloud_url: std::env::var("EXTRACT_CLOUD_URL").ok().filter(|s| !s.is_empty()),
             extract_cloud_model: std::env::var("EXTRACT_CLOUD_MODEL").ok().filter(|s| !s.is_empty()),

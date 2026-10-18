@@ -76,6 +76,7 @@ async fn select_audio_upstream(
     state: &Arc<GatewayState>,
     role: &str,
     static_base: &str,
+    static_key: Option<String>,
     path: &str,
 ) -> AudioUpstream {
     if let Some(node) = state.pick_node(role).await {
@@ -89,7 +90,7 @@ async fn select_audio_upstream(
     }
     AudioUpstream {
         url: audio_target(static_base, path),
-        bearer: None,
+        bearer: static_key,
         node_id: None,
         model: None,
     }
@@ -100,16 +101,12 @@ pub async fn tts_handler(
     req: Request<Body>,
 ) -> Response {
     let static_base = state.runtime.read().await.tts_url.clone();
-    let mut upstream = select_audio_upstream(&state, "speech", &static_base, req.uri().path()).await;
-    // ★ Inject the TTS bearer when neither the node nor the caller brings one.
-    //
-    // The key sits in the container environment (`POCKET_API_KEY`) and was
-    // never read — see the field docstring in config.rs. Without this the
-    // route answers 401 to every client that does not send it, which is what
-    // it did until 2026-10-07. A client-supplied Authorization is kept as-is.
-    if upstream.bearer.is_none() && !req.headers().contains_key(axum::http::header::AUTHORIZATION) {
-        upstream.bearer = state.config.tts_api_key.clone();
-    }
+    // ★ Upstream auth is the node's own bearer or the service key
+    // (POCKET_API_KEY for the static fallback) — never the client's header,
+    // which is the gateway credential. See `proxy_request`.
+    let upstream = select_audio_upstream(
+        &state, "speech", &static_base, state.config.tts_api_key.clone(), req.uri().path(),
+    ).await;
     info!("TTS proxy: {} -> {}", req.uri(), upstream.url);
     // Speech output is streamed to the client; usage is metered from the request.
     proxy_request(state, req, upstream, "audio_speech", "tts", true).await
@@ -120,7 +117,9 @@ pub async fn stt_handler(
     req: Request<Body>,
 ) -> Response {
     let static_base = state.runtime.read().await.stt_url.clone();
-    let upstream = select_audio_upstream(&state, "transcription", &static_base, req.uri().path()).await;
+    let upstream = select_audio_upstream(
+        &state, "transcription", &static_base, state.config.stt_api_key.clone(), req.uri().path(),
+    ).await;
     info!("STT proxy: {} -> {}", req.uri(), upstream.url);
     proxy_request(state, req, upstream, "audio_transcription", "stt", false).await
 }
@@ -141,7 +140,12 @@ pub async fn stt_diarize_handler(
         req.uri().path(),
     );
     info!("STT diarize proxy: {} -> {}", req.uri(), target_url);
-    let upstream = AudioUpstream { url: target_url, bearer: None, node_id: None, model: None };
+    let upstream = AudioUpstream {
+        url: target_url,
+        bearer: state.config.stt_api_key.clone(),
+        node_id: None,
+        model: None,
+    };
     proxy_request(state, req, upstream, "audio_transcription", "stt", false).await
 }
 
@@ -186,12 +190,12 @@ async fn proxy_request(
     };
 
     // Content-length is recomputed by reqwest: a model rewrite changes it.
+    // The client's Authorization is the gateway credential: it is dropped
+    // unconditionally and never reaches an upstream. The upstream sees only
+    // its own bearer (node token or configured service key), or none.
     let mut proxy_req = state.http_client.request(method, &upstream.url);
     for (key, value) in headers.iter() {
-        if key == "host" || key == "content-length" {
-            continue;
-        }
-        if key == "authorization" && upstream.bearer.is_some() {
+        if key == "host" || key == "content-length" || key == "authorization" {
             continue;
         }
         proxy_req = proxy_req.header(key.clone(), value.clone());

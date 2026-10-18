@@ -88,7 +88,7 @@ async fn image_generation_dispatch(
     // resolve), and until 2026-10-07 that surfaced as a bare 502 while a
     // working zero-config path sat one function away.
     let mode = state.config.image_mode.as_str();
-    let (mut parts, body) = req.into_parts();
+    let (parts, body) = req.into_parts();
     let mut bytes = match body.collect().await {
         Ok(b) => b.to_bytes(),
         Err(_) => {
@@ -101,12 +101,10 @@ async fn image_generation_dispatch(
     let payload: Option<serde_json::Value> = serde_json::from_slice(&bytes).ok();
     // Registry node: its bearer authenticates the call and its model alias
     // replaces the client's model name (same contract as chat/embeddings).
+    // The node's bearer is passed to `proxy_request` explicitly; the client's
+    // Authorization (the gateway credential) is never forwarded upstream.
+    let node_bearer = node.as_ref().and_then(|n| n.bearer_token.clone()).filter(|t| !t.is_empty());
     if let Some(node) = &node {
-        if let Some(token) = node.bearer_token.as_deref().filter(|t| !t.is_empty()) {
-            if let Ok(value) = axum::http::HeaderValue::from_str(&format!("Bearer {}", token)) {
-                parts.headers.insert(axum::http::header::AUTHORIZATION, value);
-            }
-        }
         if let Some(model) = node.model.as_deref().filter(|m| !m.is_empty()) {
             if let Some(rewritten) = crate::registry::force_model_json(&bytes, model) {
                 bytes = axum::body::Bytes::from(rewritten);
@@ -129,6 +127,7 @@ async fn image_generation_dispatch(
         state.clone(),
         Request::from_parts(parts, Body::from(bytes.clone())),
         &target_url,
+        node_bearer,
     )
     .await;
 
@@ -163,12 +162,12 @@ pub async fn video_generation_handler(
     State(state): State<Arc<GatewayState>>,
     req: Request<Body>,
 ) -> Response {
-    let target_url = match state.pick_node("image").await {
-        Some(node) if node.endpoint_url.contains("/v1/video") => node.endpoint_url,
-        _ => state.config.video_generation_url.clone(),
+    let (target_url, bearer) = match state.pick_node("image").await {
+        Some(node) if node.endpoint_url.contains("/v1/video") => (node.endpoint_url, node.bearer_token),
+        _ => (state.config.video_generation_url.clone(), None),
     };
     info!("Video generation proxy: {} -> {}", req.uri(), target_url);
-    proxy_request(state, req, &target_url).await
+    proxy_request(state, req, &target_url, bearer).await
 }
 
 fn is_pollinations(node: &UpstreamNode) -> bool {
@@ -379,7 +378,15 @@ impl TapContentType for Response {
     }
 }
 
-async fn proxy_request(state: Arc<GatewayState>, req: Request<Body>, target_url: &str) -> Response {
+/// Forwards a media call. The client's `Authorization` is the gateway
+/// credential and is always dropped; `bearer` (the registry node's own token,
+/// if any) is the only upstream credential.
+async fn proxy_request(
+    state: Arc<GatewayState>,
+    req: Request<Body>,
+    target_url: &str,
+    bearer: Option<String>,
+) -> Response {
     let method = req.method().clone();
     let headers = req.headers().clone();
 
@@ -396,9 +403,12 @@ async fn proxy_request(state: Arc<GatewayState>, req: Request<Body>, target_url:
     let mut proxy_req = state.http_client.request(method, target_url);
     for (key, value) in headers.iter() {
         // reqwest recomputes content-length; a model rewrite changes the body size.
-        if key != "host" && key != "content-length" {
+        if key != "host" && key != "content-length" && key != "authorization" {
             proxy_req = proxy_req.header(key.clone(), value.clone());
         }
+    }
+    if let Some(token) = bearer.as_deref().filter(|t| !t.is_empty()) {
+        proxy_req = proxy_req.bearer_auth(token);
     }
 
     match proxy_req.body(body_bytes).send().await {

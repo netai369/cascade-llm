@@ -57,6 +57,10 @@ async fn proxy_json_api(state: Arc<GatewayState>, req: Request<Body>, service: &
             .body(Body::from(body.to_string())).unwrap();
     }
     let node_model = node.as_ref().and_then(|n| n.model.clone()).filter(|m| !m.is_empty());
+    let static_key = match service {
+        "rerank" => state.config.rerank_api_key.clone(),
+        _ => state.config.embeddings_api_key.clone(),
+    };
     let (target_url, bearer, node_id) = if let Some(node) = node {
         let base = node.endpoint_url.trim_end_matches('/');
         let target = if base.ends_with(endpoint) {
@@ -68,7 +72,7 @@ async fn proxy_json_api(state: Arc<GatewayState>, req: Request<Body>, service: &
         };
         (target, node.bearer_token, Some(node.id))
     } else {
-        (format!("{}{}", default_url.trim_end_matches('/'), endpoint), None, None)
+        (format!("{}{}", default_url.trim_end_matches('/'), endpoint), static_key, None)
     };
     info!("{} proxy: {} -> {}", service, req.uri(), target_url);
 
@@ -94,6 +98,7 @@ async fn proxy_json_api(state: Arc<GatewayState>, req: Request<Body>, service: &
 
     // reqwest recomputes content-length; the rewritten body may differ in size.
     let mut upstream = state.http_client.request(method, target_url);
+    // The client's Authorization is the gateway credential: never forwarded.
     for (key, value) in &headers {
         if key != "host" && key != "authorization" && key != "content-length" {
             upstream = upstream.header(key, value);
@@ -101,8 +106,6 @@ async fn proxy_json_api(state: Arc<GatewayState>, req: Request<Body>, service: &
     }
     if let Some(token) = bearer.as_deref().filter(|t| !t.is_empty()) {
         upstream = upstream.bearer_auth(token);
-    } else if let Some(value) = headers.get("authorization") {
-        upstream = upstream.header("authorization", value);
     }
 
     match upstream.body(send_body).send().await {

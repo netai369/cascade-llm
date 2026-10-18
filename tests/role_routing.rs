@@ -380,3 +380,131 @@ async fn endpoint_hits_are_counted_by_path_on_the_overview() {
     // Idle endpoints are listed with 0 rather than omitted.
     assert!(after["requests_by_backend"].get("/v1/rerank").is_some());
 }
+
+// ── Upstream auth: the client's Authorization is the gateway credential ──
+//
+// Regression (2026-10-18): `/v1/audio/speech` forwarded the CLIENT's bearer to
+// the static pocket-tts upstream, which answered 401. Upstream auth must be the
+// node's own bearer or the configured service key, or no header at all.
+
+const CLIENT_KEY: &str = "Bearer client-gateway-key";
+
+#[tokio::test]
+async fn speech_static_fallback_uses_service_key_not_client_bearer() {
+    let (mock, seen) = mock_upstream().await;
+    let (base, _rx) = spawn_gateway(|c| {
+        c.tts_url = format!("{}/v1/audio", mock);
+        c.tts_api_key = Some("tts-service-key".to_string());
+    })
+    .await;
+
+    let res = reqwest::Client::new()
+        .post(format!("{}/v1/audio/speech", base))
+        .header("authorization", CLIENT_KEY)
+        .json(&serde_json::json!({"model": "m", "input": "abc", "voice": "christian"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let (_, auth, _) = seen.only("/v1/audio/speech");
+    assert_eq!(auth.as_deref(), Some("Bearer tts-service-key"));
+}
+
+#[tokio::test]
+async fn speech_static_fallback_without_client_header_uses_service_key() {
+    let (mock, seen) = mock_upstream().await;
+    let (base, _rx) = spawn_gateway(|c| {
+        c.tts_url = format!("{}/v1/audio", mock);
+        c.tts_api_key = Some("tts-service-key".to_string());
+    })
+    .await;
+
+    let res = reqwest::Client::new()
+        .post(format!("{}/v1/audio/speech", base))
+        .json(&serde_json::json!({"model": "m", "input": "abc"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let (_, auth, _) = seen.only("/v1/audio/speech");
+    assert_eq!(auth.as_deref(), Some("Bearer tts-service-key"));
+}
+
+#[tokio::test]
+async fn speech_node_never_receives_client_bearer() {
+    let (mock, seen) = mock_upstream().await;
+    let (base, _rx) = spawn_gateway(|_| {}).await;
+    register(&base, "speech", serde_json::json!({
+        "endpoint_url": format!("{}/v1/audio/speech", mock),
+        "bearer_token": "node-secret", "model": "tts-alias"
+    }))
+    .await;
+
+    let res = reqwest::Client::new()
+        .post(format!("{}/v1/audio/speech", base))
+        .header("authorization", CLIENT_KEY)
+        .json(&serde_json::json!({"model": "c", "input": "abc"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let (_, auth, _) = seen.only("/v1/audio/speech");
+    assert_eq!(auth.as_deref(), Some("Bearer node-secret"));
+}
+
+#[tokio::test]
+async fn transcription_static_fallback_drops_client_bearer_without_service_key() {
+    let (mock, seen) = mock_upstream().await;
+    let (base, _rx) = spawn_gateway(|c| c.stt_url = format!("{}/v1/audio", mock)).await;
+
+    let part = reqwest::multipart::Part::bytes(b"RIFFfake".to_vec()).file_name("a.wav");
+    let form = reqwest::multipart::Form::new().text("model", "m").part("file", part);
+    let res = reqwest::Client::new()
+        .post(format!("{}/v1/audio/transcriptions", base))
+        .header("authorization", CLIENT_KEY)
+        .multipart(form)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let (_, auth, _) = seen.only("/v1/audio/transcriptions");
+    assert_eq!(auth, None);
+}
+
+#[tokio::test]
+async fn embeddings_static_fallback_drops_client_bearer() {
+    let (mock, seen) = mock_upstream().await;
+    let (base, _rx) = spawn_gateway(|c| c.embeddings_url = mock.clone()).await;
+
+    let res = reqwest::Client::new()
+        .post(format!("{}/v1/embeddings", base))
+        .header("authorization", CLIENT_KEY)
+        .json(&serde_json::json!({"model": "m", "input": "abc"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let (_, auth, _) = seen.only("/v1/embeddings");
+    assert_eq!(auth, None);
+}
+
+#[tokio::test]
+async fn embeddings_static_fallback_uses_configured_service_key() {
+    let (mock, seen) = mock_upstream().await;
+    let (base, _rx) = spawn_gateway(|c| {
+        c.embeddings_url = mock.clone();
+        c.embeddings_api_key = Some("emb-service-key".to_string());
+    })
+    .await;
+
+    let res = reqwest::Client::new()
+        .post(format!("{}/v1/embeddings", base))
+        .header("authorization", CLIENT_KEY)
+        .json(&serde_json::json!({"model": "m", "input": "abc"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let (_, auth, _) = seen.only("/v1/embeddings");
+    assert_eq!(auth.as_deref(), Some("Bearer emb-service-key"));
+}
