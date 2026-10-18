@@ -35,8 +35,7 @@
     .side {
       border-right: 1px solid var(--card-border); background: var(--bg-soft);
       padding: 1rem .7rem; display: flex; flex-direction: column; gap: .2rem;
-      position: sticky; top: 56px; align-self: start; max-height: calc(100vh - 56px);
-      overflow-y: auto;
+      align-self: stretch;
     }
     .side .grp {
       font-size: .68rem; text-transform: uppercase; letter-spacing: .09em;
@@ -159,6 +158,17 @@
       border-radius: 50%; animation: spin .7s linear infinite; vertical-align: -.1em;
     }
     @keyframes spin { to { transform: rotate(360deg); } }
+    .mp-wrap { position: relative; min-width: 0; }
+    .mp-input { width: 100%; box-sizing: border-box; }
+    .mp-list { position: absolute; z-index: 60; left: 0; right: 0; top: calc(100% + 4px); max-height: 300px; overflow: auto; margin: 0; padding: .25rem; list-style: none; border: 1px solid var(--card-border); border-radius: 8px; background: var(--card, var(--bg-soft)); box-shadow: 0 8px 24px rgba(0,0,0,.25); }
+    .mp-list[hidden] { display: none; }
+    .mp-group { font-size: .68rem; text-transform: uppercase; letter-spacing: .06em; color: var(--text-faint); padding: .45rem .5rem .2rem; }
+    .mp-opt { display: flex; justify-content: space-between; align-items: baseline; gap: .6rem; padding: .3rem .5rem; border-radius: 6px; cursor: pointer; font-size: .82rem; }
+    .mp-opt:hover, .mp-opt.mp-active { background: var(--hover-bg, rgba(127,127,127,.15)); }
+    .mp-opt.mp-on .mp-id { font-weight: 700; }
+    .mp-id { overflow-wrap: anywhere; min-width: 0; }
+    .mp-meta { color: var(--text-muted); font-size: .74rem; white-space: nowrap; }
+    .mp-foot { padding: .4rem .5rem; color: var(--text-faint); font-size: .78rem; }
     .state.error {
       color: var(--error); border-left: 3px solid var(--error);
       background: var(--error-bg); padding: .6rem .8rem; border-radius: var(--radius-sm);
@@ -444,7 +454,7 @@
           </div>
           <div class="btn-row"><button class="btn" id="ra-load">Load models</button><span class="small faint" id="ra-load-state"></span></div>
           <div class="f-row" style="margin-top:.8rem">
-            <label class="f"><span>Model</span><select id="ra-model" disabled><option value="">— load models first —</option></select>
+            <label class="f"><span>Model</span><div class="mp-wrap"><input type="text" id="ra-model-q" class="mp-input" role="combobox" aria-label="Model" aria-autocomplete="list" aria-expanded="false" autocomplete="off"><ul id="ra-model-list" class="mp-list" role="listbox" aria-label="Models" hidden></ul></div><select id="ra-model" disabled><option value="">— load models first —</option></select>
               <span class="h" id="ra-model-count"></span></label>
             <label class="f"><span>Role</span><select id="ra-role"></select><span class="h" id="ra-role-hint"></span></label>
             <label class="f" id="ra-name-wrap"><span>Name</span><input type="text" id="ra-name" placeholder="e.g. Mistral EU"></label>
@@ -486,7 +496,7 @@
           <div class="f-row">
             <label class="f"><span>Model</span>
               <div class="row" style="gap:.4rem;align-items:center">
-                <select id="pe-model" style="flex:1;min-width:0"><option value="">— load models first —</option></select>
+                <div class="mp-wrap" style="flex:1;min-width:0"><input type="text" id="pe-model-q" class="mp-input" role="combobox" aria-label="Model" aria-autocomplete="list" aria-expanded="false" autocomplete="off"><ul id="pe-model-list" class="mp-list" role="listbox" aria-label="Models" hidden></ul></div><select id="pe-model" style="flex:1;min-width:0"><option value="">— load models first —</option></select>
                 <button type="button" class="btn sm" id="pe-load-models">Load models</button>
               </div>
               <span class="h" id="pe-model-hint">The chosen model is tested and forced onto requests routed here. Discovery uses the base URL above; for a keyed provider type the key first, because the stored key is not sent for discovery.</span>
@@ -745,6 +755,7 @@ function setField(field, value) {
   if (field.value !== String(value)) field.value = value;
 }
 function emptyState(host, title, hint) {
+  host.classList.remove("loading");
   clear(host).append(el("div", { class: "empty" }, [el("strong", { text: title }), hint ? el("div", { text: hint }) : null]));
 }
 function errorState(host, err) {
@@ -1065,11 +1076,13 @@ async function refreshOverview() {
     { includeZero: true }));
 
   const origins = clear($("#ov-origins"));
+  origins.classList.remove("loading");
   const oentries = Object.entries(d.metrics.requests_by_origin || {}).sort((a, b) => b[1] - a[1]);
   if (!oentries.length) emptyState(origins, "No request origins yet", "x-request-origin is recorded per request.");
   else origins.append(barChart(oentries.map(([k, v]) => ({ label: k, value: v }))));
 
   const fb = clear($("#ov-fallbacks"));
+  fb.classList.remove("loading");
   const fentries = Object.entries(d.metrics.fallback_by_reason || {});
   if (!fentries.length) emptyState(fb, "No fallbacks triggered", "The primary backend has answered every request.");
   else fb.append(barChart(fentries.map(([k, v]) => ({ label: k, value: v }))));
@@ -1839,6 +1852,99 @@ async function raLoadCatalog() {
   raSyncForm();
 }
 
+/* Searchable model picker. The hidden <select> stays the value source, so the fill,
+ * read and poll code keeps working unchanged. The combobox filters by model id
+ * (case-insensitive, every typed word must occur), renders at most MP_MAX rows and
+ * keeps the select's optgroups (kind fits / kind unknown) as list headers. */
+const MP_MAX = 100;
+function attachModelPicker(sel, input, list) {
+  let userQuery = "", active = -1, shown = [];
+  const isOpen = () => !list.hidden;
+  const optionsOf = () => {
+    const out = [];
+    for (const c of sel.children) {
+      if (c.tagName === "OPTGROUP") { for (const o of c.children) if (o.value) out.push({ group: c.label, value: o.value, text: o.textContent }); }
+      else if (c.tagName === "OPTION" && c.value) out.push({ group: "", value: c.value, text: c.textContent });
+    }
+    return out;
+  };
+  const metaOf = (o) => (o.text.startsWith(o.value) ? o.text.slice(o.value.length) : "").replace(/^\s*—\s*/, "");
+  function syncDisplay() {
+    input.disabled = sel.disabled;
+    const first = sel.options[0];
+    input.placeholder = first && !first.value ? first.textContent : "";
+    if (document.activeElement === input) return;
+    input.value = sel.value || "";
+  }
+  function setActive(i) {
+    if (!shown.length) return;
+    active = (i + shown.length) % shown.length;
+    list.querySelectorAll("[role=option]").forEach((li) => li.classList.toggle("mp-active", +li.dataset.idx === active));
+    const li = list.querySelector('[data-idx="' + active + '"]');
+    if (li) { input.setAttribute("aria-activedescendant", li.id); li.scrollIntoView({ block: "nearest" }); }
+  }
+  function render() {
+    const words = userQuery.toLowerCase().split(/\s+/).filter(Boolean);
+    const groups = new Map(); let total = 0;
+    for (const o of optionsOf()) {
+      const v = o.value.toLowerCase();
+      if (!words.every((w) => v.includes(w))) continue;
+      total++;
+      if (!groups.has(o.group)) groups.set(o.group, []);
+      groups.get(o.group).push(o);
+    }
+    shown = []; list.textContent = "";
+    const footer = (txt) => { const f = document.createElement("li"); f.className = "mp-foot"; f.setAttribute("role", "presentation"); f.textContent = txt; list.append(f); };
+    for (const [g, arr] of groups) {
+      if (shown.length >= MP_MAX) break;
+      if (g) { const h = document.createElement("li"); h.className = "mp-group"; h.setAttribute("role", "presentation"); h.textContent = g; list.append(h); }
+      for (const o of arr) {
+        if (shown.length >= MP_MAX) break;
+        const i = shown.length; shown.push(o);
+        const li = document.createElement("li");
+        li.id = list.id + "-" + i; li.setAttribute("role", "option"); li.dataset.idx = String(i);
+        li.setAttribute("aria-selected", String(o.value === sel.value));
+        li.className = "mp-opt" + (o.value === sel.value ? " mp-on" : "");
+        const name = document.createElement("span"); name.className = "mp-id"; name.textContent = o.value;
+        const meta = document.createElement("span"); meta.className = "mp-meta"; meta.textContent = metaOf(o);
+        li.append(name, meta); list.append(li);
+      }
+    }
+    if (!total) footer("No models match “" + userQuery + "”");
+    else if (total > shown.length) footer((total - shown.length) + " more — refine your search");
+    active = -1; input.removeAttribute("aria-activedescendant");
+  }
+  function open() { if (input.disabled) return; render(); list.hidden = false; input.setAttribute("aria-expanded", "true"); }
+  function close() { list.hidden = true; input.setAttribute("aria-expanded", "false"); active = -1; input.removeAttribute("aria-activedescendant"); }
+  function choose(o) {
+    sel.value = o.value;
+    sel.dispatchEvent(new Event("change", { bubbles: true }));
+    userQuery = ""; input.value = o.value; close();
+  }
+  input.addEventListener("focus", () => { userQuery = ""; open(); input.select(); });
+  input.addEventListener("click", () => { if (!isOpen()) { userQuery = ""; open(); } input.select(); });
+  input.addEventListener("input", () => { userQuery = input.value; open(); if (userQuery) setActive(0); });
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "ArrowDown") { e.preventDefault(); if (!isOpen()) open(); setActive(active + 1); }
+    else if (e.key === "ArrowUp") { e.preventDefault(); if (!isOpen()) open(); setActive(active < 0 ? shown.length - 1 : active - 1); }
+    else if (e.key === "Enter") { if (isOpen() && shown[active]) { e.preventDefault(); choose(shown[active]); } }
+    else if (e.key === "Escape") { if (isOpen()) { e.preventDefault(); userQuery = ""; close(); input.value = sel.value || ""; } }
+  });
+  input.addEventListener("blur", () => { close(); userQuery = ""; syncDisplay(); });
+  list.addEventListener("mousedown", (e) => {
+    const li = e.target.closest && e.target.closest("[role=option]");
+    if (!li) return;
+    e.preventDefault(); choose(shown[+li.dataset.idx]);
+  });
+  sel.style.display = "none";
+  list.id = list.id || (input.id + "-list");
+  input.setAttribute("aria-controls", list.id);
+  new MutationObserver(() => { if (isOpen()) render(); syncDisplay(); })
+    .observe(sel, { childList: true, subtree: true, attributes: true, attributeFilter: ["disabled"] });
+  sel.addEventListener("change", syncDisplay);
+  syncDisplay();
+}
+
 function fillModelSelect() {
   const sel = $("#ra-model"); clear(sel);
   const role = $("#ra-role").value;
@@ -2319,6 +2425,8 @@ showView(location.hash.slice(1) || "overview");
 refreshOverview().catch(() => {});
 startPolling();
 document.addEventListener("visibilitychange", () => { if (document.hidden) stopPolling(); else { startPolling(); refreshView(activeView); } });
+attachModelPicker($("#ra-model"), $("#ra-model-q"), $("#ra-model-list"));
+attachModelPicker($("#pe-model"), $("#pe-model-q"), $("#pe-model-list"));
 </script>
 </body>
 </html>
