@@ -47,8 +47,38 @@ self-hosted platform, but it runs standalone and has no NetAI-specific requireme
   selected by `CASCADE_IMAGE_MODE`.
 - **Routing transparency**: responses carry `x-cascade-route` (backend class) and `x-cascade-node`
   (registry node id) headers.
-- Optional **intent and complexity routing** for hybrid auxiliary/main selection
-  (`CASCADE_HYBRID_AUTO`), and a configurable default route (`CASCADE_DEFAULT_ROUTE`).
+- **Per-request route decision** (`src/state.rs`, `inspect_route`), checked in this order:
+  1. Settings pin: `CASCADE_DEFAULT_ROUTE=inference|auxiliary` overrides the payload.
+  2. Explicit hint: header `x-cascade-route` (also `x-cascade-mode`, `x-router-mode`, `x-route-mode`,
+     `x-router`) or body key `route`/`mode`/`target`/`routing`. Accepted values include `inference`,
+     `inference-server`, `main`, `large`; `auxiliary`, `auxiliary-server`, `aux`, `small`, `compression`,
+     `summary`, `subagent`; `ocr`, `document`, `vision`; and `auto`, `auto-small`, `auto-large`,
+     `complexity`, `session-affinity`. Unknown values fall back to main.
+  3. **Condition B, agent compression**: system-message markers from agent compression hooks send the
+     request to the auxiliary model. `MARKER_MODE` selects `substring` (default) or `prefix` matching.
+  4. **Condition A, document/OCR**: uploaded documents, image attachments and explicit `document`/`ocr`
+     flags go to the `ocr` pool, but only while an active `ocr` node is registered. Otherwise the
+     multimodal main or auxiliary backend parses them.
+  5. **Condition C, hybrid**: with `CASCADE_HYBRID_AUTO=true` and no pinned default route, a short, plain,
+     single-turn, text-only, tool-less prompt goes to the auxiliary model (see the X-Tier section and
+     configuration reference for thresholds).
+  6. Default: main inference.
+- **Complexity routing on the `auto` path**: a keyword and length score is compared with
+  `ROUTER_THRESHOLD` (default `0.5`). Scores at or below it go to the small (auxiliary) model; higher
+  scores go to the large (main) model. Keywords are matched per language (en, de, fr, es, it, pl, hu).
+- **Tool-aware routing**: a request that declares `tools` or `functions` goes to the main model when
+  `ROUTE_TOOLS_TO_LARGE=true` (default). Session affinity keeps a conversation that already used tools on
+  the main model.
+- **Vision fallback**: when the main model is text-only (`LARGE_MODEL_MULTIMODAL=false`), image requests
+  go to the auxiliary multimodal model. If the variable is unset, the gateway probes
+  `MULTIMODAL_CAPABILITY_URL` at startup.
+- **Confidence rerouting**: when the small model answers, its token logprobs are checked against
+  `CONFIDENCE_THRESHOLD` (default `0.7`). A low score, or a fallback tag in the small model's output,
+  reroutes the original request to the large model.
+- **Intent bypass**: planning, design, security and meta requests go directly to the large model.
+- **X-Tier header**: `x-tier: premium` sends the request to the large model, bypassing complexity
+  scoring. Any other value, including the default `standard`, uses normal complexity routing. See
+  [X-Tier](#x-tier-header) below.
 
 ### Metering and billing hooks
 - **One usage event per billable call**: chat, completions, embeddings, audio, images, video and realtime
@@ -223,6 +253,29 @@ Each route is also served under `/api/...` and `/web/api/...` for backward compa
 routes take the `x-cascade-admin-key` header. Extraction, GPU provisioner and dashboard routes are
 listed in `src/router.rs`.
 
+## X-Tier header
+
+`x-tier` is read on `/v1/chat/completions` and `/v1/messages` (`src/handlers.rs`, `src/anthropic.rs`).
+
+| Value | Effect |
+|---|---|
+| `premium` | Complexity scoring is skipped and the request goes to the large (main) model. |
+| `standard` (default) | Normal complexity routing. |
+| any other value | Treated the same as `standard`. |
+
+The tier is applied only on the auto path, that is, when the route decision is `auto` (for example
+through an `auto`, `auto-small`, `auto-large`, `complexity` or `session-affinity` hint). Tool-carrying
+requests, intent bypass and an existing session-affinity route are resolved first and keep their target
+even when the tier is `premium`.
+
+```bash
+curl http://localhost:3000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "x-cascade-route: auto" \
+  -H "x-tier: premium" \
+  -d '{"model":"cascade-hybrid-v1","messages":[{"role":"user","content":"Hello"}]}'
+```
+
 ## Configuration reference
 
 The most relevant variables. Full defaults are in `src/config.rs`.
@@ -251,9 +304,15 @@ The most relevant variables. Full defaults are in `src/config.rs`.
 | Variable | Default | Purpose |
 |---|---|---|
 | `CASCADE_ROUTING_STRATEGY` | `round_robin` | `round_robin` (weighted) or `least_latency` |
-| `CASCADE_DEFAULT_ROUTE` | none | Deterministic route: `inference`, `auxiliary` or `ocr` |
-| `CASCADE_HYBRID_AUTO` | `false` | Complexity-based auxiliary/main selection |
-| `CASCADE_HYBRID_AUX_MAX_CHARS` | `600` | Prompt size cut-off for the auxiliary route |
+| `CASCADE_DEFAULT_ROUTE` | none | Pin every request to `inference` or `auxiliary`. `ocr` is retired and ignored. |
+| `ROUTER_THRESHOLD` | `0.5` | Complexity score above which the `auto` path uses the large model |
+| `CONFIDENCE_THRESHOLD` | `0.7` | Minimum small-model token confidence before its answer is kept |
+| `ROUTE_TOOLS_TO_LARGE` | `true` | Send requests that declare tools to the main model |
+| `LARGE_MODEL_MULTIMODAL` | unset (auto-detect) | Whether the main model accepts images. If unset, probed via `MULTIMODAL_CAPABILITY_URL` (default `http://inference-server:18081/multimodal-capability`) |
+| `MARKER_MODE` | `substring` | Compression and document marker matching: `substring` or `prefix` |
+| `CASCADE_MODEL_NAME` | `cascade-hybrid-v1` | Unified model id the gateway advertises and accepts |
+| `CASCADE_HYBRID_AUTO` | `false` | Enable hybrid Condition C (short plain prompts to the auxiliary model) |
+| `CASCADE_HYBRID_AUX_MAX_CHARS` | `600` | Length budget for a prompt to count as simple (`0` disables the gate) |
 | `CASCADE_IMAGE_MODE` | `local_free` | `local`, `local_free` or `free` |
 | `CASCADE_EXTRACTION_STRATEGY` | see `src/config.rs` | Extraction backends: `priority` or `round_robin` |
 | `CIRCUIT_BREAKER_THRESHOLD` / `CIRCUIT_BREAKER_RESET_SECS` | `5` / `60` | Static-upstream circuit breaker |
