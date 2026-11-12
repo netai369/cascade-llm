@@ -3,8 +3,10 @@
 //! Library target so integration tests can exercise the router, registry and
 //! state machinery directly; the binary in `main.rs` is a thin bootstrap.
 
+pub mod access;
 pub mod anthropic;
 pub mod audio;
+pub mod audio_bridge;
 pub mod cascade_features;
 pub mod config;
 pub mod db;

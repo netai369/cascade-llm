@@ -177,4 +177,24 @@ mod audio_target_tests {
              delegates to proxy_request()"
         );
     }
+
+    /// The chat-side audio bridge (src/audio_bridge.rs) is a DIFFERENT thing
+    /// from the removed proxy helper: it does not proxy a request, it
+    /// transcribes an `input_audio` chat part so a TEXT-ONLY model can answer
+    /// it. It must still build the STT URL through audio_target() — the whole
+    /// point of the deleted helper was that a hand-built URL is wrong.
+    #[test]
+    fn the_audio_bridge_builds_its_url_through_audio_target() {
+        let bridge = include_str!("../src/audio_bridge.rs");
+        assert!(
+            bridge.contains("audio_target("),
+            "audio_bridge must build the STT URL via audio_target(), not by hand"
+        );
+        assert!(
+            !bridge.contains("{/v1/audio/transcriptions"),
+            "audio_bridge must not build the STT URL by concatenation — that is \
+             the append-side defect the deleted helper had; pass the path to \
+             audio_target() instead"
+        );
+    }
 }

@@ -81,6 +81,25 @@ pub async fn chat_completions(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("standard");
 
+    // ★ Audio bridge: the models behind this gateway are text-only, so an
+    // `input_audio` part cannot reach them. Transcribe it with the stack's
+    // own STT service FIRST and hand the model the transcript as text. Without
+    // this the main model rejects the request with "This servable supports
+    // only text input" and the aux model silently drops the clip and claims
+    // it cannot hear. Runs before routing, so the payload is text-only
+    // afterwards and takes the normal text route (main).
+    let mut json = json;
+    {
+        let stt_url = state.runtime.read().await.stt_url.clone();
+        crate::audio_bridge::audio_parts_to_text(
+            &state.http_client,
+            &stt_url,
+            state.config.stt_api_key.as_deref(),
+            &mut json,
+        )
+        .await;
+    }
+
     let permit = match state.tenant_limiter.acquire(&headers).await {
         Ok(permit) => permit,
         Err(rej) => return crate::tenant_limit::rejection_response(rej),
@@ -156,31 +175,89 @@ async fn fetch_models_from(client: &reqwest::Client, base_url: &str, model_type:
     models
 }
 
-pub async fn list_models(State(state): State<Arc<GatewayState>>) -> Response {
+/// Model-list shape for Anthropic clients (Claude Code uses this to populate
+/// its `/model` picker when `CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1`).
+///
+/// Two things are deliberate:
+///   * only ids beginning with `claude`/`anthropic` survive Claude Code's
+///     discovery filter — the gateway's real ids (`netai-hybrid`, `netai-aux`)
+///     are silently dropped, which is what "0 Modelle gefunden" looked like;
+///   * the ids are pure aliases. `anthropic::messages` already replaces the
+///     requested model with the gateway identity, so any of them works without
+///     touching the upstream model name.
+fn anthropic_model_page(state: &GatewayState) -> serde_json::Value {
+    let now = chrono::Utc::now().to_rfc3339();
+    let entries = [
+        ("claude-netai-hybrid", "NetAI Hybrid (gateway identity)"),
+        ("claude-netai-main", "NetAI Main (chat and tools)"),
+        ("claude-netai-aux", "NetAI Auxiliary (fast)"),
+    ];
+    let data: Vec<serde_json::Value> = entries
+        .iter()
+        .map(|(id, label)| {
+            serde_json::json!({
+                "type": "model",
+                "id": id,
+                "display_name": label,
+                "created_at": now,
+                // OpenAI clients ignore these; keeping them makes one payload
+                // valid for both dialects.
+                "object": "model",
+                "created": 1740000000,
+                "owned_by": "netai-stack",
+                "description": format!("Alias for the gateway model `{}`. The Messages route retargets it.", state.config.cascade_model_name),
+            })
+        })
+        .collect();
+    let first = data.first().and_then(|m| m.get("id")).cloned().unwrap_or_default();
+    let last = data.last().and_then(|m| m.get("id")).cloned().unwrap_or_default();
+    serde_json::json!({"data": data, "has_more": false, "first_id": first, "last_id": last})
+}
+
+pub async fn list_models(
+    State(state): State<Arc<GatewayState>>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    if headers.contains_key("anthropic-version") {
+        return json_response(anthropic_model_page(&state), StatusCode::OK);
+    }
+    let policy = state.config.capability_policy();
     let large_base = state.config.large_text_url.replace("/v1/chat/completions", "");
     let small_base = state.config.small_mllm_url.replace("/v1/chat/completions", "");
     let ocr_base = state.config.ocr_server_url.replace("/v1/chat/completions", "");
+    // TTS_URL / STT_URL point at the audio API (…/v1/audio); discovery lives
+    // one level up at …/v1/models.
+    let tts_base = state.config.tts_url.replace("/v1/audio", "");
+    let stt_base = state.config.stt_url.replace("/v1/audio", "");
 
     // Each fetch reports where it found the model rather than pretending to know
     // what it can do. Under OVMS one process serves the chat AND the embedding
-    // graphs, so "found on the main origin" is the only honest claim available —
-    // calling `bge-m3` a "Main" model (the old `model_type` tag) is a guess that
-    // was wrong on the live system.
+    // graphs, so the origin is not a capability claim; `apply_model_capabilities`
+    // adds that separately (and honors any upstream-supplied metadata).
     let large_models = fetch_models_from(&state.http_client, &large_base, "Main").await;
     let small_models = fetch_models_from(&state.http_client, &small_base, "Auxiliary").await;
-    let ocr_models = fetch_models_from(&state.http_client, &ocr_base, "OCR").await;
+    let ocr_models = if state.config.ocr_discovery_enabled {
+        fetch_models_from(&state.http_client, &ocr_base, "OCR").await
+    } else {
+        Vec::new()
+    };
+    let tts_models = fetch_models_from(&state.http_client, &tts_base, "Speech").await;
+    let stt_models =
+        fetch_models_from(&state.http_client, &stt_base, "Transcription").await;
 
     // Unified model identity: the cascade-hybrid model is what clients
     // (LibreChat, Hermes, …) send, so it leads the list. It carries an explicit
     // flag rather than relying on `owned_by`: the configured OCR fallback is
     // built by the same helper and is also `netai-stack`, and the console used
     // to label it "gateway identity — send this one".
-    let hybrid = build_model_info(&state.config.cascade_model_name);
+    let hybrid_id = state.config.cascade_model_name.clone();
+    let hybrid = build_model_info(&hybrid_id);
     let mut all_models = vec![serde_json::to_value(hybrid)
         .map(|mut m| {
             if let Some(obj) = m.as_object_mut() {
                 obj.insert("advertised_identity".into(), serde_json::json!(true));
             }
+            apply_model_capabilities(&mut m, &hybrid_id, "Main", &policy);
             m
         })
         .unwrap_or_default()];
@@ -190,7 +267,7 @@ pub async fn list_models(State(state): State<Arc<GatewayState>>) -> Response {
         .filter_map(|m| m.get("id").and_then(|v| v.as_str()).map(str::to_string))
         .collect();
 
-    let append = |models: Vec<serde_json::Value>, origin: &str, seen: &mut std::collections::HashSet<String>, out: &mut Vec<serde_json::Value>| {
+    let append = |models: Vec<serde_json::Value>, origin: &str, role: &str, seen: &mut std::collections::HashSet<String>, out: &mut Vec<serde_json::Value>| {
         for mut m in models {
             if let Some(obj) = m.as_object_mut() {
                 obj.insert("discovered_via".into(), serde_json::json!(origin));
@@ -200,31 +277,75 @@ pub async fn list_models(State(state): State<Arc<GatewayState>>) -> Response {
             // id that actually works upstream (gotcha 40/68), so a second entry
             // with the same name — which the live OVMS setup produced — is noise
             // in every consumer's model picker.
-            if id.is_empty() || !seen.insert(id) {
+            if id.is_empty() || !seen.insert(id.clone()) {
                 continue;
             }
+            apply_model_capabilities(&mut m, &id, role, &policy);
             out.push(m);
         }
     };
 
-    append(large_models, &large_base, &mut seen, &mut all_models);
-    append(small_models, &small_base, &mut seen, &mut all_models);
-    if ocr_models.is_empty() {
-        // Backend not reachable yet — still advertise the configured OCR model id.
-        if seen.insert(state.config.ocr_model_name.clone()) {
-            all_models.push(serde_json::to_value(build_model_info(&state.config.ocr_model_name))
-                .ok()
-                .filter(|m| m.is_object())
-                .map(|mut m| {
-                    if let Some(obj) = m.as_object_mut() {
-                        obj.insert("discovered_via".into(), serde_json::json!(ocr_base));
-                    }
-                    m
-                })
-                .unwrap_or_default());
+    let push_static = |id: &str, role: &str, origin: &str, seen: &mut std::collections::HashSet<String>, out: &mut Vec<serde_json::Value>| {
+        if id.is_empty() || !seen.insert(id.to_string()) {
+            return;
         }
+        let mut m = serde_json::to_value(build_model_info(id)).unwrap_or_default();
+        if let Some(obj) = m.as_object_mut() {
+            obj.insert("discovered_via".into(), serde_json::json!(origin));
+        }
+        apply_model_capabilities(&mut m, id, role, &policy);
+        out.push(m);
+    };
+
+    append(large_models, &large_base, "Main", &mut seen, &mut all_models);
+    append(small_models, &small_base, "Auxiliary", &mut seen, &mut all_models);
+
+    if ocr_models.is_empty() {
+        // The OCR service is optional/unreachable: still advertise the
+        // configured id so clients can see the endpoint exists. When OCR_URL is
+        // not configured at all, do not point `discovered_via` at the dead
+        // default host.
+        let ocr_origin = if state.config.ocr_discovery_enabled {
+            ocr_base.as_str()
+        } else {
+            "configured (OCR_MODEL_NAME)"
+        };
+        push_static(&state.config.ocr_model_name, "OCR", ocr_origin, &mut seen, &mut all_models);
     } else {
-        append(ocr_models, &ocr_base, &mut seen, &mut all_models);
+        append(ocr_models, &ocr_base, "OCR", &mut seen, &mut all_models);
+    }
+
+    if tts_models.is_empty() {
+        push_static(&state.config.tts_model_name, "Speech", &tts_base, &mut seen, &mut all_models);
+    } else {
+        append(tts_models, &tts_base, "Speech", &mut seen, &mut all_models);
+    }
+
+    if stt_models.is_empty() {
+        push_static(&state.config.stt_model_name, "Transcription", &stt_base, &mut seen, &mut all_models);
+    } else {
+        append(stt_models, &stt_base, "Transcription", &mut seen, &mut all_models);
+    }
+
+    // Image generation has no /v1/models upstream; it is a single configured
+    // backend, so advertise its model id directly.
+    push_static(
+        &state.config.image_model_name,
+        "Image",
+        &state.config.image_generation_url,
+        &mut seen,
+        &mut all_models,
+    );
+
+    // Operator deny list: remove ids that must never reach a client picker
+    // (e.g. a stale model left in an upstream's /v1/models).
+    if !policy.deny.is_empty() {
+        all_models.retain(|m| {
+            m.get("id")
+                .and_then(|v| v.as_str())
+                .map(|id| !policy.deny.iter().any(|d| d.eq_ignore_ascii_case(id)))
+                .unwrap_or(true)
+        });
     }
 
     json_response(
@@ -237,8 +358,38 @@ pub async fn list_models(State(state): State<Arc<GatewayState>>) -> Response {
 }
 
 pub async fn get_model(State(state): State<Arc<GatewayState>>) -> Response {
-    let model = build_model_info(&state.config.cascade_model_name);
-    json_response(serde_json::to_value(model).unwrap(), StatusCode::OK)
+    let id = state.config.cascade_model_name.clone();
+    let mut model = serde_json::to_value(build_model_info(&id)).unwrap_or_default();
+    apply_model_capabilities(&mut model, &id, "Main", &state.config.capability_policy());
+    json_response(model, StatusCode::OK)
+}
+
+/// `GET /v1/models/{id}`. Anthropic clients (and Claude Code's discovery)
+/// expect the Anthropic model shape; OpenAI clients keep the old object.
+pub async fn get_model_by_id(
+    State(state): State<Arc<GatewayState>>,
+    Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    if headers.contains_key("anthropic-version") {
+        let page = anthropic_model_page(&state);
+        if let Some(found) = page["data"]
+            .as_array()
+            .and_then(|a| a.iter().find(|m| m["id"] == serde_json::json!(id)).cloned())
+        {
+            return json_response(found, StatusCode::OK);
+        }
+        return json_response(
+            serde_json::json!({
+                "type": "error",
+                "error": {"type": "not_found_error", "message": format!("model {} not found", id)}
+            }),
+            StatusCode::NOT_FOUND,
+        );
+    }
+    let mut model = serde_json::to_value(build_model_info(&id)).unwrap_or_default();
+    apply_model_capabilities(&mut model, &id, "", &state.config.capability_policy());
+    json_response(model, StatusCode::OK)
 }
 
 pub async fn active_models(State(state): State<Arc<GatewayState>>) -> Response {

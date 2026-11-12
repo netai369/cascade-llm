@@ -255,6 +255,8 @@
       <div class="grp">Supply</div>
       <button class="tab" data-view="providers"><span class="ic">◈</span>Providers<span class="count" id="cnt-providers">–</span></button>
       <button class="tab" data-view="models"><span class="ic">◇</span>Models<span class="count" id="cnt-models">–</span></button>
+      <div class="grp">Connect</div>
+      <button class="tab" data-view="access"><span class="ic">↗</span>External access</button>
       <div class="grp">Configure</div>
       <button class="tab" data-view="routing"><span class="ic">⇄</span>Routing</button>
       <button class="tab" data-view="diagnostics"><span class="ic">⚑</span>Diagnostics</button>
@@ -535,6 +537,52 @@
         </div>
       </section>
 
+      <!-- ============================ ACCESS ============================== -->
+      <section class="view" id="view-access">
+        <h1>External access</h1>
+        <p class="sub">Where to point an app, which endpoints it can call, and the credentials that reach them. The base URL is taken from this request (or <code>CASCADE_PUBLIC_URL</code> / <code>DOMAIN</code>), so an engine or hostname change cannot leave a stale address here.</p>
+
+        <div class="panel">
+          <h2>Base URL <span class="spacer"></span><span class="hint">works from any network that can reach Caddy</span></h2>
+          <div id="ac-base" class="state loading">Loading…</div>
+        </div>
+
+        <div class="panel">
+          <h2>Service key <span class="spacer"></span><span class="hint">internal / full surface · <code>/api2</code></span></h2>
+          <div id="ac-service" class="state loading">Loading…</div>
+          <p class="small muted" style="margin-top:.7rem">
+            This is <code>CASCADE_API_KEY</code> from <code>.env</code>. It is the stack-wide credential and reaches every
+            endpoint below, including Anthropic Messages and the realtime socket. Keep it inside the trust boundary —
+            for people and external apps, issue a personal key instead.
+          </p>
+        </div>
+
+        <div class="panel">
+          <h2>Personal API keys <span class="spacer"></span><span class="hint">metered per user · <code>/api/llm/v1</code> · <code>nbk_…</code></span></h2>
+          <p class="small muted" style="margin-bottom:.8rem">
+            Created through the billing service, scoped to the signed-in user's tenant and billed to that account.
+            The key is shown once. Every user can also manage their own keys in the
+            <a href="/billing/" target="_blank" rel="noopener">billing dashboard ↗</a>.
+          </p>
+          <div class="f-row">
+            <label class="f"><span>Label</span><input type="text" id="ac-key-label" placeholder="e.g. Android app" autocomplete="off">
+              <span class="h">A name so you can tell keys apart later.</span></label>
+          </div>
+          <div class="btn-row"><button class="btn primary" id="ac-key-create">Create key</button><span class="small faint" id="ac-key-note"></span></div>
+          <div id="ac-keys" class="mt" style="margin-top:.9rem"><div class="state loading">Loading keys…</div></div>
+        </div>
+
+        <div class="panel">
+          <h2>Endpoints <span class="hint">both API dialects the gateway speaks</span></h2>
+          <div id="ac-endpoints" class="state loading">Loading…</div>
+        </div>
+
+        <div class="panel">
+          <h2>Claude Code / Anthropic clients <span class="hint">Messages API on the service base</span></h2>
+          <div id="ac-anthropic" class="state loading">Loading…</div>
+        </div>
+      </section>
+
       <!-- ============================= ROUTING ============================ -->
       <section class="view" id="view-routing">
         <h1>Routing</h1>
@@ -697,7 +745,15 @@ function el(tag, opts = {}, children = []) {
 }
 // clear() marks the region as rendered: from then on a poll never paints a
 // "Loading…" placeholder over it (that placeholder was the periodic flash).
-const clear = (node) => { while (node.firstChild) node.removeChild(node.firstChild); if (node.dataset) node.dataset.ready = "1"; return node; };
+// The host often starts as `class="state loading"`. Swapping its children is not
+// enough: `.state.loading::before` keeps the CSS spinner running next to the
+// rendered content forever. Drop the class whenever the region is (re)painted.
+const clear = (node) => {
+  while (node.firstChild) node.removeChild(node.firstChild);
+  node.classList.remove("loading");
+  if (node.dataset) node.dataset.ready = "1";
+  return node;
+};
 
 /* --- small shared vocabulary ------------------------------------------- */
 // Placeholder only before the first render of a region; a refresh never blanks
@@ -975,7 +1031,7 @@ $("#modal-close").addEventListener("click", () => { const m = $("#modal"); if (m
 /* =========================================================================
  * NAVIGATION
  * ========================================================================= */
-const VIEWS = ["overview", "backends", "fleet", "providers", "models", "routing", "diagnostics"];
+const VIEWS = ["overview", "backends", "fleet", "providers", "models", "access", "routing", "diagnostics"];
 let activeView = "overview";
 
 function showView(name) {
@@ -1028,8 +1084,8 @@ function stamp() {
 async function refreshView(name) {
   const fn = ({
     overview: refreshOverview, backends: refreshBackends, fleet: refreshFleet,
-    providers: refreshProviders, models: refreshModels, routing: refreshSettings,
-    diagnostics: refreshDiagnostics,
+    providers: refreshProviders, models: refreshModels, access: refreshAccess,
+    routing: refreshSettings, diagnostics: refreshDiagnostics,
   })[name];
   if (!fn) return;
   try { await fn(); stamp(); }
@@ -1217,8 +1273,8 @@ async function refreshBackends() {
   const servedBy = (role) => nodes.filter((n) => n.role === role && n.active)
     .map((n) => (n.label || n.id) + (n.healthy ? "" : " (unhealthy)"));
   clear(defs).append(
-    el("p", { class: "small muted", style: "margin-bottom:.6rem",
-      text: "Static defaults are fallback URLs from the stack configuration. “— none —” means no local engine serves that role: image, main and auxiliary are served only by registered external nodes, listed per role." }),
+    el("p", { class: "small muted", style: { marginBottom: ".6rem" },
+      text: "These are the fallback URLs from the running stack configuration (engine-specific container names). A registered node, when present, wins; the “Served by” line names it. “— none —” means no local engine is configured for that role." }),
     el("dl", { class: "kv" }, Object.entries(d.defaults || {}).flatMap(([role, url]) => {
       const s = servedBy(role);
       return [
@@ -2331,6 +2387,203 @@ async function openRaw(name) {
 }
 
 /* =========================================================================
+ * EXTERNAL ACCESS
+ *
+ * The address shown here must be the one a client can actually reach. It comes
+ * from `/web/api/access`, which derives it from this request / CASCADE_PUBLIC_URL
+ * — never from a hardcoded engine name.
+ * ========================================================================= */
+function copyButton(text, label = "Copy") {
+  return el("button", {
+    class: "btn sm", text: label,
+    on: {
+      click: async () => {
+        try {
+          await navigator.clipboard.writeText(text);
+          toast("Copied.");
+        } catch {
+          // Clipboard API needs a secure context; fall back to a selection.
+          const ta = el("textarea", { attrs: { readonly: true }, style: { position: "fixed", opacity: "0" } });
+          ta.value = text;
+          document.body.append(ta); ta.select();
+          try { document.execCommand("copy"); toast("Copied."); }
+          catch { toast("Copy failed — select the text manually.", "err"); }
+          ta.remove();
+        }
+      },
+    },
+  });
+}
+
+function accessUrlRow(label, url) {
+  return el("div", { class: "row", style: { display: "flex", alignItems: "center", gap: ".6rem", flexWrap: "wrap", marginBottom: ".45rem" } }, [
+    el("span", { class: "small muted", style: { minWidth: "9rem" }, text: label }),
+    el("code", { class: "mono", text: url }),
+    copyButton(url),
+  ]);
+}
+
+async function refreshAccess() {
+  const baseHost = $("#ac-base"), svc = $("#ac-service");
+  let d;
+  try { d = cache.access = await api("/web/api/access"); }
+  catch (e) { errorState(baseHost, e); errorState(svc, e); return; }
+
+  clear(baseHost).append(
+    accessUrlRow("Service-key base", d.service.base_url),
+    accessUrlRow("Personal-key base", d.user_keys.base_url),
+    el("div", { class: "small muted", text: `Public origin: ${d.public_base} · internal: ${d.service.internal_url}` }),
+  );
+
+  const keySet = !!d.service.key_set;
+  clear(svc).append(
+    el("div", { class: "row", style: { display: "flex", alignItems: "center", gap: ".6rem", flexWrap: "wrap" } }, [
+      el("span", { class: "small muted", style: { minWidth: "9rem" }, text: "Key" }),
+      el("code", { class: "mono", id: "ac-service-key", text: keySet ? (d.service.key_masked || "set") : "not configured" }),
+      copyButton(d.service.key_masked || "", "Copy masked"),
+      keySet ? el("button", { class: "btn sm", text: "Reveal", on: {
+        click: async (ev) => {
+          const btn = ev.currentTarget;
+          try {
+            const r = await api("/web/api/access/service-key");
+            const code = $("#ac-service-key");
+            if (code) code.textContent = r.key;
+            btn.replaceWith(copyButton(r.key, "Copy key"));
+            toast("Service key revealed — handle it as a root credential.");
+          } catch (e) { toast("Reveal failed: " + e.message, "err"); }
+        },
+      } }) : null,
+    ]),
+    el("div", { class: "small faint", style: { marginTop: ".4rem" }, text: d.service.scope }),
+  );
+
+  // Endpoints table — grouped by dialect so the Anthropic surface is not
+  // buried under the OpenAI rows.
+  const eps = d.endpoints || [];
+  const family = { openai: "OpenAI-compatible", anthropic: "Anthropic", rag: "RAG" };
+  const t = el("table", {}, [
+    el("thead", {}, [el("tr", {}, [
+      el("th", { text: "Dialect" }), el("th", { text: "Method" }), el("th", { text: "Path" }),
+      el("th", { text: "Reaches" }), el("th", { text: "Purpose" }),
+    ])]),
+  ]);
+  const tb = el("tbody");
+  eps.forEach((e) => {
+    tb.append(el("tr", {}, [
+      el("td", { class: "small", text: family[e.family] || e.family }),
+      el("td", { class: "mono small", text: e.method }),
+      el("td", { class: "mono small", text: e.path }),
+      el("td", { class: "small nowrap" }, [
+        (e.auth || []).includes("service") ? badge("service", "info") : null,
+        (e.auth || []).includes("user") ? badge("personal", "ok") : null,
+      ]),
+      el("td", { class: "small faint", text: e.purpose }),
+    ]));
+  });
+  t.append(tb);
+  clear($("#ac-endpoints")).append(
+    el("p", { class: "small muted", style: { marginBottom: ".6rem" }, text: d.endpoints_note }),
+    el("div", { class: "tw" }, [t]),
+  );
+
+  const cc = d.claude_code;
+  if (cc) {
+    clear($("#ac-anthropic")).append(
+      el("p", { class: "small muted", style: { marginBottom: ".6rem" }, text: cc.note }),
+      el("pre", { class: "raw", style: { whiteSpace: "pre-wrap", margin: "0 0 .7rem" }, text: cc.env.join("\n") }),
+      el("div", { class: "small muted" }, [
+        el("span", { text: "Discovery aliases: " }),
+        el("code", { class: "mono", text: (cc.models || []).join(", ") }),
+      ]),
+      el("div", { class: "btn-row", style: { marginTop: ".6rem" } }, [
+        copyButton(cc.env.join("\n"), "Copy env"),
+      ]),
+    );
+  }
+
+  loadAccessKeys();
+}
+
+async function loadAccessKeys() {
+  const host = $("#ac-keys");
+  if (!host) return;
+  loading(host, "Loading keys");
+  let d;
+  try { d = await api("/web/api/access/keys"); }
+  catch (e) {
+    errorState(host, e);
+    const hint = el("div", { class: "small muted", style: { marginTop: ".5rem" },
+      text: "The billing profile supplies personal keys. If it is disabled, enable it or use the service key above." });
+    host.append(hint);
+    return;
+  }
+  const keys = d.keys || [];
+  clear(host);
+  if (cache.newAccessKey) {
+    host.append(el("div", { class: "state", style: { borderColor: "var(--success)", marginBottom: ".7rem" } }, [
+      el("div", { class: "small", text: cache.newAccessKey.note || "Shown once — store it now." }),
+      el("div", { class: "row", style: { display: "flex", gap: ".6rem", alignItems: "center", flexWrap: "wrap", marginTop: ".4rem" } }, [
+        el("code", { class: "mono", text: cache.newAccessKey.key }),
+        copyButton(cache.newAccessKey.key, "Copy key"),
+        el("button", { class: "btn sm", text: "Dismiss", on: { click: () => { cache.newAccessKey = null; loadAccessKeys(); } } }),
+      ]),
+    ]));
+  }
+  if (!keys.length) {
+    host.append(el("div", { class: "empty" }, [
+      el("strong", { text: "No personal keys yet" }),
+      el("div", { text: "Create one above; it will be scoped to your account and metered like any other call." }),
+    ]));
+    return;
+  }
+  const t = el("table", {}, [
+    el("thead", {}, [el("tr", {}, [
+      el("th", { text: "Label" }), el("th", { text: "Prefix" }), el("th", { text: "Created" }),
+      el("th", { text: "Last used" }), el("th", { text: "State" }), el("th", { text: "" }),
+    ])]),
+  ]);
+  const tb = el("tbody");
+  keys.forEach((k) => {
+    const revoked = !!k.revoked_at;
+    tb.append(el("tr", {}, [
+      el("td", { text: k.label || "—" }),
+      el("td", { class: "mono small", text: k.prefix || "—" }),
+      el("td", { class: "small faint", text: (k.created_at || "").slice(0, 19).replace("T", " ") }),
+      el("td", { class: "small faint", text: k.last_used_at ? k.last_used_at.slice(0, 19).replace("T", " ") : "never" }),
+      el("td", {}, [revoked ? badge("revoked", "idle") : badge("active", "ok")]),
+      el("td", {}, [revoked ? null : el("button", {
+        class: "btn sm danger", text: "Revoke",
+        on: {
+          click: async () => {
+            if (!confirm("Revoke this key? Applications using it stop working immediately.")) return;
+            try { await api("/web/api/access/keys/" + encodeURIComponent(k.id), { method: "DELETE" }); toast("Key revoked."); loadAccessKeys(); }
+            catch (e) { toast("Revoke failed: " + e.message, "err"); }
+          },
+        },
+      })]),
+    ]));
+  });
+  t.append(tb);
+  host.append(el("div", { class: "tw" }, [t]));
+}
+
+$("#ac-key-create").addEventListener("click", async (e) => {
+  const btn = e.currentTarget, note = $("#ac-key-note");
+  btn.disabled = true; note.textContent = "Creating…";
+  try {
+    const r = await api("/web/api/access/keys", { method: "POST", body: { label: $("#ac-key-label").value.trim() } });
+    cache.newAccessKey = r;
+    $("#ac-key-label").value = "";
+    note.textContent = "Created — copy it now.";
+    await loadAccessKeys();
+    toast("API key created.");
+  } catch (err) {
+    note.textContent = err.message;
+    toast("Could not create key: " + err.message, "err", 7000);
+  } finally { btn.disabled = false; }
+});
+
+/* =========================================================================
  * DIAGNOSTICS
  * ========================================================================= */
 // Routes that deliberately do NOT go through the gateway, with the reason. This
@@ -2415,6 +2668,7 @@ $("#btn-refresh-all").addEventListener("click", async (e) => {
   await Promise.all([refreshOverview(), refreshBackends(), refreshModels()]);
   if (activeView === "fleet") await refreshFleet().catch(() => {});
   if (activeView === "providers") await refreshProviders().catch(() => {});
+  if (activeView === "access") await refreshAccess().catch(() => {});
   btn.disabled = false; btn.textContent = "Refresh all";
   toast("Refreshed.");
 });

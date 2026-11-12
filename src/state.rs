@@ -358,6 +358,8 @@ impl GatewayState {
     }
 
     async fn pick_model(&self, has_image: bool, complexity: f64, tier: &str) -> (bool, String) {
+        // NOTE: `has_image` is passed as "has image OR audio" by the caller —
+        // the aux model takes both, the text-only main model neither.
         let rt = self.runtime.read().await;
         let router_threshold = rt.router_threshold;
         let large_url = self.config.large_text_url.clone();
@@ -466,6 +468,18 @@ impl GatewayState {
         payload.messages.iter().any(|m| match &m.content {
             Some(MessageContent::Parts(parts)) => parts.iter().any(
                 |p| matches!(p, MessageContentPart::ImageUrl { .. }),
+            ),
+            _ => false,
+        })
+    }
+
+    /// True when the conversation carries audio content. The aux model
+    /// (Gemma) can take audio; the text-only main model cannot — an audio
+    /// payload forwarded to main is rejected by the engine.
+    fn has_audio(&self, payload: &ChatCompletionRequest) -> bool {
+        payload.messages.iter().any(|m| match &m.content {
+            Some(MessageContent::Parts(parts)) => parts.iter().any(
+                |p| matches!(p, MessageContentPart::InputAudio { .. }),
             ),
             _ => false,
         })
@@ -1163,12 +1177,28 @@ impl GatewayState {
 
     pub async fn route_request_with_fallback(
         &self,
-        payload: ChatCompletionRequest,
+        mut payload: ChatCompletionRequest,
         is_streaming: bool,
         tier: &str,
         headers: &HeaderMap,
         _origin: &str,
     ) -> Result<(HeaderMap, Body), ProxyError> {
+        // OVMS rejects `max_tokens` at or above the graph's `max_tokens_limit`
+        // (400 "max_tokens exceeds limit provided in graph config"). Claude
+        // Code and other Anthropic clients ask for 32k/64k regardless of what
+        // the local engine can produce, so cap before routing. The engine
+        // enforces a STRICT upper bound, hence the configured value is already
+        // one below the graph limit (CASCADE_MAX_OUTPUT_TOKENS=20479 for a
+        // 20480 limit).
+        if let (Some(limit), Some(requested)) = (self.config.max_output_tokens, payload.max_tokens) {
+            if requested > limit {
+                info!(
+                    "MAX_TOKENS_CLAMP: requested={} limit={} (engine graph ceiling)",
+                    requested, limit
+                );
+                payload.max_tokens = Some(limit);
+            }
+        }
         let mut decision = self.inspect_route(&payload, headers).await;
         // Intent-based routing: planning/design/security/meta → force large model.
         let intent = intent_routing::inspect_intent(&payload);
@@ -1373,15 +1403,18 @@ impl GatewayState {
     /// no-op whenever aux and main are the same model (the vLLM fold) or the
     /// engine ignores the field (llama.cpp rollback).
     async fn retarget_aux_model(&self, payload: &mut ChatCompletionRequest) {
-        if !self.hybrid_enabled().await {
-            return;
-        }
+        // NOT gated on hybrid_enabled(): this is about WHICH MODEL the aux
+        // backend serves, not about WHY the request went to the aux backend.
+        // With the complexity router off (hybrid_auto=false) a vision request
+        // still routes to the aux backend — and if the payload keeps the MAIN
+        // model id, the engine serves the text-only main graph and rejects the
+        // image ("This servable supports only text input").
         let main = self.config.main_model_name.trim();
         let aux = self.config.small_model_name.trim();
         if main.is_empty() || aux.is_empty() || aux == main || payload.model != main {
             return;
         }
-        info!("AUX_MODEL_RETARGET: {} -> {} (hybrid routing)", payload.model, aux);
+        info!("AUX_MODEL_RETARGET: {} -> {} (aux route)", payload.model, aux);
         payload.model = aux.to_string();
     }
 
@@ -1433,9 +1466,9 @@ impl GatewayState {
         is_streaming: bool,
         headers: &HeaderMap,
     ) -> Result<(HeaderMap, Body), ProxyError> {
-        if self.has_image(payload) && !self.config.large_model_multimodal {
+        if (self.has_image(payload) || self.has_audio(payload)) && !self.config.large_model_multimodal {
             info!(
-                "ROUTE_C: image detected but large model is text-only -> auxiliary multimodal backend"
+                "ROUTE_C: image/audio detected but large model is text-only -> auxiliary multimodal backend"
             );
             return self.route_auxiliary(payload, is_streaming, headers).await;
         }
@@ -1482,7 +1515,8 @@ impl GatewayState {
             self.apply_node_model(&mut payload, &node).await;
             return self.private_proxy_with_bearer(&payload, &url, bearer.as_deref(), RouteBackend::InferenceServer, is_streaming, headers, node.as_deref()).await;
         }
-        let has_image = self.has_image(&payload);
+        // image OR audio: the aux model takes both, the text-only main neither
+        let has_image = self.has_image(&payload) || self.has_audio(&payload);
         let has_tools = payload.tools.is_some() || payload.functions.is_some();
         let complexity_score = self.evaluate_complexity(&payload.messages);
         let language = language::detect_language(&payload.messages);

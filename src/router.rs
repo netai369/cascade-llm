@@ -1,6 +1,6 @@
 //! Axum router assembly — shared by the binary and integration tests.
 
-use crate::{cascade_features, handlers, state::GatewayState};
+use crate::{access, cascade_features, handlers, state::GatewayState};
 use axum::{
     extract::DefaultBodyLimit,
     middleware,
@@ -66,6 +66,33 @@ pub fn build_router(state: Arc<GatewayState>) -> Router {
         // consumption, so it sits behind the same require_admin layer.
         .route("/web/api/v1/admin/usage", get(crate::usage::admin_usage))
         .route("/api/v1/admin/usage", get(crate::usage::admin_usage))
+        // External access: public URL + endpoint catalog, the stack service
+        // key (reveal on demand), and the caller's own metered API keys.
+        // Key CRUD is proxied to billing, which owns the key store and scopes
+        // it to the forward_auth identity Caddy copied onto this request.
+        .route("/web/api/access", get(access::access_info))
+        .route("/api/access", get(access::access_info))
+        .route(
+            "/web/api/access/service-key",
+            get(access::reveal_service_key),
+        )
+        .route(
+            "/api/access/service-key",
+            get(access::reveal_service_key),
+        )
+        .route(
+            "/web/api/access/keys",
+            get(access::list_keys).post(access::create_key),
+        )
+        .route(
+            "/api/access/keys",
+            get(access::list_keys).post(access::create_key),
+        )
+        .route(
+            "/web/api/access/keys/:id",
+            delete(access::delete_key),
+        )
+        .route("/api/access/keys/:id", delete(access::delete_key))
         .route("/web/api/provisioner/status", get(crate::provisioner::status))
         .route("/api/provisioner/status", get(crate::provisioner::status))
         .route(
@@ -103,6 +130,8 @@ pub fn build_router(state: Arc<GatewayState>) -> Router {
             post(crate::anthropic::count_tokens),
         )
         .route("/v1/models", get(handlers::list_models))
+        // Anthropic `models.retrieve`; also the OpenAI single-model path.
+        .route("/v1/models/:id", get(handlers::get_model_by_id))
         .route("/models", get(handlers::list_models))
         .route("/model", get(handlers::get_model))
         // Same payload under the /web/api namespace the console uses. The old

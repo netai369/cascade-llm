@@ -6,12 +6,20 @@ pub struct AppConfig {
     pub large_mllm_url: String,
     pub large_text_url: String,
     pub ocr_server_url: String,
+    /// True only when `OCR_URL` was explicitly configured. The default OCR host
+    /// is a document service without `/v1/models`, so probing it every reconcile
+    /// cycle produced a permanent "Failed to connect" log line.
+    pub ocr_discovery_enabled: bool,
     pub main_model_name: String,
     pub small_model_name: String,
     pub ocr_model_name: String,
     /// Unified model identity advertised in /v1/models, /model, x-model-name
     /// header, and streaming chunks. Default: "cascade-hybrid-v1".
     pub cascade_model_name: String,
+    /// Capability metadata advertised on model-discovery responses. Built once
+    /// from CASCADE_MAIN_CAPABILITIES / CASCADE_AUX_CAPABILITIES /
+    /// CASCADE_MODEL_CAPABILITIES so a request does not re-read the environment.
+    pub model_capabilities: CapabilityPolicy,
     pub router_threshold: f64,
     pub confidence_threshold: f64,
     pub large_model_multimodal: bool,
@@ -23,6 +31,8 @@ pub struct AppConfig {
     pub multimodal_capability_url: String,
     pub providers: Vec<ProviderConfig>,
     pub tts_url: String,
+    /// Fallback id advertised when the TTS service's /v1/models is unreachable.
+    pub tts_model_name: String,
     /// Bearer the TTS service requires, injected on the TTS proxy route.
     ///
     /// ★ The key was ALREADY in the container environment (`POCKET_API_KEY`,
@@ -37,6 +47,8 @@ pub struct AppConfig {
     /// asymmetry is why one half of the audio proxy worked and hid the other.
     pub tts_api_key: Option<String>,
     pub stt_url: String,
+    /// Fallback id advertised when the STT service's /v1/models is unreachable.
+    pub stt_model_name: String,
     /// Service key for the static STT fallback (STT_API_KEY); unset = none.
     pub stt_api_key: Option<String>,
     pub embeddings_url: String,
@@ -67,6 +79,21 @@ pub struct AppConfig {
     /// Bearer token sent to local static llama upstreams (LLAMA_API_KEY).
     /// Read once at startup; empty/unset means no header (today's behavior).
     pub llama_api_key: Option<String>,
+    /// Stack-wide external API bearer (CASCADE_API_KEY). Only used by the
+    /// console's Access page, which shows it masked and reveals it on demand;
+    /// the actual /api2 check happens in Caddy. Never routed upstream.
+    pub service_api_key: Option<String>,
+    /// Canonical public URL for external clients (CASCADE_PUBLIC_URL). Unset
+    /// falls back to `https://$DOMAIN`, then to the request's forwarded Host.
+    pub public_url: Option<String>,
+    /// Billing service origin (BILLING_URL). It owns the per-user `nbk_…`
+    /// key store, so the Access page proxies list/create/revoke there.
+    pub billing_url: Option<String>,
+    /// Hard per-request output cap (CASCADE_MAX_OUTPUT_TOKENS). OVMS rejects
+    /// `max_tokens` at or above the graph's `max_tokens_limit` with a 400, and
+    /// Anthropic clients (Claude Code) routinely ask for 32k+. Clamping here
+    /// keeps the request alive instead of surfacing an engine error.
+    pub max_output_tokens: Option<u32>,
     /// Deterministic routing mode: none|inference|auxiliary|ocr (CASCADE_DEFAULT_ROUTE).
     pub default_route: Option<String>,
     /// Hybrid complexity router: when the default route is auto, a short plain
@@ -81,6 +108,8 @@ pub struct AppConfig {
 
     // Media generation endpoints (fallback when no registry node is active)
     pub image_generation_url: String,
+    /// Fallback id advertised for image generation (no /v1/models upstream).
+    pub image_model_name: String,
     /// How the image route picks a backend. `CASCADE_IMAGE_MODE`:
     ///
     ///   `local`       — only the configured local backend. Nothing leaves the
@@ -205,6 +234,9 @@ impl AppConfig {
                 .unwrap_or_else(|_| "http://inference-server:8080/v1/chat/completions".to_string()),
             ocr_server_url: std::env::var("OCR_URL")
                 .unwrap_or_else(|_| "http://ocr-server:8082/v1/chat/completions".to_string()),
+            ocr_discovery_enabled: std::env::var("OCR_URL")
+                .map(|v| !v.trim().is_empty())
+                .unwrap_or(false),
             main_model_name: std::env::var("MAIN_MODEL_NAME")
                 .unwrap_or_else(|_| "Qwythos-9B-v2".to_string()),
             small_model_name: std::env::var("SMALL_MODEL_NAME")
@@ -213,6 +245,7 @@ impl AppConfig {
                 .unwrap_or_else(|_| "PaddleOCR-VL-1.6".to_string()),
             cascade_model_name: std::env::var("CASCADE_MODEL_NAME")
                 .unwrap_or_else(|_| "cascade-hybrid-v1".to_string()),
+            model_capabilities: CapabilityPolicy::from_env(),
             router_threshold: std::env::var("ROUTER_THRESHOLD")
                 .unwrap_or_else(|_| "0.5".to_string())
                 .parse::<f64>()
@@ -244,11 +277,15 @@ impl AppConfig {
             providers: Vec::new(),
             tts_url: std::env::var("TTS_URL")
                 .unwrap_or_else(|_| "http://speech-tts:8800/v1/audio".to_string()),
+            tts_model_name: std::env::var("TTS_MODEL_NAME")
+                .unwrap_or_else(|_| "pocket-tts".to_string()),
             tts_api_key: std::env::var("POCKET_API_KEY")
                 .ok()
                 .filter(|k| !k.trim().is_empty()),
             stt_url: std::env::var("STT_URL")
                 .unwrap_or_else(|_| "http://speech-stt:5092/v1/audio".to_string()),
+            stt_model_name: std::env::var("STT_MODEL_NAME")
+                .unwrap_or_else(|_| "parakeet-tdt-0.6b-v3".to_string()),
             stt_api_key: std::env::var("STT_API_KEY").ok().filter(|k| !k.trim().is_empty()),
             embeddings_url: std::env::var("EMBEDDINGS_URL")
                 .unwrap_or_else(|_| "http://embeddings:8801".to_string()),
@@ -277,6 +314,16 @@ impl AppConfig {
                 .or_else(|| std::env::var("KNOWLEDGE_API_KEY").ok())
                 .filter(|s| !s.is_empty()),
             llama_api_key: std::env::var("LLAMA_API_KEY").ok().filter(|s| !s.is_empty()),
+            service_api_key: std::env::var("CASCADE_API_KEY").ok().filter(|s| !s.is_empty()),
+            public_url: std::env::var("CASCADE_PUBLIC_URL").ok().filter(|s| !s.is_empty()),
+            billing_url: std::env::var("BILLING_URL")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .or_else(|| Some("http://billing:8099".to_string())),
+            max_output_tokens: std::env::var("CASCADE_MAX_OUTPUT_TOKENS")
+                .ok()
+                .and_then(|v| v.trim().parse::<u32>().ok())
+                .filter(|v| *v > 0),
             default_route: std::env::var("CASCADE_DEFAULT_ROUTE").ok().filter(|s| !s.is_empty()),
             hybrid_auto: std::env::var("CASCADE_HYBRID_AUTO")
                 .unwrap_or_else(|_| "false".to_string())
@@ -294,6 +341,8 @@ impl AppConfig {
                 .unwrap_or_else(|| "local_free".to_string()),
             image_generation_url: std::env::var("IMAGE_GENERATION_URL")
                 .unwrap_or_else(|_| "http://localhost:8080/v1/images/generations".to_string()),
+            image_model_name: std::env::var("IMAGE_MODEL_NAME")
+                .unwrap_or_else(|_| "z-image-turbo".to_string()),
             video_generation_url: std::env::var("VIDEO_GENERATION_URL")
                 .unwrap_or_else(|_| "http://localhost:8080/v1/video/generations".to_string()),
 
@@ -322,6 +371,11 @@ impl AppConfig {
                 .unwrap_or_default(),
             upstream_seeds: Vec::new(),
         }
+    }
+
+    /// Capability policy resolved at startup (env wins over the defaults).
+    pub fn capability_policy(&self) -> CapabilityPolicy {
+        self.model_capabilities.clone()
     }
 
     /// Builds the initial extraction backend entries from env vars.

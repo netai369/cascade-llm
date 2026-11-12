@@ -403,6 +403,188 @@ async fn advertised_models_are_deduped_and_say_where_they_were_found() {
 }
 
 // ---------------------------------------------------------------------------
+// OpenAI model discovery: every endpoint, with capabilities
+// ---------------------------------------------------------------------------
+
+async fn spawn_models_stub(ids: &[&str]) -> String {
+    let data: Vec<serde_json::Value> = ids
+        .iter()
+        .map(|id| {
+            serde_json::json!({"id": id, "object": "model", "owned_by": "stub"})
+        })
+        .collect();
+    let router = Router::new().route(
+        "/v1/models",
+        get(move || {
+            let data = data.clone();
+            async move { axum::Json(serde_json::json!({"object": "list", "data": data})) }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap(); });
+    origin
+}
+
+#[tokio::test]
+async fn discovery_advertises_every_endpoint_with_capabilities() {
+    let llm = spawn_models_stub(&[
+        "netai-hybrid",
+        "netai-hybrid-think",
+        "netai-aux",
+        "bge-m3",
+        "bge-reranker-v2-m3",
+        "Qwen3.5-9B",
+    ])
+    .await;
+    let ocr = spawn_models_stub(&["docling-serve"]).await;
+    let tts = spawn_models_stub(&["de_6l", "en_6l"]).await;
+    let stt = spawn_models_stub(&["parakeet-tdt-0.6b-v3"]).await;
+
+    let base = spawn_gateway_with(|cfg| {
+        cfg.large_text_url = format!("{}/v1/chat/completions", llm);
+        cfg.small_mllm_url = format!("{}/v1/chat/completions", llm);
+        cfg.ocr_server_url = format!("{}/v1/chat/completions", ocr);
+        cfg.tts_url = format!("{}/v1/audio", tts);
+        cfg.stt_url = format!("{}/v1/audio", stt);
+        cfg.cascade_model_name = "netai-hybrid".to_string();
+        cfg.tts_model_name = "pocket-tts".to_string();
+        cfg.stt_model_name = "parakeet-tdt-0.6b-v3".to_string();
+        cfg.ocr_model_name = "docling-serve".to_string();
+        cfg.image_model_name = "z-image-turbo".to_string();
+        cfg.model_capabilities = cascade_llm::types::CapabilityPolicy::default();
+        cfg.model_capabilities.deny = vec!["Qwen3.5-9B".to_string()];
+    })
+    .await;
+    let client = reqwest::Client::new();
+
+    let body: serde_json::Value = client
+        .get(format!("{}/v1/models", base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let data = body["data"].as_array().unwrap();
+    let ids: Vec<&str> = data.iter().map(|m| m["id"].as_str().unwrap()).collect();
+
+    // Every endpoint family must be proposed: chat, embeddings, rerank, OCR,
+    // TTS, STT and image generation.
+    for id in [
+        "netai-hybrid",
+        "netai-hybrid-think",
+        "netai-aux",
+        "bge-m3",
+        "bge-reranker-v2-m3",
+        "docling-serve",
+        "de_6l",
+        "en_6l",
+        "parakeet-tdt-0.6b-v3",
+        "z-image-turbo",
+    ] {
+        assert!(ids.contains(&id), "missing {id}: {ids:?}");
+    }
+    assert!(!ids.iter().any(|id| id.to_ascii_lowercase().contains("qwen")));
+
+    let hybrid = data.iter().find(|m| m["id"] == "netai-hybrid").unwrap();
+    assert_eq!(hybrid["capabilities"]["chat"], true);
+    assert_eq!(hybrid["capabilities"]["streaming"], true);
+    assert_eq!(hybrid["capabilities"]["tools"], true);
+    assert_eq!(hybrid["capabilities"]["vision"], true);
+    assert_eq!(hybrid["type"], "vlm");
+    assert_eq!(hybrid["architecture"]["input_modalities"][1], "image");
+    assert!(hybrid["supported_parameters"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|p| p.as_str() == Some("tools")));
+
+    let think = data.iter().find(|m| m["id"] == "netai-hybrid-think").unwrap();
+    assert_eq!(think["capabilities"]["thinking"], true);
+
+    let aux = data.iter().find(|m| m["id"] == "netai-aux").unwrap();
+    assert_eq!(aux["capabilities"]["chat"], true);
+    assert_eq!(aux["capabilities"]["tools"], false);
+    assert_eq!(aux["capabilities"]["vision"], false);
+
+    let bge = data.iter().find(|m| m["id"] == "bge-m3").unwrap();
+    assert_eq!(bge["capabilities"]["embeddings"], true);
+    assert_eq!(bge["capabilities"]["chat"], false);
+    assert_eq!(bge["type"], "embeddings");
+
+    let rerank = data
+        .iter()
+        .find(|m| m["id"] == "bge-reranker-v2-m3")
+        .unwrap();
+    assert_eq!(rerank["capabilities"]["rerank"], true);
+    assert_eq!(rerank["type"], "rerank");
+
+    let docling = data.iter().find(|m| m["id"] == "docling-serve").unwrap();
+    assert_eq!(docling["capabilities"]["ocr"], true);
+    assert_eq!(docling["type"], "ocr");
+
+    let tts_entry = data.iter().find(|m| m["id"] == "de_6l").unwrap();
+    assert_eq!(tts_entry["capabilities"]["tts"], true);
+    assert_eq!(tts_entry["type"], "tts");
+    assert_eq!(tts_entry["capabilities"]["chat"], false);
+
+    let stt_entry = data
+        .iter()
+        .find(|m| m["id"] == "parakeet-tdt-0.6b-v3")
+        .unwrap();
+    assert_eq!(stt_entry["capabilities"]["stt"], true);
+    assert_eq!(stt_entry["capabilities"]["diarization"], true);
+    assert_eq!(stt_entry["type"], "stt");
+    assert_eq!(stt_entry["capabilities"]["chat"], false);
+
+    let image = data.iter().find(|m| m["id"] == "z-image-turbo").unwrap();
+    assert_eq!(image["capabilities"]["image"], true);
+    assert_eq!(image["type"], "image");
+    assert_eq!(image["capabilities"]["chat"], false);
+}
+
+#[tokio::test]
+async fn discovery_keeps_fallback_ids_when_services_are_down() {
+    let base = spawn_gateway_with(|cfg| {
+        // Connection-refused endpoint; discovery must still propose the
+        // configured ids instead of silently dropping an endpoint family.
+        cfg.large_text_url = "http://127.0.0.1:1/v1/chat/completions".to_string();
+        cfg.small_mllm_url = "http://127.0.0.1:1/v1/chat/completions".to_string();
+        cfg.ocr_server_url = "http://127.0.0.1:1/v1/chat/completions".to_string();
+        cfg.tts_url = "http://127.0.0.1:1/v1/audio".to_string();
+        cfg.stt_url = "http://127.0.0.1:1/v1/audio".to_string();
+        cfg.cascade_model_name = "netai-hybrid".to_string();
+        cfg.tts_model_name = "pocket-tts".to_string();
+        cfg.stt_model_name = "parakeet-tdt-0.6b-v3".to_string();
+        cfg.ocr_model_name = "docling-serve".to_string();
+        cfg.image_model_name = "z-image-turbo".to_string();
+        cfg.model_capabilities = cascade_llm::types::CapabilityPolicy::default();
+    })
+    .await;
+    let client = reqwest::Client::new();
+
+    let body: serde_json::Value = client
+        .get(format!("{}/v1/models", base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let data = body["data"].as_array().unwrap();
+    let by_id = |id: &str| data.iter().find(|m| m["id"] == id).unwrap();
+
+    assert_eq!(by_id("docling-serve")["capabilities"]["ocr"], true);
+    assert_eq!(by_id("pocket-tts")["capabilities"]["tts"], true);
+    assert_eq!(
+        by_id("parakeet-tdt-0.6b-v3")["capabilities"]["stt"],
+        true
+    );
+    assert_eq!(by_id("z-image-turbo")["capabilities"]["image"], true);
+}
+
+// ---------------------------------------------------------------------------
 // GPU provisioner passthrough
 // ---------------------------------------------------------------------------
 
@@ -774,4 +956,174 @@ async fn console_is_served_from_both_mounts_and_has_no_cdn() {
             );
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// External access (address + credentials discoverability)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn access_lists_both_api_dialects_and_the_live_base_url() {
+    let base = spawn_gateway_with(|cfg| {
+        cfg.public_url = Some("https://example.test".to_string());
+        cfg.service_api_key = Some("stack-service-key-123456".to_string());
+        cfg.billing_url = None;
+    })
+    .await;
+    let client = reqwest::Client::new();
+
+    let body: serde_json::Value = client
+        .get(format!("{}/web/api/access", base))
+        .headers(admin_headers())
+        .send().await.unwrap().json().await.unwrap();
+
+    assert_eq!(body["public_base"], "https://example.test");
+    assert_eq!(body["service"]["base_url"], "https://example.test/api2");
+    assert_eq!(body["user_keys"]["base_url"], "https://example.test/api/llm/v1");
+    // The full stack key must never be in a list response.
+    assert_eq!(body["service"]["key_set"], true);
+    assert_eq!(body["service"]["key_masked"], "***3456");
+    assert!(body["service"].get("key").is_none());
+
+    let paths: Vec<&str> = body["endpoints"]
+        .as_array().unwrap().iter()
+        .map(|e| e["path"].as_str().unwrap())
+        .collect();
+    assert!(paths.contains(&"/v1/chat/completions"));
+    // Anthropic is a first-class surface, not a footnote behind OpenAI.
+    assert!(paths.contains(&"/v1/messages"));
+    assert!(paths.contains(&"/v1/messages/count_tokens"));
+    assert!(paths.contains(&"/v1/rerank"));
+}
+
+#[tokio::test]
+async fn service_key_reveal_is_admin_gated_and_returns_the_configured_key() {
+    let base = spawn_gateway_with(|cfg| {
+        cfg.service_api_key = Some("stack-service-key-123456".to_string());
+    })
+    .await;
+    let client = reqwest::Client::new();
+
+    let anon = client
+        .get(format!("{}/web/api/access/service-key", base))
+        .send().await.unwrap();
+    assert_eq!(anon.status(), reqwest::StatusCode::FORBIDDEN);
+
+    let keyed: serde_json::Value = client
+        .get(format!("{}/web/api/access/service-key", base))
+        .headers(admin_headers())
+        .send().await.unwrap().json().await.unwrap();
+    assert_eq!(keyed["key"], "stack-service-key-123456");
+}
+
+#[tokio::test]
+async fn personal_key_crud_without_billing_is_a_clear_502_not_a_fake_success() {
+    let base = spawn_gateway_with(|cfg| {
+        // Reserved TEST-NET address: nothing listens, so this fails fast.
+        cfg.billing_url = Some("http://192.0.2.1:8099".to_string());
+    })
+    .await;
+    let client = reqwest::Client::new();
+
+    let res = client
+        .post(format!("{}/web/api/access/keys", base))
+        .headers(admin_headers())
+        .json(&serde_json::json!({"label": "phone"}))
+        .send().await.unwrap();
+    assert_eq!(res.status(), reqwest::StatusCode::BAD_GATEWAY);
+    let body: serde_json::Value = res.json().await.unwrap();
+    assert!(body["error"].as_str().unwrap().contains("billing"));
+}
+
+// ---------------------------------------------------------------------------
+// Anthropic model discovery (Claude Code `/model` picker)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn anthropic_model_list_advertises_claude_prefixed_aliases() {
+    let base = spawn_gateway().await;
+    let client = reqwest::Client::new();
+
+    let anth: serde_json::Value = client
+        .get(format!("{}/v1/models?limit=1000", base))
+        .header("anthropic-version", "2023-06-01")
+        .send().await.unwrap().json().await.unwrap();
+
+    // Claude Code drops every id that does not begin with claude/anthropic;
+    // netai-hybrid and bge-m3 alone produced "0 Modelle gefunden".
+    let ids: Vec<&str> = anth["data"].as_array().unwrap().iter()
+        .map(|m| m["id"].as_str().unwrap()).collect();
+    assert!(ids.iter().all(|id| id.starts_with("claude") || id.starts_with("anthropic")));
+    assert!(ids.contains(&"claude-netai-hybrid"));
+    assert!(ids.contains(&"claude-netai-main"));
+    assert!(ids.contains(&"claude-netai-aux"));
+    // Anthropic page shape.
+    assert_eq!(anth["has_more"], false);
+    assert_eq!(anth["first_id"], ids[0]);
+    assert!(anth["data"][0]["type"] == "model");
+    assert!(anth["data"][0]["display_name"].as_str().is_some());
+    assert!(anth["data"][0]["created_at"].as_str().is_some());
+
+    // OpenAI clients keep the historical shape and real model ids.
+    let oai: serde_json::Value = client
+        .get(format!("{}/v1/models", base))
+        .send().await.unwrap().json().await.unwrap();
+    assert_eq!(oai["object"], "list");
+    let oai_ids: Vec<&str> = oai["data"].as_array().unwrap().iter()
+        .map(|m| m["id"].as_str().unwrap()).collect();
+    assert!(!oai_ids.is_empty());
+    assert!(!oai_ids.contains(&"claude-netai-hybrid"));
+
+    // Retrieve one alias in Anthropic shape.
+    let one: serde_json::Value = client
+        .get(format!("{}/v1/models/claude-netai-main", base))
+        .header("anthropic-version", "2023-06-01")
+        .send().await.unwrap().json().await.unwrap();
+    assert_eq!(one["id"], "claude-netai-main");
+    assert_eq!(one["type"], "model");
+}
+
+// ---------------------------------------------------------------------------
+// Output-token ceiling (OVMS graph max_tokens_limit)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn max_tokens_is_clamped_to_the_engine_ceiling() {
+    let seen: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
+    let capture = seen.clone();
+    let router = Router::new().route(
+        "/v1/chat/completions",
+        post(|body: axum::body::Bytes| async move {
+            let mt = serde_json::from_slice::<serde_json::Value>(&body)
+                .ok()
+                .and_then(|v| v["max_tokens"].as_u64())
+                .unwrap_or(0);
+            capture.lock().unwrap().push(mt);
+            (axum::http::StatusCode::OK, axum::Json(serde_json::json!({
+                "choices": [{"message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+                "model": "netai-hybrid",
+            })))
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream = format!("http://{}/v1", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap(); });
+
+    let base = spawn_gateway_with(|cfg| {
+        cfg.large_text_url = format!("{}/chat/completions", upstream);
+        cfg.small_mllm_url = format!("{}/chat/completions", upstream);
+        cfg.max_output_tokens = Some(20479);
+    })
+    .await;
+
+    let res = reqwest::Client::new()
+        .post(format!("{}/v1/chat/completions", base))
+        .json(&serde_json::json!({
+            "model": "netai-hybrid",
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 64000
+        }))
+        .send().await.unwrap();
+    assert_eq!(res.status(), reqwest::StatusCode::OK);
+    assert_eq!(*seen.lock().unwrap(), vec![20479]);
 }

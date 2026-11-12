@@ -339,6 +339,412 @@ pub struct ModelList {
     pub data: Vec<ModelInfo>,
 }
 
+/// What a model can actually do, as opposed to where it was discovered.
+///
+/// `/v1/models` is a DISCOVERY surface: clients use it to decide whether they
+/// may send images, tools or streaming requests. Before this existed every
+/// entry looked like `text, streaming`, so capable clients either refused
+/// `netai-hybrid` or sent requests the selected backend could not serve.
+/// `chat` is the load-bearing flag: entries with `chat == false` are utility
+/// services (embeddings, rerank, OCR), not chat models.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ModelCapabilities {
+    #[serde(default)]
+    pub chat: bool,
+    #[serde(default)]
+    pub streaming: bool,
+    #[serde(default)]
+    pub tools: bool,
+    #[serde(default)]
+    pub vision: bool,
+    #[serde(default)]
+    pub thinking: bool,
+    #[serde(default)]
+    pub embeddings: bool,
+    #[serde(default)]
+    pub rerank: bool,
+    #[serde(default)]
+    pub ocr: bool,
+    #[serde(default)]
+    pub tts: bool,
+    #[serde(default)]
+    pub stt: bool,
+    #[serde(default)]
+    pub diarization: bool,
+    #[serde(default)]
+    pub image: bool,
+}
+
+/// Partial override for `CASCADE_MODEL_CAPABILITIES`. Every field is optional
+/// so an entry only names the flags it changes; the rest keep the default
+/// derived from the model id and the upstream role.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ModelCapabilitiesOverride {
+    #[serde(default)]
+    pub chat: Option<bool>,
+    #[serde(default)]
+    pub streaming: Option<bool>,
+    #[serde(default)]
+    pub tools: Option<bool>,
+    #[serde(default)]
+    pub vision: Option<bool>,
+    #[serde(default)]
+    pub thinking: Option<bool>,
+    #[serde(default)]
+    pub embeddings: Option<bool>,
+    #[serde(default)]
+    pub rerank: Option<bool>,
+    #[serde(default)]
+    pub ocr: Option<bool>,
+    #[serde(default)]
+    pub tts: Option<bool>,
+    #[serde(default)]
+    pub stt: Option<bool>,
+    #[serde(default)]
+    pub diarization: Option<bool>,
+    #[serde(default)]
+    pub image: Option<bool>,
+}
+
+fn set_capability(caps: &mut ModelCapabilities, token: &str) {
+    match token.trim().to_ascii_lowercase().as_str() {
+        "chat" | "text" => caps.chat = true,
+        "streaming" | "stream" => caps.streaming = true,
+        "tools" | "tool_use" | "tool-calling" | "function_calling" => caps.tools = true,
+        "vision" | "image" | "multimodal" => caps.vision = true,
+        "thinking" | "reasoning" => caps.thinking = true,
+        "embeddings" | "embedding" => caps.embeddings = true,
+        "rerank" | "reranking" => caps.rerank = true,
+        "ocr" | "document" => caps.ocr = true,
+        "tts" | "speech" | "text-to-speech" => caps.tts = true,
+        "stt" | "transcription" | "speech-to-text" => caps.stt = true,
+        "diarization" | "diarisation" | "speaker-diarization" => caps.diarization = true,
+        "image_generation" | "image-generation" => caps.image = true,
+        _ => {}
+    }
+}
+
+impl ModelCapabilities {
+    /// Parse a comma list such as `chat,streaming,tools,vision`.
+    pub fn from_csv(csv: &str) -> Self {
+        let mut caps = Self::default();
+        for token in csv.split(',').filter(|t| !t.trim().is_empty()) {
+            set_capability(&mut caps, token);
+        }
+        caps
+    }
+
+    pub fn overlay(&mut self, o: &ModelCapabilitiesOverride) {
+        if let Some(v) = o.chat { self.chat = v; }
+        if let Some(v) = o.streaming { self.streaming = v; }
+        if let Some(v) = o.tools { self.tools = v; }
+        if let Some(v) = o.vision { self.vision = v; }
+        if let Some(v) = o.thinking { self.thinking = v; }
+        if let Some(v) = o.embeddings { self.embeddings = v; }
+        if let Some(v) = o.rerank { self.rerank = v; }
+        if let Some(v) = o.ocr { self.ocr = v; }
+        if let Some(v) = o.tts { self.tts = v; }
+        if let Some(v) = o.stt { self.stt = v; }
+        if let Some(v) = o.diarization { self.diarization = v; }
+        if let Some(v) = o.image { self.image = v; }
+    }
+
+    fn model_class(&self) -> &'static str {
+        if self.tts {
+            "tts"
+        } else if self.stt {
+            "stt"
+        } else if self.image {
+            "image"
+        } else if self.ocr {
+            "ocr"
+        } else if self.rerank {
+            "rerank"
+        } else if self.embeddings {
+            "embeddings"
+        } else if self.chat && self.vision {
+            "vlm"
+        } else if self.chat {
+            "llm"
+        } else {
+            "model"
+        }
+    }
+
+    /// OpenRouter-shaped modality metadata. Clients that predate OpenRouter
+    /// ignore it; clients that read it no longer have to guess from the id.
+    fn architecture(&self) -> Value {
+        if self.tts {
+            serde_json::json!({"input_modalities": ["text"], "output_modalities": ["audio"]})
+        } else if self.stt {
+            serde_json::json!({"input_modalities": ["audio"], "output_modalities": ["text"]})
+        } else if self.image {
+            serde_json::json!({"input_modalities": ["text"], "output_modalities": ["image"]})
+        } else if self.ocr {
+            serde_json::json!({"input_modalities": ["image"], "output_modalities": ["text"]})
+        } else if self.rerank {
+            serde_json::json!({"input_modalities": ["text"], "output_modalities": ["scores"]})
+        } else if self.embeddings {
+            serde_json::json!({"input_modalities": ["text"], "output_modalities": ["embeddings"]})
+        } else if self.vision {
+            serde_json::json!({"input_modalities": ["text", "image"], "output_modalities": ["text"]})
+        } else {
+            serde_json::json!({"input_modalities": ["text"], "output_modalities": ["text"]})
+        }
+    }
+
+    fn supported_parameters(&self) -> Vec<&'static str> {
+        if self.tts {
+            return vec!["model", "voice", "response_format", "input"];
+        }
+        if self.stt {
+            return vec!["model", "language", "response_format", "diarize", "words"];
+        }
+        if self.image {
+            return vec!["model", "prompt", "size", "n", "response_format"];
+        }
+        if !self.chat {
+            return Vec::new();
+        }
+        let mut params = vec!["temperature", "top_p", "max_tokens", "stream", "response_format"];
+        if self.tools {
+            params.push("tools");
+            params.push("tool_choice");
+        }
+        params
+    }
+
+    pub fn as_json(&self) -> Value {
+        serde_json::json!({
+            "chat": self.chat,
+            "streaming": self.streaming,
+            "tools": self.tools,
+            "vision": self.vision,
+            "thinking": self.thinking,
+            "embeddings": self.embeddings,
+            "rerank": self.rerank,
+            "ocr": self.ocr,
+            "tts": self.tts,
+            "stt": self.stt,
+            "diarization": self.diarization,
+            "image": self.image,
+        })
+    }
+}
+
+/// Capability defaults + per-model overrides, built once at startup.
+#[derive(Debug, Clone)]
+pub struct CapabilityPolicy {
+    pub main: ModelCapabilities,
+    pub aux: ModelCapabilities,
+    pub overrides: std::collections::HashMap<String, ModelCapabilitiesOverride>,
+    /// Operator-supplied ids to keep out of discovery (case-insensitive), e.g.
+    /// a stale upstream model that must not reach a client picker.
+    pub deny: Vec<String>,
+}
+
+impl Default for CapabilityPolicy {
+    fn default() -> Self {
+        Self {
+            main: ModelCapabilities::from_csv("chat,streaming,tools,vision"),
+            aux: ModelCapabilities::from_csv("chat,streaming"),
+            overrides: std::collections::HashMap::new(),
+            deny: Vec::new(),
+        }
+    }
+}
+
+impl CapabilityPolicy {
+    /// Read the capability policy from the environment once at startup.
+    ///
+    /// `CASCADE_MAIN_CAPABILITIES` / `CASCADE_AUX_CAPABILITIES` are comma lists
+    /// (defaults match the shipped OVMS/vLLM main: text+vision+tools, and the
+    /// text-only aux). `CASCADE_MODEL_CAPABILITIES` is a JSON object of partial
+    /// per-id overrides, e.g. `{"netai-hybrid":{"vision":false}}`.
+    pub fn from_env() -> Self {
+        fn env_csv(name: &str, default: &str) -> String {
+            std::env::var(name)
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+                .unwrap_or_else(|| default.to_string())
+        }
+        let main = ModelCapabilities::from_csv(&env_csv(
+            "CASCADE_MAIN_CAPABILITIES",
+            "chat,streaming,tools,vision",
+        ));
+        let aux = ModelCapabilities::from_csv(&env_csv(
+            "CASCADE_AUX_CAPABILITIES",
+            "chat,streaming",
+        ));
+        let overrides = std::env::var("CASCADE_MODEL_CAPABILITIES")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .and_then(|raw| {
+                serde_json::from_str::<
+                    std::collections::HashMap<String, ModelCapabilitiesOverride>,
+                >(&raw)
+                .ok()
+            })
+            .unwrap_or_default();
+        let deny = std::env::var("CASCADE_MODELS_DENY")
+            .ok()
+            .map(|raw| {
+                raw.split(',')
+                    .map(str::trim)
+                    .filter(|id| !id.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        Self {
+            main,
+            aux,
+            overrides,
+            deny,
+        }
+    }
+
+    /// Derive the capability claim from the id and the role the model was
+    /// discovered under. Utility roles win over the origin because OVMS serves
+    /// chat and embedding graphs on the same origin.
+    pub fn for_model(&self, id: &str, role: &str) -> ModelCapabilities {
+        let lower = id.to_ascii_lowercase();
+        let mut caps = if role.eq_ignore_ascii_case("Speech")
+            || role.eq_ignore_ascii_case("TTS")
+            || lower.contains("-tts")
+            || lower.contains("pocket-tts")
+        {
+            ModelCapabilities {
+                tts: true,
+                streaming: true,
+                ..Default::default()
+            }
+        } else if role.eq_ignore_ascii_case("Transcription")
+            || role.eq_ignore_ascii_case("STT")
+            || lower.contains("parakeet")
+            || lower.contains("-stt")
+        {
+            ModelCapabilities {
+                stt: true,
+                diarization: true,
+                ..Default::default()
+            }
+        } else if role.eq_ignore_ascii_case("Image")
+            || lower.contains("z-image")
+            || lower.contains("zimage")
+        {
+            ModelCapabilities { image: true, ..Default::default() }
+        } else if role.eq_ignore_ascii_case("OCR")
+            || lower.contains("docling")
+            || lower.contains("ocr")
+        {
+            ModelCapabilities { ocr: true, ..Default::default() }
+        } else if lower.contains("rerank") {
+            ModelCapabilities { rerank: true, ..Default::default() }
+        } else if lower.contains("embed") || (lower.contains("bge") && !lower.contains("rerank")) {
+            ModelCapabilities { embeddings: true, ..Default::default() }
+        } else if role.eq_ignore_ascii_case("Auxiliary") || lower.contains("aux") {
+            self.aux.clone()
+        } else {
+            self.main.clone()
+        };
+
+        // Everything that is not a utility service is a chat model. This is
+        // deliberately separate from the role defaults above: a deployment may
+        // configure an empty capability list, and the gateway identity must
+        // never disappear from the chat list because of that.
+        if !caps.embeddings
+            && !caps.rerank
+            && !caps.ocr
+            && !caps.tts
+            && !caps.stt
+            && !caps.image
+        {
+            caps.chat = true;
+            caps.streaming = true;
+            if lower.ends_with("-think") || lower.contains("-think-") {
+                caps.thinking = true;
+            }
+        }
+
+        if let Some(o) = self.overrides.get(id) {
+            caps.overlay(o);
+        }
+        caps
+    }
+}
+
+/// Add the discovery metadata to one model object. Upstream-supplied fields
+/// (`capabilities` array/object, `type`) are honored first: they are closer to
+/// the backend than the gateway's name heuristics.
+pub fn apply_model_capabilities(
+    value: &mut Value,
+    id: &str,
+    role: &str,
+    policy: &CapabilityPolicy,
+) {
+    let Some(obj) = value.as_object_mut() else { return };
+    let mut caps = policy.for_model(id, role);
+
+    if let Some(upstream) = obj.get("capabilities").cloned() {
+        if let Some(map) = upstream.as_object() {
+            for (token, enabled) in map {
+                if enabled.as_bool() == Some(true) {
+                    set_capability(&mut caps, token);
+                }
+            }
+        } else if let Some(list) = upstream.as_array() {
+            for token in list.iter().filter_map(Value::as_str) {
+                set_capability(&mut caps, token);
+            }
+        }
+    }
+    if let Some(class) = obj.get("type").and_then(Value::as_str) {
+        match class.to_ascii_lowercase().as_str() {
+            "embeddings" | "embedding" => {
+                caps = ModelCapabilities { embeddings: true, ..Default::default() };
+            }
+            "rerank" => {
+                caps = ModelCapabilities { rerank: true, ..Default::default() };
+            }
+            "ocr" => {
+                caps = ModelCapabilities { ocr: true, ..Default::default() };
+            }
+            "tts" => {
+                caps = ModelCapabilities {
+                    tts: true,
+                    streaming: true,
+                    ..Default::default()
+                };
+            }
+            "stt" => {
+                caps = ModelCapabilities {
+                    stt: true,
+                    diarization: true,
+                    ..Default::default()
+                };
+            }
+            "image" => {
+                caps = ModelCapabilities { image: true, ..Default::default() };
+            }
+            "vlm" => {
+                caps.chat = true;
+                caps.streaming = true;
+                caps.vision = true;
+            }
+            _ => {}
+        }
+    }
+
+    obj.insert("capabilities".to_string(), caps.as_json());
+    obj.insert("type".to_string(), serde_json::json!(caps.model_class()));
+    obj.insert("architecture".to_string(), caps.architecture());
+    obj.insert(
+        "supported_parameters".to_string(),
+        serde_json::json!(caps.supported_parameters()),
+    );
+}
+
 pub fn build_model_info(id: &str) -> ModelInfo {
     ModelInfo {
         id: id.to_string(),
@@ -424,6 +830,13 @@ pub struct ProviderCapabilities {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Settings {
+    /// Persisted settings intentionally store only `{routing, audio}` — the
+    /// provider list is written by the tested provider endpoint, never by the
+    /// settings page (its copy is REDACTED: api_key: null). Without
+    /// `#[serde(default)]` the boot-time restore of that partial blob fails
+    /// with "missing field `providers`" and EVERY persisted setting is
+    /// silently dropped — the DB then overrides nothing and the env wins.
+    #[serde(default)]
     pub providers: Vec<ProviderConfig>,
     pub routing: RoutingSettings,
     pub audio: AudioSettings,

@@ -28,13 +28,24 @@ self-hosted platform, but it runs standalone and has no NetAI-specific requireme
 ### API compatibility
 - `POST /v1/chat/completions` (OpenAI Chat Completions, streaming via SSE)
 - `POST /v1/messages` and `POST /v1/messages/count_tokens` (Anthropic Messages API, including the SSE event protocol)
-- `GET /v1/models` (the models the gateway currently serves)
+- `GET /v1/models` (the models the gateway currently serves, with capability metadata)
+- `GET /v1/models` for Anthropic clients (Claude Code): the same page also carries `claude-*` aliases,
+  because Claude Code's discovery filter drops ids that do not start with `claude`/`anthropic` — without
+  them the client reports "0 Modelle gefunden". The aliases are pure identities; the Messages route
+  retargets them to the gateway model.
 - `POST /v1/embeddings`, `POST /v1/rerank` (pass-through to the embeddings service)
 - `POST /v1/audio/speech` (TTS), `POST /v1/audio/transcriptions` (STT), `POST /v1/audio/diarize`
 - `POST /v1/images/generations`, `POST /v1/video/generations`
 - `GET /v1/realtime` (OpenAI-Realtime-compatible WebSocket proxy to the STT realtime upstream)
 
 ### Routing and upstreams
+- **Capability metadata on discovery**: `/v1/models` carries a `capabilities` object per model
+  (`chat`, `streaming`, `tools`, `vision`, `thinking`, `embeddings`, `rerank`, `ocr`, `tts`, `stt`,
+  `diarization`, `image`). A client that asks what models exist and picks one trusts that list — without
+  the flags every model looks like "text, streaming". Configured with `CASCADE_MAIN_CAPABILITIES`,
+  `CASCADE_AUX_CAPABILITIES`, per-id overrides in `CASCADE_MODEL_CAPABILITIES` and an optional deny list
+  (`CASCADE_MODELS_DENY`). Every endpoint family stays advertised; the capabilities distinguish them,
+  nothing is hidden from discovery.
 - **Role-based dispatch**: `main`, `auxiliary`, `ocr`, `image` and `rag_worker` pools, each with its own
   nodes and static fallback URLs from the environment.
 - **Dynamic upstream registry**: register, update, toggle and remove nodes at runtime through the admin
@@ -71,7 +82,16 @@ self-hosted platform, but it runs standalone and has no NetAI-specific requireme
   the main model.
 - **Vision fallback**: when the main model is text-only (`LARGE_MODEL_MULTIMODAL=false`), image requests
   go to the auxiliary multimodal model. If the variable is unset, the gateway probes
-  `MULTIMODAL_CAPABILITY_URL` at startup.
+  `MULTIMODAL_CAPABILITY_URL` at startup. The same applies to **audio** payloads.
+- **Audio bridge**: an `input_audio` part in a chat request is transcribed by the stack's own STT service
+  **before** routing, and the model receives the transcript as a text turn
+  (`[Audio-Transkript] …`). Without it the request either fails outright (text-only main model) or the
+  audio is silently dropped by the engine and the model claims it cannot hear anything. A failed
+  transcription becomes an explicit marker, never a silent drop.
+- **Auxiliary model retargeting**: when a request is routed to the auxiliary backend, the model id is
+  rewritten to the configured auxiliary model (`netai-aux`) — otherwise the backend would keep serving the
+  *main* graph. This is independent of the complexity router: it depends on *which* backend answers, not
+  on *why* the request went there.
 - **Confidence rerouting**: when the small model answers, its token logprobs are checked against
   `CONFIDENCE_THRESHOLD` (default `0.7`). A low score, or a fallback tag in the small model's output,
   reroutes the original request to the large model.
@@ -120,8 +140,15 @@ self-hosted platform, but it runs standalone and has no NetAI-specific requireme
 
 ### Admin console and admin API
 - Web console at `/web/`: **Overview**, **Backends** (pool and health prober), **GPU fleet**,
-  **Providers** (with **Register an API**), **Models**, **Routing**, **Diagnostics**, and a settings page
-  with the reference docs at `/web/settings`.
+  **Providers** (with **Register an API**), **Models**, **External access**, **Routing**, **Diagnostics**,
+  and a settings page with the reference docs at `/web/settings`.
+- **External access panel** (`/web/api/access`): the public base URL is derived from the request Caddy
+  forwarded (falling back to `CASCADE_PUBLIC_URL` / `DOMAIN`), both served API dialects are listed
+  (OpenAI-compatible and Anthropic Messages), the internal service key is shown masked and revealed on
+  demand, and personal `nbk_…` API keys are listed/created/revoked. Key CRUD is proxied to the billing
+  service, which owns the tenant-scoped key store, with the caller's `forward_auth` identity — a key
+  always belongs to the signed-in user and is metered against that user's tenant. No secret is ever
+  returned by a list response; a key is shown once at creation or on an explicit reveal.
 - Admin API for upstreams, nodes, providers, routing strategy and settings, guarded by the
   `x-cascade-admin-key` header (`CASCADE_ADMIN_KEY`). When the key is unset, the admin routes are disabled.
 - Endpoint and API documentation: [`docs/dynamic-upstreams.md`](docs/dynamic-upstreams.md),
@@ -203,6 +230,11 @@ docker run -p 3000:3000 \
 The state database defaults to `/data/cascade.db` (`CASCADE_DB`), so mount a volume there to keep usage
 and registry data across restarts. The CI workflow in `.github/workflows/` publishes the image on pushes
 to `main` and on `v*` tags.
+
+The build caches the dependency graph in its own layer (a dummy source compiles axum, reqwest, tokio and
+the rest once), so a change in `src/` rebuilds only this crate — about 20 s instead of three minutes. The
+sources are `touch`ed after the copy: Cargo fingerprints by mtime, `COPY` preserves the host mtime, and
+without that touch the build would silently ship the previous binary.
 
 ### Minimal configuration
 
@@ -328,6 +360,14 @@ The most relevant variables. Full defaults are in `src/config.rs`.
 | `CASCADE_MODEL_NAME` | `cascade-hybrid-v1` | Unified model id the gateway advertises and accepts |
 | `CASCADE_HYBRID_AUTO` | `false` | Enable hybrid Condition C (short plain prompts to the auxiliary model) |
 | `CASCADE_HYBRID_AUX_MAX_CHARS` | `600` | Length budget for a prompt to count as simple (`0` disables the gate) |
+| `CASCADE_MAIN_CAPABILITIES` | `chat,streaming,tools,vision` | Capability flags advertised for the main model on `/v1/models` |
+| `CASCADE_AUX_CAPABILITIES` | `chat,streaming` | Capability flags advertised for the auxiliary model |
+| `CASCADE_MODEL_CAPABILITIES` | empty | Per-id JSON overrides, e.g. `{"netai-hybrid":{"vision":false}}` |
+| `CASCADE_MODELS_DENY` | empty | Comma list of model ids to omit from discovery (case-insensitive) |
+| `CASCADE_MAX_OUTPUT_TOKENS` | unset | Hard per-request output cap. Engines reject `max_tokens` at or above their own ceiling with a 400; clamping here keeps the request alive |
+| `CASCADE_PUBLIC_URL` | unset | Canonical public base URL shown in the console's External access panel (falls back to `DOMAIN`, then the forwarded Host) |
+| `CASCADE_API_KEY` | unset | Stack-wide service key; the console shows it masked and reveals it on demand. It is never routed upstream |
+| `BILLING_URL` | unset | Billing service origin that owns the tenant-scoped `nbk_…` key store the console's External access panel manages |
 | `CASCADE_IMAGE_MODE` | `local_free` | `local`, `local_free` or `free` |
 | `CASCADE_EXTRACTION_STRATEGY` | see `src/config.rs` | Extraction backends: `priority` or `round_robin` |
 | `CIRCUIT_BREAKER_THRESHOLD` / `CIRCUIT_BREAKER_RESET_SECS` | `5` / `60` | Static-upstream circuit breaker |
