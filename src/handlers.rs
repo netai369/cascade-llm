@@ -888,9 +888,16 @@ pub async fn update_settings(
     // TTS/STT overrides are registry nodes too (`manual-speech` /
     // `manual-transcription`), so a changed URL takes effect without a restart.
     // An explicit empty value drops the node and falls back to the static URL.
+    // The node carries its role's service key, exactly like the static fallback
+    // would (`audio.rs::select_audio_upstream`).
     for (role, base) in [("speech", &settings.audio.tts_url), ("transcription", &settings.audio.stt_url)] {
         let Some(base) = base else { continue };
-        match crate::registry::audio_override_request(role, base) {
+        let bearer = if role == "speech" {
+            state.config.tts_api_key.clone()
+        } else {
+            state.config.stt_api_key.clone()
+        };
+        match crate::registry::audio_override_request(role, base, bearer) {
             Some((_, req)) => {
                 state.registry.write().await.upsert(role, req);
             }

@@ -340,7 +340,19 @@ fn split_bytes<'a>(hay: &'a [u8], delim: &[u8]) -> Vec<&'a [u8]> {
 /// Registration payload for a saved TTS/STT override: a `speech` or
 /// `transcription` node with a fixed id, so re-applying it is idempotent.
 /// `base` may carry the trailing `/v1/audio` (both forms are accepted).
-pub fn audio_override_request(role: &str, base: &str) -> Option<(String, RegisterUpstreamRequest)> {
+///
+/// ★ `bearer` must be the role's service key (POCKET_API_KEY / STT_API_KEY).
+/// The audio proxy authenticates to an UPSTREAM with "the node's own bearer or
+/// the static service key" (`audio.rs::select_audio_upstream`), and the static
+/// key is only used when NO node is active. A migrated node without a bearer
+/// therefore silently drops the credential the static URL would have sent — and
+/// a fail-closed TTS/STT backend answers 401, which surfaces as "TTS produced 0
+/// bytes" rather than as an auth error.
+pub fn audio_override_request(
+    role: &str,
+    base: &str,
+    bearer: Option<String>,
+) -> Option<(String, RegisterUpstreamRequest)> {
     let (id, path) = match role {
         "speech" => ("manual-speech", "/v1/audio/speech"),
         "transcription" => ("manual-transcription", "/v1/audio/transcriptions"),
@@ -357,6 +369,9 @@ pub fn audio_override_request(role: &str, base: &str) -> Option<(String, Registe
             endpoint_url: Some(endpoint),
             id: Some(id.to_string()),
             label: Some(id.to_string()),
+            // Absent means "keep whatever the node already has" (`upsert` only
+            // overwrites on Some), so an unset key never wipes an existing one.
+            bearer_token: bearer.filter(|k| !k.trim().is_empty()),
             ..Default::default()
         },
     ))
@@ -366,14 +381,22 @@ pub fn audio_override_request(role: &str, base: &str) -> Option<(String, Registe
 /// fields: a saved `tts_url` / `stt_url` becomes a `manual-speech` /
 /// `manual-transcription` node in the registry. Idempotent (explicit node ids),
 /// so it can run on every start. The static config URLs stay the fallback.
+///
+/// `tts_bearer` / `stt_bearer` are the matching service keys — see
+/// `audio_override_request` for why omitting them breaks a fail-closed backend.
 pub fn migrate_audio_overrides(
     registry: &mut UpstreamRegistry,
     tts_url: Option<&str>,
     stt_url: Option<&str>,
+    tts_bearer: Option<String>,
+    stt_bearer: Option<String>,
 ) -> usize {
     let mut migrated = 0;
-    for (role, base) in [("speech", tts_url), ("transcription", stt_url)] {
-        if let Some((_, req)) = base.and_then(|b| audio_override_request(role, b)) {
+    for (role, base, bearer) in [
+        ("speech", tts_url, tts_bearer),
+        ("transcription", stt_url, stt_bearer),
+    ] {
+        if let Some((_, req)) = base.and_then(|b| audio_override_request(role, b, bearer)) {
             registry.upsert(role, req);
             migrated += 1;
         }
@@ -1022,25 +1045,34 @@ mod tests {
     fn audio_overrides_migrate_idempotently_to_speech_and_transcription_nodes() {
         let mut reg = UpstreamRegistry::default();
         // Both base forms are accepted and normalize to the same endpoints.
-        let n = migrate_audio_overrides(&mut reg, Some("http://speech-tts:8800"), Some("http://stt:5092/v1/audio"));
+        let n = migrate_audio_overrides(&mut reg, Some("http://speech-tts:8800"), Some("http://stt:5092/v1/audio"),
+                                       Some("pocket-key".into()), Some("stt-key".into()));
         assert_eq!(n, 2);
-        assert_eq!(migrate_audio_overrides(&mut reg, Some("http://speech-tts:8800"), Some("http://stt:5092/v1/audio")), 2);
+        assert_eq!(migrate_audio_overrides(&mut reg, Some("http://speech-tts:8800"), Some("http://stt:5092/v1/audio"),
+                                           Some("pocket-key".into()), Some("stt-key".into())), 2);
         assert_eq!(reg.nodes().len(), 2, "re-running the migration must not duplicate nodes");
         let speech = reg.pick("speech").unwrap();
         assert_eq!(speech.endpoint_url, "http://speech-tts:8800/v1/audio/speech");
         assert_eq!(speech.id, "manual-speech");
         assert_eq!(speech.label.as_deref(), Some("manual-speech"));
+        assert_eq!(speech.bearer_token.as_deref(), Some("pocket-key"));
         let stt = reg.pick("transcription").unwrap();
         assert_eq!(stt.endpoint_url, "http://stt:5092/v1/audio/transcriptions");
         assert_eq!(stt.label.as_deref(), Some("manual-transcription"));
+        assert_eq!(stt.bearer_token.as_deref(), Some("stt-key"));
 
         // A changed URL updates the same node instead of adding one.
-        migrate_audio_overrides(&mut reg, Some("http://tts-new:8800"), None);
+        migrate_audio_overrides(&mut reg, Some("http://tts-new:8800"), None, Some("pocket-key".into()), Some("stt-key".into()));
         assert_eq!(reg.pick("speech").unwrap().endpoint_url, "http://tts-new:8800/v1/audio/speech");
         assert_eq!(reg.nodes().len(), 2);
 
+        // A later migration WITHOUT a key must keep the stored one: upsert only
+        // overwrites on Some, so a missing service key never logs the caller out.
+        migrate_audio_overrides(&mut reg, Some("http://tts-new:8800"), None, None, None);
+        assert_eq!(reg.pick("speech").unwrap().bearer_token.as_deref(), Some("pocket-key"));
+
         // Empty or non-http values migrate nothing.
-        assert_eq!(migrate_audio_overrides(&mut UpstreamRegistry::default(), Some(""), Some("ws://x")), 0);
+        assert_eq!(migrate_audio_overrides(&mut UpstreamRegistry::default(), Some(""), Some("ws://x"), None, None), 0);
     }
 
     fn reg_node(url: &str) -> UpstreamNode {

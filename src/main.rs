@@ -136,6 +136,10 @@ async fn main() {
             &mut registry,
             saved_tts_url.as_deref(),
             saved_stt_url.as_deref(),
+            // The migrated node is an upstream, so it needs the service key the
+            // static URL would have carried (`audio.rs::select_audio_upstream`).
+            state.config.tts_api_key.clone(),
+            state.config.stt_api_key.clone(),
         );
         if migrated > 0 {
             info!("Migrated {} saved TTS/STT URL override(s) into registry nodes", migrated);
