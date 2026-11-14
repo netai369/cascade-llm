@@ -142,6 +142,10 @@ pub struct GatewayState {
     circuit_breaker: CircuitBreaker,
     load_tracker: LoadTracker,
     pub session_cache: Cache<String, String>,
+    /// Vision pre-pass: the aux model's description of an image, keyed by the
+    /// hash of the image payload. The conversation keeps the picture in its
+    /// history, so without this every later turn would re-run the aux hop.
+    vision_cache: Cache<String, String>,
     image_semaphore: Arc<Semaphore>,
     pub metrics: Arc<crate::cascade_features::MetricsRegistry>,
     pub db: Arc<Db>,
@@ -197,6 +201,10 @@ impl GatewayState {
             load_tracker: LoadTracker::default(),
             session_cache: Cache::builder()
                 .max_capacity(10_000)
+                .time_to_live(Duration::from_secs(3600))
+                .build(),
+            vision_cache: Cache::builder()
+                .max_capacity(64)
                 .time_to_live(Duration::from_secs(3600))
                 .build(),
             image_semaphore: Arc::new(Semaphore::new(config.max_concurrent_images)),
@@ -414,6 +422,15 @@ impl GatewayState {
         None
     }
 
+    /// True when the request carries an explicit header asking for the auxiliary
+    /// backend. Narrow: only the *header* channel counts (body hints keep their
+    /// existing, image-gated behaviour).
+    fn has_explicit_aux_header(&self, headers: &HeaderMap) -> bool {
+        self.header_route_hint(headers)
+            .map(|h| Self::hint_to_decision(&h) == RouteDecision::Auxiliary)
+            .unwrap_or(false)
+    }
+
     /// Extracts a backend route hint from the request body (metadata / top-level `route`).
     fn payload_route_hint(&self, payload: &ChatCompletionRequest) -> Option<String> {
         if let Some(r) = &payload.route_hint {
@@ -491,6 +508,248 @@ impl GatewayState {
             Some(MessageContent::Parts(parts)) => parts.iter().any(|p| matches!(p, MessageContentPart::File { .. })),
             _ => false,
         })
+    }
+
+    /// The instruction the vision pre-pass sends to the aux model.
+    ///
+    /// It is deliberately NEUTRAL: the description must describe the IMAGE,
+    /// not answer the user's question — answering is the main model's job.
+    /// A neutral instruction also makes the description cacheable per image:
+    /// the same picture yields the same description in every later turn of
+    /// the conversation.
+    const VISION_PROMPT: &'static str = "Beschreibe den Inhalt des Bildes sachlich und praezise: Ort, Personen, Objekte, sichtbare Beschriftungen (Schilder, Schriftzuege, Logos) und Bildausschnitt. Antworte auf Deutsch und ohne zu spekulieren.";
+
+    /// A description that sounds like this was written without the picture:
+    /// it must NEVER be cached or injected as "the content of the image" —
+    /// the main model would repeat the refusal verbatim (measured 2026-11-12:
+    /// a 84-char blind answer got injected and the turn said "Da mir das
+    /// Bild nicht zur Verfügung gestellt wurde…").
+    const VISION_REFUSAL_MARKERS: &'static [&'static str] = &[
+        "ich kann das bild nicht",
+        "kein bild",
+        "nicht beschreiben",
+        "no image",
+        "cannot see",
+        "cannot view",
+        "cannot describe",
+        "i can't",
+        "i cannot",
+    ];
+
+    /// Rule appended to the system prompt when a vision pre-pass ran.
+    ///
+    /// Without it the main model reads the description as "a description
+    /// somebody else gave me" and answers "I cannot analyse images" — or
+    /// reaches for the image-GENERATION tool, because that is the tool whose
+    /// roster entry mentions pictures (measured 2026-11-12: "was ist auf dem
+    /// foto?" produced an `image_generate` call instead of an answer).
+    const VISION_RULE_MARKER: &'static str = "[Gateway-Regel: Bildanfrage]";
+
+    const VISION_RULE: &'static str = "[Gateway-Regel: Bildanfrage] Der Kontext enthaelt die Beschreibung des angehaengten Bildes — das Bild wurde bereits analysiert. Beantworte Fragen ueber das Bild direkt aus dieser Beschreibung. Rufe image_generate NUR auf, wenn der Nutzer ausdruecklich ein NEUES Bild erzeugen lassen will; fuer Fragen ueber ein vorhandenes Bild ist die Websuche (web_search) das passende Werkzeug.";
+
+    /// Stable key for an image set: the hash of every image payload in the
+    /// conversation. The conversation keeps the picture in its history, so
+    /// every later turn would otherwise re-run the aux hop.
+    fn vision_cache_key(&self, payload: &ChatCompletionRequest) -> Option<String> {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let mut hasher = DefaultHasher::new();
+        let mut found = false;
+        for message in &payload.messages {
+            let Some(MessageContent::Parts(parts)) = &message.content else { continue };
+            for part in parts {
+                if let MessageContentPart::ImageUrl { image_url } = part {
+                    image_url.url.hash(&mut hasher);
+                    found = true;
+                }
+            }
+        }
+        if !found {
+            return None;
+        }
+        Some(format!("{:016x}", hasher.finish()))
+    }
+
+    /// Describe the image(s) with the aux model, so the TEXT-ONLY main model
+    /// can answer about them.
+    ///
+    /// WHY this exists (measured 2026-11-12):
+    ///   The aux (Gemma-4-E2B, 2B) SEES the image, but it is a poor tool
+    ///   caller — asked "was ist auf dem foto?" it answered with an
+    ///   `image_generate` call instead of a description, and the whole turn
+    ///   died. The main model (LFM2.5-8B-A1B) is text-only but owns the tool
+    ///   parser and the agent loop. So: the aux PERCEIVES, the main ACTS.
+    ///
+    /// The aux hop is deliberately NOT metered as a separate request: one
+    /// client turn is one billable answer, and the main hop that follows is
+    /// the one the client sees.
+    async fn vision_prepass(&self, payload: &ChatCompletionRequest) -> Option<String> {
+        let cache_key = self.vision_cache_key(payload);
+        if let Some(key) = &cache_key {
+            if let Some(hit) = self.vision_cache.get(key).await {
+                info!("VISION_PREPASS: cache hit ({})", &key[..8]);
+                return Some(hit);
+            }
+        }
+
+        let mut aux = payload.clone();
+        self.log_image_forms(&payload, "prepass payload");
+        // No tools: the aux must answer in prose. With a tool roster it
+        // answers with a tool call instead of a description.
+        aux.tools = None;
+        aux.tool_choice = None;
+        aux.functions = None;
+        aux.function_call = None;
+        aux.stream = Some(false);
+        aux.stream_options = None;
+        aux.metadata = None;
+        aux.route_hint = None;
+        aux.max_tokens = Some(768);
+        // Ask about the picture, not about the user's question.
+        for message in aux.messages.iter_mut().rev() {
+            let carries_image = match &message.content {
+                Some(MessageContent::Parts(parts)) => parts
+                    .iter()
+                    .any(|p| matches!(p, MessageContentPart::ImageUrl { .. })),
+                _ => false,
+            };
+            if !carries_image {
+                continue;
+            }
+            if let Some(MessageContent::Parts(parts)) = &mut message.content {
+                for part in parts.iter_mut() {
+                    if let MessageContentPart::Text { text } = part {
+                        *text = Self::VISION_PROMPT.to_string();
+                    }
+                }
+            }
+            break;
+        }
+        self.inline_all_images(&mut aux).await;
+        self.log_image_forms(&aux, "prepass after inline");
+        let (url, bearer, node) = self
+            .resolve_upstream("auxiliary", &self.config.small_mllm_url)
+            .await;
+        self.apply_node_model(&mut aux, &node).await;
+        self.retarget_aux_model(&mut aux).await;
+
+        let mut request = self.http_client.post(&url).json(&aux);
+        if let Some(token) = bearer.as_deref() {
+            request = request.bearer_auth(token);
+        }
+        let response = match request.send().await {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("VISION_PREPASS: aux unreachable: {}", e);
+                self.circuit_breaker.record_failure(&url).await;
+                return None;
+            }
+        };
+        if !response.status().is_success() {
+            warn!("VISION_PREPASS: aux returned HTTP {}", response.status());
+            return None;
+        }
+        let body: serde_json::Value = match response.json().await {
+            Ok(v) => v,
+            Err(e) => {
+                warn!("VISION_PREPASS: unparsable aux answer: {}", e);
+                return None;
+            }
+        };
+        let text = body
+            .get("choices")
+            .and_then(|c| c.as_array())
+            .and_then(|c| c.first())
+            .and_then(|c| c.get("message"))
+            .and_then(|m| m.get("content"))
+            .and_then(|c| c.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if text.is_empty() {
+            warn!("VISION_PREPASS: aux returned an empty description");
+            return None;
+        }
+        if Self::is_vision_refusal(&text) {
+            warn!(
+                "VISION_PREPASS: aux answered BLIND ({} chars): {:?} — not cached, image never seen",
+                text.len(),
+                &text[..text.len().min(120)]
+            );
+            return None;
+        }
+        self.circuit_breaker.record_success(&url).await;
+        if let Some(key) = cache_key {
+            self.vision_cache.insert(key, text.clone()).await;
+        }
+        Some(text)
+    }
+
+    /// Replace every image part with the aux model's description.
+    ///
+    /// The main model is text-only: an image part makes OVMS reject the whole
+    /// request ("This servable supports only text input"), so the media part
+    /// has to become text before the turn is forwarded.
+    fn replace_media_with_text(&self, payload: &mut ChatCompletionRequest, description: &str) {
+        for message in payload.messages.iter_mut() {
+            let Some(MessageContent::Parts(parts)) = &mut message.content else { continue };
+            for part in parts.iter_mut() {
+                if matches!(part, MessageContentPart::ImageUrl { .. }) {
+                    *part = MessageContentPart::Text {
+                        text: format!(
+                            "[Inhalt des Bildes, vom Vision-Modell beschrieben]\n{}",
+                            description
+                        ),
+                    };
+                }
+            }
+        }
+    }
+
+    /// Append the vision rule to the system prompt (or create one).
+    ///
+    /// The rule is idempotent: a request that already carries the marker is
+    /// left alone, so a re-sent turn cannot stack copies of it.
+    fn inject_vision_rule(&self, payload: &mut ChatCompletionRequest) {
+        for message in payload.messages.iter_mut() {
+            if message.role != "system" {
+                continue;
+            }
+            match &mut message.content {
+                Some(MessageContent::Text(text)) => {
+                    if text.contains(Self::VISION_RULE_MARKER) {
+                        return;
+                    }
+                    text.push('\n');
+                    text.push_str(Self::VISION_RULE);
+                }
+                Some(MessageContent::Parts(parts)) => {
+                    for part in parts.iter_mut() {
+                        if let MessageContentPart::Text { text } = part {
+                            if text.contains(Self::VISION_RULE_MARKER) {
+                                return;
+                            }
+                            text.push('\n');
+                            text.push_str(Self::VISION_RULE);
+                            return;
+                        }
+                    }
+                }
+                None => {}
+            }
+            return;
+        }
+        payload.messages.insert(
+            0,
+            ChatMessage {
+                role: "system".to_string(),
+                content: Some(MessageContent::Text(Self::VISION_RULE.to_string())),
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+            },
+        );
     }
 
     /// Condition A — document / OCR parsing payloads (PaddleOCR-VL).
@@ -596,17 +855,23 @@ impl GatewayState {
     /// Returns the routing decision for a request based on headers, metadata
     /// and payload structure — the three-condition multi-endpoint dispatcher.
     async fn inspect_route(&self, payload: &ChatCompletionRequest, headers: &HeaderMap) -> RouteDecision {
+        // An explicit `x-cascade-route: auxiliary-server` (or any aux alias)
+        // header is a request-specific override: it must win over the
+        // settings-page default_route pin, which is a global preference.
+        let explicit_aux = self.has_explicit_aux_header(headers);
         // Settings-page deterministic short-circuit (default_route).
-        if let Some(dr) = self.runtime.read().await.default_route.clone() {
-            let d = match dr.to_lowercase().as_str() {
-                "inference" => Some(RouteDecision::Inference),
-                "auxiliary" => Some(RouteDecision::Auxiliary),
-                // "ocr" => Some(RouteDecision::Ocr),  // Route A retired — falls through to None
-                _ => None,
-            };
-            if let Some(d) = d {
-                info!("ROUTE_DEFAULT: settings pin {:?} (payload ignored)", d);
-                return d;
+        if !explicit_aux {
+            if let Some(dr) = self.runtime.read().await.default_route.clone() {
+                let d = match dr.to_lowercase().as_str() {
+                    "inference" => Some(RouteDecision::Inference),
+                    "auxiliary" => Some(RouteDecision::Auxiliary),
+                    // "ocr" => Some(RouteDecision::Ocr),  // Route A retired — falls through to None
+                    _ => None,
+                };
+                if let Some(d) = d {
+                    info!("ROUTE_DEFAULT: settings pin {:?} (payload ignored)", d);
+                    return d;
+                }
             }
         }
         // Explicit header hint wins for OCR / aux / auto.
@@ -628,9 +893,13 @@ impl GatewayState {
                 info!("ROUTE_HEADER_HINT: '{hint}' -> Inference");
                 return decision;
             }
-            if (decision == RouteDecision::Auxiliary && !self.has_image(payload))
-                || decision == RouteDecision::Auto
-            {
+            // An explicit aux header stays on the auxiliary backend even when
+            // the payload carries images/tools.
+            if decision == RouteDecision::Auxiliary {
+                info!("ROUTE_HEADER_HINT: '{hint}' -> Auxiliary (explicit header)");
+                return decision;
+            }
+            if decision == RouteDecision::Auto {
                 info!("ROUTE_HEADER_HINT: '{hint}' -> {:?}", decision);
                 return decision;
             }
@@ -1090,21 +1359,128 @@ impl GatewayState {
         Ok((headers, Body::from(body_bytes)))
     }
 
+    /// True when the aux's "description" is actually a refusal written
+    /// without seeing any picture (or too short to be a real description).
+    fn is_vision_refusal(text: &str) -> bool {
+        let lower = text.to_lowercase();
+        if text.len() < 100 && lower.split_whitespace().count() < 15 {
+            return true;
+        }
+        Self::VISION_REFUSAL_MARKERS
+            .iter()
+            .any(|m| lower.contains(m))
+    }
+
+    /// Diagnose the image-part forms in a payload. The 13:49 incident made
+    /// one thing certain: a turn can fail with the SAME picture that works
+    /// two minutes later, and without knowing WHICH form the picture had
+    /// (data URL vs. file URL vs. relative path) the failure is unreproducible.
+    fn log_image_forms(&self, payload: &ChatCompletionRequest, label: &str) {
+        for (idx, message) in payload.messages.iter().enumerate() {
+            let Some(MessageContent::Parts(parts)) = &message.content else {
+                continue;
+            };
+            for part in parts {
+                if let MessageContentPart::ImageUrl { image_url } = part {
+                    let url = &image_url.url;
+                    let form = if url.starts_with("data:") {
+                        format!("data-url ({} kB)", url.len() / 1024)
+                    } else if url.starts_with('/') {
+                        format!("relative path ({})", &url[..url.len().min(60)])
+                    } else if url.starts_with("http") {
+                        format!("absolute url ({})", &url[..url.len().min(80)])
+                    } else {
+                        format!("unknown ({})", &url[..url.len().min(60)])
+                    };
+                    info!("VISION_FORMS[{}]: msg#{} -> {}", label, idx, form);
+                }
+            }
+        }
+    }
+
     async fn download_image_as_base64(&self, url: &str) -> Option<String> {
         if url.starts_with("data:") {
             return Some(url.to_string());
         }
-        let _permit = self.image_semaphore.acquire().await.ok()?;
-        let resp = self.http_client.get(url).send().await.ok()?;
-        let content_type = resp
-            .headers()
-            .get("content-type")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("image/png")
-            .to_string();
-        let bytes = resp.bytes().await.ok()?;
-        let encoded = BASE64_STANDARD.encode(&bytes);
-        Some(format!("data:{};base64,{}", content_type, encoded))
+        // Candidates: the URL as given; if it is relative, anchored to the
+        // internal LibreChat base; if the original fetch fails (public domain
+        // behind forward_auth, stale DNS, …), the internal fallback is the
+        // LAST resort before giving up — an aux that answers without the
+        // picture poisons the whole turn.
+        let fallback_url = |u: &str| -> Option<String> {
+            let path = if u.starts_with('/') {
+                u.to_string()
+            } else {
+                // take path+query of an absolute URL
+                u.split_once("://")?
+                    .1
+                    .split_once('/')
+                    .map(|(_, rest)| format!("/{}", rest))?
+            };
+            Some(format!("{}{}", self.config.file_base_url, path))
+        };
+        let mut candidate = url.to_string();
+        if url.starts_with('/') {
+            candidate = fallback_url(url)?;
+        }
+        for attempt in 0..2 {
+            let _permit = self.image_semaphore.acquire().await.ok()?;
+            let resp = match self.http_client.get(&candidate).send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!("IMAGE_FETCH: {} -> {}", &candidate[..candidate.len().min(80)], e);
+                    if attempt == 0 {
+                        candidate = fallback_url(url)?;
+                        continue;
+                    }
+                    return None;
+                }
+            };
+            let status = resp.status();
+            let content_type = resp
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_string();
+            if !status.is_success() {
+                warn!(
+                    "IMAGE_FETCH: {} -> HTTP {} (attempt {})",
+                    &candidate[..candidate.len().min(80)],
+                    status,
+                    attempt + 1
+                );
+                if attempt == 0 {
+                    candidate = fallback_url(url)?;
+                    continue;
+                }
+                return None;
+            }
+            if !content_type.starts_with("image/") {
+                // A login page or an error JSON is not a picture; forwarding
+                // it as a data:image URL makes the aux answer blind.
+                warn!(
+                    "IMAGE_FETCH: {} -> non-image content-type {:?}",
+                    &candidate[..candidate.len().min(80)],
+                    content_type
+                );
+                if attempt == 0 {
+                    candidate = fallback_url(url)?;
+                    continue;
+                }
+                return None;
+            }
+            let bytes = match resp.bytes().await {
+                Ok(b) => b,
+                Err(e) => {
+                    warn!("IMAGE_FETCH: body read failed: {}", e);
+                    return None;
+                }
+            };
+            let encoded = BASE64_STANDARD.encode(&bytes);
+            return Some(format!("data:{};base64,{}", content_type, encoded));
+        }
+        None
     }
 
     async fn inline_all_images(&self, payload: &mut ChatCompletionRequest) {
@@ -1143,6 +1519,29 @@ impl GatewayState {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    /// Reorder image-bearing message parts so all `image_url` parts come
+    /// before any other (text/...) parts, preserving relative order within
+    /// the image group and within the remaining group. Gemma multimodal
+    /// convention: image content before text. Only used on the direct
+    /// auxiliary route; does not resize/re-encode data URLs or drop metadata.
+    pub(crate) fn reorder_image_parts_first(payload: &mut ChatCompletionRequest) {
+        for msg in payload.messages.iter_mut() {
+            if let Some(MessageContent::Parts(parts)) = &mut msg.content {
+                let mut images = Vec::new();
+                let mut rest = Vec::new();
+                for part in parts.drain(..) {
+                    if matches!(part, MessageContentPart::ImageUrl { .. }) {
+                        images.push(part);
+                    } else {
+                        rest.push(part);
+                    }
+                }
+                images.extend(rest);
+                *parts = images;
             }
         }
     }
@@ -1201,8 +1600,13 @@ impl GatewayState {
         }
         let mut decision = self.inspect_route(&payload, headers).await;
         // Intent-based routing: planning/design/security/meta → force large model.
+        // An explicit aux header is request-specific and must not be overridden.
+        let explicit_aux = self.has_explicit_aux_header(headers);
         let intent = intent_routing::inspect_intent(&payload);
-        if intent.direct_to_large && matches!(decision, RouteDecision::Auxiliary | RouteDecision::Auto) {
+        if !explicit_aux
+            && intent.direct_to_large
+            && matches!(decision, RouteDecision::Auxiliary | RouteDecision::Auto)
+        {
             info!(
                 "INTENT_ROUTING: intent={} → forcing Inference (was {:?})",
                 intent.intent.label(),
@@ -1212,7 +1616,7 @@ impl GatewayState {
         }
         // Settings: tools-bearing requests go to the large model (deterministic).
         let has_tools = payload.tools.is_some() || payload.functions.is_some();
-        if has_tools && self.runtime.read().await.route_tools_to_large {
+        if !explicit_aux && has_tools && self.runtime.read().await.route_tools_to_large {
             if decision == RouteDecision::Auxiliary {
                 info!("ROUTE_TOOLS_TO_LARGE: aux hint overridden -> Inference");
                 decision = RouteDecision::Inference;
@@ -1446,6 +1850,8 @@ impl GatewayState {
         headers: &HeaderMap,
     ) -> Result<(HeaderMap, Body), ProxyError> {
         let mut payload = payload.clone();
+        // Gemma multimodal convention: image parts before text parts.
+        Self::reorder_image_parts_first(&mut payload);
         // If a remote image slipped in, inline it before forwarding.
         self.inline_all_images(&mut payload).await;
         let (url, bearer, node) = self.resolve_upstream("auxiliary", &self.config.small_mllm_url).await;
@@ -1466,14 +1872,45 @@ impl GatewayState {
         is_streaming: bool,
         headers: &HeaderMap,
     ) -> Result<(HeaderMap, Body), ProxyError> {
-        if (self.has_image(payload) || self.has_audio(payload)) && !self.config.large_model_multimodal {
-            info!(
-                "ROUTE_C: image/audio detected but large model is text-only -> auxiliary multimodal backend"
-            );
-            return self.route_auxiliary(payload, is_streaming, headers).await;
+        let mut payload = payload.clone();
+        if (self.has_image(&payload) || self.has_audio(&payload)) && !self.config.large_model_multimodal {
+            // ★ Two-stage vision: the aux PERCEIVES, the main ACTS.
+            //
+            // The main model is text-only, so a picture cannot go there. The
+            // aux (Gemma-4-E2B, 2B) can see it — but it is a poor tool
+            // caller: asked "was ist auf dem foto?" it answered with an
+            // `image_generate` call, and the turn died (measured 2026-11-12).
+            // The main model owns the tool parser and the agent loop.
+            //
+            // So: the aux describes the picture, the description REPLACES the
+            // image part, and the main answers with the tools attached —
+            // which is how the llama.cpp backend behaved before OVMS.
+            //
+            // Without tool definitions the whole turn goes to the aux as
+            // before: a pure "what do I see?" needs no second hop.
+            let wants_tools = payload.tools.is_some() || payload.functions.is_some();
+            if wants_tools && self.config.vision_prepass {
+                if let Some(description) = self.vision_prepass(&payload).await {
+                    self.replace_media_with_text(&mut payload, &description);
+                    self.inject_vision_rule(&mut payload);
+                    info!(
+                        "ROUTE_C: vision pre-pass -> main model ({} chars of image description)",
+                        description.len()
+                    );
+                } else {
+                    info!(
+                        "ROUTE_C: image/audio detected but large model is text-only -> auxiliary multimodal backend"
+                    );
+                    return self.route_auxiliary(&payload, is_streaming, headers).await;
+                }
+            } else {
+                info!(
+                    "ROUTE_C: image/audio detected but large model is text-only -> auxiliary multimodal backend"
+                );
+                return self.route_auxiliary(&payload, is_streaming, headers).await;
+            }
         }
 
-        let mut payload = payload.clone();
         // Qwythos-9B is multimodal — inline any remote image URLs before forwarding.
         self.inline_all_images(&mut payload).await;
         let lang = language::detect_language(&payload.messages);
@@ -2209,14 +2646,22 @@ fn normalize_event_json(raw: &str, model_name: &str) -> Option<String> {
         info!(target: "cascade_llm::state", "NORMALIZE chunk with reasoning delta (passthrough)");
     }
 
-    if delta.get("tool_calls").is_some() || delta.get("function_call").is_some() {
-        return Some(format!("data: {}", serde_json::to_string(&event).unwrap_or_default()));
-    }
-
+    // ★ The role default MUST run BEFORE the tool_calls early-return below.
+    //
+    // Measured 2026-11-12: OVMS' aux graph opens a tool-call turn with the
+    // tool_call chunk ITSELF — there is no separate `delta.role` frame — so
+    // the early return kept the chunk role-less. LibreChat opens the
+    // assistant message from the role; a role-less tool call is dropped
+    // silently and the agent turn ends EMPTY (gotcha 47). The main model
+    // (LFM2.5) does send an opening role chunk, which is why only the aux
+    // route lost its tool calls.
     if delta.get("role").is_none() {
         delta["role"] = serde_json::Value::String("assistant".to_string());
     }
 
+    if delta.get("tool_calls").is_some() || delta.get("function_call").is_some() {
+        return Some(format!("data: {}", serde_json::to_string(&event).unwrap_or_default()));
+    }
     // Reasoning/thinking is deliberately NOT merged into `content`.  The small
     // and large backends surface chain-of-thought via `reasoning_content`
     // (llama.cpp Qwen/Gemma-style); OpenAI-compatible clients like Hermes
@@ -2452,6 +2897,30 @@ mod normalize_tests {
         assert!(out.contains("tool_calls"));
     }
 
+    /// ★ Regression (2026-11-12): OVMS' aux graph opens a tool-call turn
+    /// with the tool_call chunk ITSELF — no separate `delta.role` frame.
+    /// LibreChat opens the assistant message from the role, so a role-less
+    /// tool call was dropped silently and the agent turn ended EMPTY.
+    /// The role default must therefore run BEFORE the tool_calls early
+    /// return.
+    #[test]
+    fn adds_role_to_a_tool_call_chunk_that_opens_the_turn() {
+        let chunk = r#"data: {"choices":[{"delta":{"tool_calls":[{"id":"abc","type":"function","index":0,"function":{"name":"web_search_mcp_web-search"}}]},"finish_reason":null,"index":0}],"id":"chatcmpl-x","model":"/models/raw.gguf","object":"chat.completion.chunk"}"#;
+        let out = normalize_event_json(chunk, "cascade-hybrid-v1").unwrap();
+        assert!(
+            out.contains("\"role\":\"assistant\""),
+            "a tool call that opens the turn must declare the role: {out}"
+        );
+        assert!(out.contains("web_search_mcp_web-search"));
+    }
+
+    #[test]
+    fn keeps_an_explicit_role_on_a_tool_call_chunk() {
+        let chunk = r#"data: {"choices":[{"delta":{"role":"assistant","tool_calls":[{"index":0,"function":{"name":"x"}}]},"finish_reason":null,"index":0}],"id":"chatcmpl-x","model":"/models/raw.gguf","object":"chat.completion.chunk"}"#;
+        let out = normalize_event_json(chunk, "cascade-hybrid-v1").unwrap();
+        assert_eq!(out.matches("\"role\":\"assistant\"").count(), 1, "{out}");
+    }
+
     #[test]
     fn drops_non_json_frames() {
         assert!(normalize_event_json("data: not json at all", "cascade-hybrid-v1").is_none());
@@ -2474,6 +2943,34 @@ mod normalize_tests {
         let out = normalize_event_json(chunk, "cascade-hybrid-v1").unwrap();
         assert!(out.contains("\"model\":\"cascade-hybrid-v1\""));
         assert!(out.contains("\"text\":\"Hello\""));
+    }
+}
+
+#[cfg(test)]
+mod vision_refusal_tests {
+    use super::GatewayState;
+
+    // A blind aux answer ("kein Bild zur Verfügung gestellt", 84 chars in the
+    // incident) must be detected, never cached, never injected as the image
+    // description — the main model would repeat the refusal verbatim.
+    #[test]
+    fn blind_answers_are_refusals() {
+        assert!(GatewayState::is_vision_refusal(
+            "Ich kann das Bild nicht beschreiben, da mir kein Bild zur Verfügung gestellt wurde."
+        ));
+        assert!(GatewayState::is_vision_refusal("Kein Bild."));
+        assert!(GatewayState::is_vision_refusal("I cannot describe the image."));
+        assert!(GatewayState::is_vision_refusal("Kein Bild", ));
+    }
+
+    #[test]
+    fn real_descriptions_pass() {
+        let desc = "Das Bild zeigt eine Statue der Freiheitsgöttin auf einem Sockel vor einer Wasserfläche. \
+                    Im Hintergrund sind Hügel und ein hellblauer Himmel zu sehen, im Vordergrund eine Uferpromenade.";
+        assert!(!GatewayState::is_vision_refusal(desc));
+        assert!(!GatewayState::is_vision_refusal(
+            "Der See ist der Wörthersee; das Bild zeigt das Schiffsanlegepodest mit der Aufschrift KLAGENFURT-SEE."
+        ));
     }
 }
 
@@ -2894,5 +3391,141 @@ data: [DONE]\n\n";
             &[Some(json!({"include_usage": true}))],
             "stream must force include_usage upstream"
         );
+    }
+}
+
+#[cfg(test)]
+mod explicit_aux_header_tests {
+    use super::*;
+    use crate::cascade_features::MetricsRegistry;
+    use crate::db::Db;
+    use axum::http::HeaderMap;
+    use axum::http::HeaderValue;
+    use serde_json::json;
+
+    fn state_with_default_route(dr: Option<&str>) -> GatewayState {
+        let mut cfg = AppConfig::from_env();
+        cfg.default_route = dr.map(|s| s.to_string());
+        cfg.route_tools_to_large = true;
+        cfg.large_model_multimodal = false;
+        GatewayState::new(
+            cfg,
+            Arc::new(MetricsRegistry::init()),
+            Arc::new(Db::new_in_memory().unwrap()),
+        )
+    }
+
+    fn payload_with_image_and_tools() -> ChatCompletionRequest {
+        serde_json::from_value(json!({
+            "model": "netai-hybrid",
+            "messages": [
+                {"role": "system", "content": "You are an expert architect and security reviewer. ".repeat(6)},
+                {"role": "user", "content": [
+                    {"type": "text", "text": "what is in this image?"},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}
+                ]}
+            ],
+            "tools": [{"type": "function", "function": {"name": "web_search", "parameters": {"type":"object"}}}]
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn explicit_aux_header_wins_default_route_and_image() {
+        let state = state_with_default_route(Some("inference"));
+        let payload = payload_with_image_and_tools();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-cascade-route", HeaderValue::from_static("auxiliary-server"));
+        let decision = state.inspect_route(&payload, &headers).await;
+        assert_eq!(decision, RouteDecision::Auxiliary);
+    }
+
+    #[tokio::test]
+    async fn without_aux_header_default_route_stands() {
+        let state = state_with_default_route(Some("inference"));
+        let payload = payload_with_image_and_tools();
+        let headers = HeaderMap::new();
+        let decision = state.inspect_route(&payload, &headers).await;
+        // With image+tools but no explicit aux header, default inference pin wins.
+        assert_eq!(decision, RouteDecision::Inference);
+    }
+}
+
+#[cfg(test)]
+mod aux_image_ordering_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn image_parts_move_before_text_preserving_relative_order() {
+        let mut payload: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": [
+                    {"type": "text", "text": "first text"},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,IMG1"}},
+                    {"type": "text", "text": "second text"},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,IMG2"}},
+                    {"type": "text", "text": "third text"}
+                ]}
+            ]
+        }))
+        .unwrap();
+
+        GatewayState::reorder_image_parts_first(&mut payload);
+
+        let parts = match &payload.messages[0].content {
+            Some(MessageContent::Parts(p)) => p,
+            _ => panic!("expected parts"),
+        };
+        assert_eq!(parts.len(), 5);
+        // images first, relative order preserved
+        match &parts[0] {
+            MessageContentPart::ImageUrl { image_url } => assert_eq!(image_url.url, "data:image/png;base64,IMG1"),
+            _ => panic!("expected image first"),
+        }
+        match &parts[1] {
+            MessageContentPart::ImageUrl { image_url } => assert_eq!(image_url.url, "data:image/png;base64,IMG2"),
+            _ => panic!("expected image second"),
+        }
+        match &parts[2] {
+            MessageContentPart::Text { text } => assert_eq!(text, "first text"),
+            _ => panic!("expected text third"),
+        }
+        match &parts[3] {
+            MessageContentPart::Text { text } => assert_eq!(text, "second text"),
+            _ => panic!("expected text fourth"),
+        }
+        match &parts[4] {
+            MessageContentPart::Text { text } => assert_eq!(text, "third text"),
+            _ => panic!("expected text fifth"),
+        }
+    }
+
+    #[test]
+    fn reorder_is_idempotent_and_ignores_text_only_messages() {
+        let mut payload: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "m",
+            "messages": [
+                {"role": "system", "content": "sys text"},
+                {"role": "user", "content": [
+                    {"type": "text", "text": "t"},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,X"}}
+                ]}
+            ]
+        }))
+        .unwrap();
+
+        GatewayState::reorder_image_parts_first(&mut payload);
+        GatewayState::reorder_image_parts_first(&mut payload);
+
+        // system message stays text
+        assert!(matches!(&payload.messages[0].content, Some(MessageContent::Text(_))));
+        let parts = match &payload.messages[1].content {
+            Some(MessageContent::Parts(p)) => p,
+            _ => panic!("expected parts"),
+        };
+        assert!(matches!(&parts[0], MessageContentPart::ImageUrl { .. }));
+        assert!(matches!(&parts[1], MessageContentPart::Text { .. }));
     }
 }

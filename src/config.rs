@@ -94,6 +94,19 @@ pub struct AppConfig {
     /// Anthropic clients (Claude Code) routinely ask for 32k+. Clamping here
     /// keeps the request alive instead of surfacing an engine error.
     pub max_output_tokens: Option<u32>,
+    /// Two-stage vision (CASCADE_VISION_PREPASS, default on): when a request
+    /// carries an image AND tool definitions, the aux model describes the
+    /// image, the description replaces the image part, and the MAIN model
+    /// answers with the tools attached. Off = the whole turn goes to the aux.
+    pub vision_prepass: bool,
+    /// Base the vision pre-pass uses to fetch image file references
+    /// (CASCADE_FILE_BASE_URL). LibreChat hands relative paths (/images/…)
+    /// and auth-protected public URLs to the gateway; both must be fetched
+    /// through the internal, guard-free LibreChat port — through Caddy the
+    /// fetch only gets the forward_auth login redirect (measured 2026-11-12:
+    /// a public-domain image URL made the aux answer "kein Bild zur
+    /// Verfügung gestellt" in 580 ms).
+    pub file_base_url: String,
     /// Deterministic routing mode: none|inference|auxiliary|ocr (CASCADE_DEFAULT_ROUTE).
     pub default_route: Option<String>,
     /// Hybrid complexity router: when the default route is auto, a short plain
@@ -324,6 +337,13 @@ impl AppConfig {
                 .ok()
                 .and_then(|v| v.trim().parse::<u32>().ok())
                 .filter(|v| *v > 0),
+            vision_prepass: std::env::var("CASCADE_VISION_PREPASS")
+                .unwrap_or_else(|_| "true".to_string())
+                .eq_ignore_ascii_case("true"),
+            file_base_url: std::env::var("CASCADE_FILE_BASE_URL")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "http://netai-librechat:3080".to_string()),
             default_route: std::env::var("CASCADE_DEFAULT_ROUTE").ok().filter(|s| !s.is_empty()),
             hybrid_auto: std::env::var("CASCADE_HYBRID_AUTO")
                 .unwrap_or_else(|_| "false".to_string())
